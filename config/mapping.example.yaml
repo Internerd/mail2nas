@@ -1,0 +1,23 @@
+# Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
+# (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
+#
+# Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
+# Aenderungen wirken also ohne Neustart/Redeploy.
+#
+# Schluessel = Stichwort, das im Betreff (und optional im Mailtext, siehe
+#              MATCH_BODY) gesucht wird - Gross-/Kleinschreibung ist egal.
+# Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+#
+# Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
+# "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
+
+RE: rechnungen
+Rechnung: rechnungen
+Invoice: rechnungen
+LS: lieferscheine
+Lieferschein: lieferscheine
+Lieferung: lieferscheine
+AB: auftragsbestaetigungen
+Auftragsbestaetigung: auftragsbestaetigungen
+Mahnung: mahnungen
+Gutschrift: gutschriften
