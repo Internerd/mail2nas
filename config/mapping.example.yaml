@@ -4,9 +4,18 @@
 # Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
 # Aenderungen wirken also ohne Neustart/Redeploy.
 #
-# Schluessel = Stichwort, das im Betreff (und optional im Mailtext, siehe
-#              MATCH_BODY) gesucht wird - Gross-/Kleinschreibung ist egal.
+# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
+#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
+#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
+#                 als Fallback, falls der Dateiname selbst nichts hergibt
+#              Gross-/Kleinschreibung ist egal.
 # Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+#
+# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
+# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
+# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
+# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
+# nicht beide im selben).
 #
 # Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
 # "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.

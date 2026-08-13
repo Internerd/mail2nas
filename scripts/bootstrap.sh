@@ -48,6 +48,9 @@ IMAP_FOLDER=INBOX
 # Optional: move processed mails into this IMAP folder instead of just
 # marking them \Seen. Leave empty to just mark as read.
 IMAP_PROCESSED_FOLDER=Processed
+# Optional: oversized messages (see MAX_MESSAGE_SIZE_MB) are marked \Seen and,
+# if set, moved here instead of being touched for attachment extraction.
+IMAP_OVERSIZED_FOLDER=
 # idle = push via IMAP IDLE (recommended if the server supports it)
 # poll = check every POLL_INTERVAL_SECONDS
 IMAP_MODE=idle
@@ -73,6 +76,24 @@ FALLBACK_FOLDER=unsorted
 MATCH_BODY=false
 # How saved attachment filenames are prefixed: none | date | sender | date_sender
 FILENAME_PREFIX=date_sender
+
+# --- Angriffsflaeche eindaemmen (Mail/Anhaenge sind nicht vertrauenswuerdig) --
+# Einzelne Anhaenge groesser als dieses Limit werden uebersprungen (geloggt),
+# der Rest der Mail wird trotzdem normal verarbeitet.
+MAX_ATTACHMENT_SIZE_MB=25
+# Ist die GESAMTE Mail groesser als dieses Limit, wird sie nicht mal geladen
+# (Schutz vor Memory-/Disk-Exhaustion durch riesige Mails) - nur \Seen markiert
+# und optional nach IMAP_OVERSIZED_FOLDER verschoben, zur manuellen Pruefung.
+MAX_MESSAGE_SIZE_MB=50
+# Mehr Anhaenge als dieses Limit werden nicht mehr verarbeitet (Schutz vor
+# Mails mit tausenden Mini-Anhaengen).
+MAX_ATTACHMENTS_PER_MESSAGE=20
+# Anhaenge mit einer dieser Dateiendungen werden IMMER nach QUARANTINE_FOLDER
+# verschoben, auch wenn der Dateiname sonst auf ein Mapping-Stichwort passt
+# (verhindert z. B. "Rechnung.exe" im Rechnungsordner). Komma-getrennt, ohne
+# Punkt. Leer lassen, um die Pruefung zu deaktivieren.
+BLOCKED_EXTENSIONS=exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk
+QUARANTINE_FOLDER=quarantaene
 
 # --- Misc ------------------------------------------------------------------
 STATE_DB_PATH=/data/state.db
@@ -157,9 +178,18 @@ cat > config/mapping.example.yaml <<'MAIL2NAS_EOF'
 # Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
 # Aenderungen wirken also ohne Neustart/Redeploy.
 #
-# Schluessel = Stichwort, das im Betreff (und optional im Mailtext, siehe
-#              MATCH_BODY) gesucht wird - Gross-/Kleinschreibung ist egal.
+# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
+#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
+#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
+#                 als Fallback, falls der Dateiname selbst nichts hergibt
+#              Gross-/Kleinschreibung ist egal.
 # Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+#
+# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
+# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
+# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
+# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
+# nicht beide im selben).
 #
 # Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
 # "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
@@ -186,12 +216,29 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# Executable/script types that are quarantined instead of filed normally,
+# even if their filename happens to match a mapping keyword. This is a
+# defense-in-depth measure against mail attachments being used to smuggle
+# malware onto the archive share - it does not make opening the quarantined
+# file safe, it just keeps it out of the regular business-document folders.
+DEFAULT_BLOCKED_EXTENSIONS = (
+    "exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,"
+    "jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk"
+)
+
 
 def _bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extension_set(name: str, default: str) -> frozenset[str]:
+    raw = os.environ.get(name, default)
+    return frozenset(
+        ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -203,6 +250,7 @@ class Config:
     imap_ssl: bool
     imap_folder: str
     imap_processed_folder: str | None
+    imap_oversized_folder: str | None
     imap_mode: str  # "idle" or "poll"
     poll_interval: int
 
@@ -211,6 +259,13 @@ class Config:
     fallback_folder: str
     match_body: bool
     filename_prefix: str  # "none" | "date" | "sender" | "date_sender"
+
+    # Attack-surface limits for untrusted mail/attachment content.
+    max_attachment_size_mb: int
+    max_message_size_mb: int
+    max_attachments_per_message: int
+    blocked_extensions: frozenset[str]
+    quarantine_folder: str
 
     state_db_path: str
     dry_run: bool
@@ -226,6 +281,7 @@ class Config:
                 imap_ssl=_bool("IMAP_SSL", True),
                 imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
                 imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
+                imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
                 imap_mode=os.environ.get("IMAP_MODE", "poll").lower(),
                 poll_interval=int(os.environ.get("POLL_INTERVAL_SECONDS", "300")),
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
@@ -233,6 +289,11 @@ class Config:
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
                 filename_prefix=os.environ.get("FILENAME_PREFIX", "date_sender"),
+                max_attachment_size_mb=int(os.environ.get("MAX_ATTACHMENT_SIZE_MB", "25")),
+                max_message_size_mb=int(os.environ.get("MAX_MESSAGE_SIZE_MB", "50")),
+                max_attachments_per_message=int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "20")),
+                blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
+                quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
             )
@@ -416,6 +477,12 @@ def _message_id(msg: Message, uid: int) -> str:
     return msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>"
 
 
+def _extension_of(filename: str) -> str:
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].strip().lower()
+
+
 class Archiver:
     def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore):
         self.config = config
@@ -445,6 +512,26 @@ class Archiver:
         return processed
 
     def _process_message(self, client: IMAPClient, uid: int) -> bool:
+        # Check the message size *before* pulling the full body into memory -
+        # a hostile/broken sender could otherwise use an oversized message to
+        # exhaust memory/disk on every poll cycle.
+        size_reply = client.fetch([uid], ["RFC822.SIZE"])
+        message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
+        max_message_bytes = self.config.max_message_size_mb * 1024 * 1024
+        if message_size and message_size > max_message_bytes:
+            logger.warning(
+                "UID %s is %.1f MB, exceeds MAX_MESSAGE_SIZE_MB=%d - skipping attachment "
+                "extraction and flagging for manual review",
+                uid,
+                message_size / (1024 * 1024),
+                self.config.max_message_size_mb,
+            )
+            if not self.config.dry_run:
+                client.add_flags([uid], [b"\\Seen"])
+                if self.config.imap_oversized_folder:
+                    client.move([uid], self.config.imap_oversized_folder)
+            return True
+
         raw = client.fetch([uid], ["RFC822"])[uid][b"RFC822"]
         msg = email.message_from_bytes(raw)
         message_id = _message_id(msg, uid)
@@ -457,35 +544,62 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
+        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
 
-        folder_name, matched_keyword = self.mapping.resolve(subject, body)
-        target_dir = Path(self.config.storage_root) / folder_name
         attachments = list(self._iter_attachments(msg))
+        if len(attachments) > self.config.max_attachments_per_message:
+            logger.warning(
+                "UID %s '%s' has %d attachments, only processing the first %d "
+                "(MAX_ATTACHMENTS_PER_MESSAGE)",
+                uid,
+                subject,
+                len(attachments),
+                self.config.max_attachments_per_message,
+            )
+            attachments = attachments[: self.config.max_attachments_per_message]
 
         saved: list[str] = []
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
         else:
-            if not self.config.dry_run:
-                target_dir.mkdir(parents=True, exist_ok=True)
             date_prefix = self._date_prefix(msg)
+            max_attachment_bytes = self.config.max_attachment_size_mb * 1024 * 1024
             for filename, payload in attachments:
+                if len(payload) > max_attachment_bytes:
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' is %.1f MB, exceeds "
+                        "MAX_ATTACHMENT_SIZE_MB=%d - skipping this attachment",
+                        uid,
+                        subject,
+                        filename,
+                        len(payload) / (1024 * 1024),
+                        self.config.max_attachment_size_mb,
+                    )
+                    continue
+
+                folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
+                    filename, mail_folder, mail_keyword
+                )
+                target_dir = Path(self.config.storage_root) / folder_name
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
+
                 if self.config.dry_run:
                     logger.info("[dry-run] would save %s -> %s", out_name, target_dir)
                     continue
+
+                target_dir.mkdir(parents=True, exist_ok=True)
                 out_path = unique_path(target_dir, out_name)
                 out_path.write_bytes(payload)
                 saved.append(str(out_path))
-            logger.info(
-                "UID %s '%s' matched '%s' -> %s (%d attachment(s): %s)",
-                uid,
-                subject,
-                matched_keyword or "<fallback>",
-                folder_name,
-                len(attachments),
-                saved,
-            )
+                logger.info(
+                    "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+                    uid,
+                    subject,
+                    filename,
+                    matched_keyword or "<fallback>",
+                    " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
+                    out_path,
+                )
 
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
@@ -493,6 +607,27 @@ class Archiver:
             if self.config.imap_processed_folder:
                 client.move([uid], self.config.imap_processed_folder)
         return True
+
+    def _resolve_attachment_folder(
+        self, filename: str, mail_folder: str, mail_keyword: str | None
+    ) -> tuple[str, str | None, bool]:
+        """Decide the target folder for a single attachment.
+
+        The attachment's own filename is checked against the mapping first,
+        so multiple differently-named attachments on the same mail can land
+        in different folders. Falls back to the mail-level (subject/body)
+        match when the filename itself gives no hint. Attachments with a
+        blocked extension are always quarantined, regardless of any keyword
+        match, so a malicious/executable attachment can never be renamed
+        into a trusted-looking business folder just by naming it "Rechnung.exe".
+        """
+        folder_name, matched_keyword = self.mapping.resolve(filename)
+        if matched_keyword is None:
+            folder_name, matched_keyword = mail_folder, mail_keyword
+
+        if _extension_of(filename) in self.config.blocked_extensions:
+            return self.config.quarantine_folder, matched_keyword, True
+        return folder_name, matched_keyword, False
 
     @staticmethod
     def _date_prefix(msg: Message) -> str:
@@ -765,10 +900,11 @@ MAIL2NAS_EOF
 cat > tests/test_archiver.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
+import textwrap
 from email.message import EmailMessage
 
 from mail2nas.archiver import Archiver
-from mail2nas.config import Config
+from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
 
@@ -782,6 +918,7 @@ def _make_config(tmp_path, **overrides) -> Config:
         imap_ssl=True,
         imap_folder="INBOX",
         imap_processed_folder=None,
+        imap_oversized_folder=None,
         imap_mode="poll",
         poll_interval=60,
         storage_root=str(tmp_path),
@@ -789,6 +926,13 @@ def _make_config(tmp_path, **overrides) -> Config:
         fallback_folder="unsorted",
         match_body=False,
         filename_prefix="date_sender",
+        max_attachment_size_mb=25,
+        max_message_size_mb=50,
+        max_attachments_per_message=20,
+        blocked_extensions=frozenset(
+            e.strip() for e in DEFAULT_BLOCKED_EXTENSIONS.split(",")
+        ),
+        quarantine_folder="quarantaene",
         state_db_path=str(tmp_path / "state.db"),
         dry_run=False,
     )
@@ -796,11 +940,59 @@ def _make_config(tmp_path, **overrides) -> Config:
     return Config(**defaults)
 
 
-def _make_archiver(tmp_path, **config_overrides) -> Archiver:
+def _write_mapping(path, content: str) -> None:
+    path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+
+def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overrides) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
-    mapping = Mapping(str(tmp_path / "missing-mapping.yaml"), config.fallback_folder)
+    mapping_path = tmp_path / "mapping.yaml"
+    if mapping_content is not None:
+        _write_mapping(mapping_path, mapping_content)
+    mapping = Mapping(str(mapping_path), config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     return Archiver(config, mapping, store)
+
+
+class FakeIMAPClient:
+    """Minimal stand-in for imapclient.IMAPClient, just enough for _process_message."""
+
+    def __init__(self, uid: int, raw: bytes):
+        self._uid = uid
+        self._raw = raw
+        self.flags_added: list[tuple[list[int], list[bytes]]] = []
+        self.moved_to: list[tuple[list[int], str]] = []
+
+    def fetch(self, uids, parts):
+        assert uids == [self._uid]
+        result: dict = {}
+        for uid in uids:
+            entry = {}
+            if "RFC822.SIZE" in parts:
+                entry[b"RFC822.SIZE"] = len(self._raw)
+            if "RFC822" in parts:
+                entry[b"RFC822"] = self._raw
+            result[uid] = entry
+        return result
+
+    def add_flags(self, uids, flags):
+        self.flags_added.append((list(uids), list(flags)))
+
+    def move(self, uids, folder):
+        self.moved_to.append((list(uids), folder))
+
+
+def _build_message(subject: str, attachments: list[tuple[str, bytes]]) -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "lieferant@example.com"
+    msg.set_content("Hallo")
+    for filename, payload in attachments:
+        msg.add_attachment(payload, maintype="application", subtype="octet-stream", filename=filename)
+    return bytes(msg)
+
+
+# --- attachment discovery / filename building -------------------------------
 
 
 def test_iter_attachments_finds_named_parts(tmp_path):
@@ -850,6 +1042,149 @@ def test_build_filename_date_only_prefix(tmp_path):
     result = archiver._build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
 
     assert result == "2026-08-12_rechnung.pdf"
+
+
+# --- per-attachment folder resolution ----------------------------------------
+
+
+def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            RE: rechnungen
+            Lieferschein: lieferscheine
+        """,
+    )
+    # Mail-level match would be "rechnungen" (subject contains RE), but this
+    # specific attachment's own filename literally says "Lieferschein".
+    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
+
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "Lieferschein_4711.pdf", mail_folder, mail_keyword
+    )
+
+    assert folder == "lieferscheine"
+    assert keyword == "Lieferschein"
+    assert quarantined is False
+
+
+def test_resolve_attachment_folder_falls_back_to_mail_level_match(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001")
+
+    # "anhang1.pdf" itself does not match any keyword.
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "anhang1.pdf", mail_folder, mail_keyword
+    )
+
+    assert folder == "rechnungen"
+    assert keyword == "RE"
+    assert quarantined is False
+
+
+def test_resolve_attachment_folder_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "Rechnung.exe", "unsorted", None
+    )
+
+    assert folder == "quarantaene"
+    assert quarantined is True
+
+
+# --- full message processing (size/count limits, quarantine, mail-level) ----
+
+
+def test_process_message_splits_multiple_attachments_by_filename(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            Rechnung: rechnungen
+            Lieferschein: lieferscheine
+        """,
+    )
+    raw = _build_message(
+        "Bestellung 42",
+        [("Rechnung_42.pdf", b"invoice-bytes"), ("Lieferschein_42.pdf", b"delivery-bytes")],
+    )
+    client = FakeIMAPClient(uid=1, raw=raw)
+
+    archiver._process_message(client, 1)
+
+    assert any(p.name.endswith("Rechnung_42.pdf") for p in (tmp_path / "rechnungen").glob("*"))
+    assert any(p.name.endswith("Lieferschein_42.pdf") for p in (tmp_path / "lieferscheine").glob("*"))
+
+
+def test_process_message_skips_oversized_message_without_reading_body(tmp_path):
+    archiver = _make_archiver(tmp_path, max_message_size_mb=1)
+    huge_raw = _build_message("Rechnung riesig", [("rechnung.pdf", b"x" * (2 * 1024 * 1024))])
+    client = FakeIMAPClient(uid=7, raw=huge_raw)
+
+    result = archiver._process_message(client, 7)
+
+    assert result is True
+    assert client.flags_added == [([7], [b"\\Seen"])]
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_process_message_skips_only_oversized_attachment(tmp_path):
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", max_attachment_size_mb=1, max_message_size_mb=50
+    )
+    raw = _build_message(
+        "RE-1",
+        [("gross.pdf", b"x" * (2 * 1024 * 1024)), ("klein.pdf", b"klein")],
+    )
+    client = FakeIMAPClient(uid=3, raw=raw)
+
+    archiver._process_message(client, 3)
+
+    saved = list((tmp_path / "rechnungen").glob("*"))
+    assert any(p.name.endswith("klein.pdf") for p in saved)
+    assert not any(p.name.endswith("gross.pdf") for p in saved)
+
+
+def test_process_message_caps_attachment_count(tmp_path):
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", max_attachments_per_message=2
+    )
+    raw = _build_message(
+        "RE-1",
+        [(f"a{i}.pdf", b"data") for i in range(5)],
+    )
+    client = FakeIMAPClient(uid=4, raw=raw)
+
+    archiver._process_message(client, 4)
+
+    saved = list((tmp_path / "rechnungen").glob("*"))
+    assert len(saved) == 2
+
+
+def test_process_message_quarantines_blocked_attachment(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ...")])
+    client = FakeIMAPClient(uid=5, raw=raw)
+
+    archiver._process_message(client, 5)
+
+    assert not (tmp_path / "rechnungen").exists() or not any((tmp_path / "rechnungen").glob("*"))
+    quarantined = list((tmp_path / "quarantaene").glob("*"))
+    assert len(quarantined) == 1
+
+
+def test_process_message_is_idempotent_for_already_processed_message_id(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("rechnung.pdf", b"data")])
+    client = FakeIMAPClient(uid=6, raw=raw)
+
+    archiver._process_message(client, 6)
+    first_run_files = list((tmp_path / "rechnungen").glob("*"))
+    archiver._process_message(client, 6)
+    second_run_files = list((tmp_path / "rechnungen").glob("*"))
+
+    assert len(first_run_files) == 1
+    assert len(second_run_files) == 1
 MAIL2NAS_EOF
 
 echo "Fertig: $TARGET enthaelt jetzt das komplette mail2nas-Projekt."

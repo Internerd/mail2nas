@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import textwrap
 from email.message import EmailMessage
 
 from mail2nas.archiver import Archiver
-from mail2nas.config import Config
+from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
 
@@ -17,6 +18,7 @@ def _make_config(tmp_path, **overrides) -> Config:
         imap_ssl=True,
         imap_folder="INBOX",
         imap_processed_folder=None,
+        imap_oversized_folder=None,
         imap_mode="poll",
         poll_interval=60,
         storage_root=str(tmp_path),
@@ -24,6 +26,13 @@ def _make_config(tmp_path, **overrides) -> Config:
         fallback_folder="unsorted",
         match_body=False,
         filename_prefix="date_sender",
+        max_attachment_size_mb=25,
+        max_message_size_mb=50,
+        max_attachments_per_message=20,
+        blocked_extensions=frozenset(
+            e.strip() for e in DEFAULT_BLOCKED_EXTENSIONS.split(",")
+        ),
+        quarantine_folder="quarantaene",
         state_db_path=str(tmp_path / "state.db"),
         dry_run=False,
     )
@@ -31,11 +40,59 @@ def _make_config(tmp_path, **overrides) -> Config:
     return Config(**defaults)
 
 
-def _make_archiver(tmp_path, **config_overrides) -> Archiver:
+def _write_mapping(path, content: str) -> None:
+    path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+
+def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overrides) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
-    mapping = Mapping(str(tmp_path / "missing-mapping.yaml"), config.fallback_folder)
+    mapping_path = tmp_path / "mapping.yaml"
+    if mapping_content is not None:
+        _write_mapping(mapping_path, mapping_content)
+    mapping = Mapping(str(mapping_path), config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     return Archiver(config, mapping, store)
+
+
+class FakeIMAPClient:
+    """Minimal stand-in for imapclient.IMAPClient, just enough for _process_message."""
+
+    def __init__(self, uid: int, raw: bytes):
+        self._uid = uid
+        self._raw = raw
+        self.flags_added: list[tuple[list[int], list[bytes]]] = []
+        self.moved_to: list[tuple[list[int], str]] = []
+
+    def fetch(self, uids, parts):
+        assert uids == [self._uid]
+        result: dict = {}
+        for uid in uids:
+            entry = {}
+            if "RFC822.SIZE" in parts:
+                entry[b"RFC822.SIZE"] = len(self._raw)
+            if "RFC822" in parts:
+                entry[b"RFC822"] = self._raw
+            result[uid] = entry
+        return result
+
+    def add_flags(self, uids, flags):
+        self.flags_added.append((list(uids), list(flags)))
+
+    def move(self, uids, folder):
+        self.moved_to.append((list(uids), folder))
+
+
+def _build_message(subject: str, attachments: list[tuple[str, bytes]]) -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "lieferant@example.com"
+    msg.set_content("Hallo")
+    for filename, payload in attachments:
+        msg.add_attachment(payload, maintype="application", subtype="octet-stream", filename=filename)
+    return bytes(msg)
+
+
+# --- attachment discovery / filename building -------------------------------
 
 
 def test_iter_attachments_finds_named_parts(tmp_path):
@@ -85,3 +142,146 @@ def test_build_filename_date_only_prefix(tmp_path):
     result = archiver._build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
 
     assert result == "2026-08-12_rechnung.pdf"
+
+
+# --- per-attachment folder resolution ----------------------------------------
+
+
+def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            RE: rechnungen
+            Lieferschein: lieferscheine
+        """,
+    )
+    # Mail-level match would be "rechnungen" (subject contains RE), but this
+    # specific attachment's own filename literally says "Lieferschein".
+    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
+
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "Lieferschein_4711.pdf", mail_folder, mail_keyword
+    )
+
+    assert folder == "lieferscheine"
+    assert keyword == "Lieferschein"
+    assert quarantined is False
+
+
+def test_resolve_attachment_folder_falls_back_to_mail_level_match(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001")
+
+    # "anhang1.pdf" itself does not match any keyword.
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "anhang1.pdf", mail_folder, mail_keyword
+    )
+
+    assert folder == "rechnungen"
+    assert keyword == "RE"
+    assert quarantined is False
+
+
+def test_resolve_attachment_folder_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+
+    folder, keyword, quarantined = archiver._resolve_attachment_folder(
+        "Rechnung.exe", "unsorted", None
+    )
+
+    assert folder == "quarantaene"
+    assert quarantined is True
+
+
+# --- full message processing (size/count limits, quarantine, mail-level) ----
+
+
+def test_process_message_splits_multiple_attachments_by_filename(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            Rechnung: rechnungen
+            Lieferschein: lieferscheine
+        """,
+    )
+    raw = _build_message(
+        "Bestellung 42",
+        [("Rechnung_42.pdf", b"invoice-bytes"), ("Lieferschein_42.pdf", b"delivery-bytes")],
+    )
+    client = FakeIMAPClient(uid=1, raw=raw)
+
+    archiver._process_message(client, 1)
+
+    assert any(p.name.endswith("Rechnung_42.pdf") for p in (tmp_path / "rechnungen").glob("*"))
+    assert any(p.name.endswith("Lieferschein_42.pdf") for p in (tmp_path / "lieferscheine").glob("*"))
+
+
+def test_process_message_skips_oversized_message_without_reading_body(tmp_path):
+    archiver = _make_archiver(tmp_path, max_message_size_mb=1)
+    huge_raw = _build_message("Rechnung riesig", [("rechnung.pdf", b"x" * (2 * 1024 * 1024))])
+    client = FakeIMAPClient(uid=7, raw=huge_raw)
+
+    result = archiver._process_message(client, 7)
+
+    assert result is True
+    assert client.flags_added == [([7], [b"\\Seen"])]
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_process_message_skips_only_oversized_attachment(tmp_path):
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", max_attachment_size_mb=1, max_message_size_mb=50
+    )
+    raw = _build_message(
+        "RE-1",
+        [("gross.pdf", b"x" * (2 * 1024 * 1024)), ("klein.pdf", b"klein")],
+    )
+    client = FakeIMAPClient(uid=3, raw=raw)
+
+    archiver._process_message(client, 3)
+
+    saved = list((tmp_path / "rechnungen").glob("*"))
+    assert any(p.name.endswith("klein.pdf") for p in saved)
+    assert not any(p.name.endswith("gross.pdf") for p in saved)
+
+
+def test_process_message_caps_attachment_count(tmp_path):
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", max_attachments_per_message=2
+    )
+    raw = _build_message(
+        "RE-1",
+        [(f"a{i}.pdf", b"data") for i in range(5)],
+    )
+    client = FakeIMAPClient(uid=4, raw=raw)
+
+    archiver._process_message(client, 4)
+
+    saved = list((tmp_path / "rechnungen").glob("*"))
+    assert len(saved) == 2
+
+
+def test_process_message_quarantines_blocked_attachment(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ...")])
+    client = FakeIMAPClient(uid=5, raw=raw)
+
+    archiver._process_message(client, 5)
+
+    assert not (tmp_path / "rechnungen").exists() or not any((tmp_path / "rechnungen").glob("*"))
+    quarantined = list((tmp_path / "quarantaene").glob("*"))
+    assert len(quarantined) == 1
+
+
+def test_process_message_is_idempotent_for_already_processed_message_id(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("rechnung.pdf", b"data")])
+    client = FakeIMAPClient(uid=6, raw=raw)
+
+    archiver._process_message(client, 6)
+    first_run_files = list((tmp_path / "rechnungen").glob("*"))
+    archiver._process_message(client, 6)
+    second_run_files = list((tmp_path / "rechnungen").glob("*"))
+
+    assert len(first_run_files) == 1
+    assert len(second_run_files) == 1

@@ -3,12 +3,29 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# Executable/script types that are quarantined instead of filed normally,
+# even if their filename happens to match a mapping keyword. This is a
+# defense-in-depth measure against mail attachments being used to smuggle
+# malware onto the archive share - it does not make opening the quarantined
+# file safe, it just keeps it out of the regular business-document folders.
+DEFAULT_BLOCKED_EXTENSIONS = (
+    "exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,"
+    "jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk"
+)
+
 
 def _bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extension_set(name: str, default: str) -> frozenset[str]:
+    raw = os.environ.get(name, default)
+    return frozenset(
+        ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -20,6 +37,7 @@ class Config:
     imap_ssl: bool
     imap_folder: str
     imap_processed_folder: str | None
+    imap_oversized_folder: str | None
     imap_mode: str  # "idle" or "poll"
     poll_interval: int
 
@@ -28,6 +46,13 @@ class Config:
     fallback_folder: str
     match_body: bool
     filename_prefix: str  # "none" | "date" | "sender" | "date_sender"
+
+    # Attack-surface limits for untrusted mail/attachment content.
+    max_attachment_size_mb: int
+    max_message_size_mb: int
+    max_attachments_per_message: int
+    blocked_extensions: frozenset[str]
+    quarantine_folder: str
 
     state_db_path: str
     dry_run: bool
@@ -43,6 +68,7 @@ class Config:
                 imap_ssl=_bool("IMAP_SSL", True),
                 imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
                 imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
+                imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
                 imap_mode=os.environ.get("IMAP_MODE", "poll").lower(),
                 poll_interval=int(os.environ.get("POLL_INTERVAL_SECONDS", "300")),
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
@@ -50,6 +76,11 @@ class Config:
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
                 filename_prefix=os.environ.get("FILENAME_PREFIX", "date_sender"),
+                max_attachment_size_mb=int(os.environ.get("MAX_ATTACHMENT_SIZE_MB", "25")),
+                max_message_size_mb=int(os.environ.get("MAX_MESSAGE_SIZE_MB", "50")),
+                max_attachments_per_message=int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "20")),
+                blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
+                quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
             )

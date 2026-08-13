@@ -30,6 +30,12 @@ def _message_id(msg: Message, uid: int) -> str:
     return msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>"
 
 
+def _extension_of(filename: str) -> str:
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].strip().lower()
+
+
 class Archiver:
     def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore):
         self.config = config
@@ -59,6 +65,26 @@ class Archiver:
         return processed
 
     def _process_message(self, client: IMAPClient, uid: int) -> bool:
+        # Check the message size *before* pulling the full body into memory -
+        # a hostile/broken sender could otherwise use an oversized message to
+        # exhaust memory/disk on every poll cycle.
+        size_reply = client.fetch([uid], ["RFC822.SIZE"])
+        message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
+        max_message_bytes = self.config.max_message_size_mb * 1024 * 1024
+        if message_size and message_size > max_message_bytes:
+            logger.warning(
+                "UID %s is %.1f MB, exceeds MAX_MESSAGE_SIZE_MB=%d - skipping attachment "
+                "extraction and flagging for manual review",
+                uid,
+                message_size / (1024 * 1024),
+                self.config.max_message_size_mb,
+            )
+            if not self.config.dry_run:
+                client.add_flags([uid], [b"\\Seen"])
+                if self.config.imap_oversized_folder:
+                    client.move([uid], self.config.imap_oversized_folder)
+            return True
+
         raw = client.fetch([uid], ["RFC822"])[uid][b"RFC822"]
         msg = email.message_from_bytes(raw)
         message_id = _message_id(msg, uid)
@@ -71,35 +97,62 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
+        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
 
-        folder_name, matched_keyword = self.mapping.resolve(subject, body)
-        target_dir = Path(self.config.storage_root) / folder_name
         attachments = list(self._iter_attachments(msg))
+        if len(attachments) > self.config.max_attachments_per_message:
+            logger.warning(
+                "UID %s '%s' has %d attachments, only processing the first %d "
+                "(MAX_ATTACHMENTS_PER_MESSAGE)",
+                uid,
+                subject,
+                len(attachments),
+                self.config.max_attachments_per_message,
+            )
+            attachments = attachments[: self.config.max_attachments_per_message]
 
         saved: list[str] = []
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
         else:
-            if not self.config.dry_run:
-                target_dir.mkdir(parents=True, exist_ok=True)
             date_prefix = self._date_prefix(msg)
+            max_attachment_bytes = self.config.max_attachment_size_mb * 1024 * 1024
             for filename, payload in attachments:
+                if len(payload) > max_attachment_bytes:
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' is %.1f MB, exceeds "
+                        "MAX_ATTACHMENT_SIZE_MB=%d - skipping this attachment",
+                        uid,
+                        subject,
+                        filename,
+                        len(payload) / (1024 * 1024),
+                        self.config.max_attachment_size_mb,
+                    )
+                    continue
+
+                folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
+                    filename, mail_folder, mail_keyword
+                )
+                target_dir = Path(self.config.storage_root) / folder_name
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
+
                 if self.config.dry_run:
                     logger.info("[dry-run] would save %s -> %s", out_name, target_dir)
                     continue
+
+                target_dir.mkdir(parents=True, exist_ok=True)
                 out_path = unique_path(target_dir, out_name)
                 out_path.write_bytes(payload)
                 saved.append(str(out_path))
-            logger.info(
-                "UID %s '%s' matched '%s' -> %s (%d attachment(s): %s)",
-                uid,
-                subject,
-                matched_keyword or "<fallback>",
-                folder_name,
-                len(attachments),
-                saved,
-            )
+                logger.info(
+                    "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+                    uid,
+                    subject,
+                    filename,
+                    matched_keyword or "<fallback>",
+                    " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
+                    out_path,
+                )
 
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
@@ -107,6 +160,27 @@ class Archiver:
             if self.config.imap_processed_folder:
                 client.move([uid], self.config.imap_processed_folder)
         return True
+
+    def _resolve_attachment_folder(
+        self, filename: str, mail_folder: str, mail_keyword: str | None
+    ) -> tuple[str, str | None, bool]:
+        """Decide the target folder for a single attachment.
+
+        The attachment's own filename is checked against the mapping first,
+        so multiple differently-named attachments on the same mail can land
+        in different folders. Falls back to the mail-level (subject/body)
+        match when the filename itself gives no hint. Attachments with a
+        blocked extension are always quarantined, regardless of any keyword
+        match, so a malicious/executable attachment can never be renamed
+        into a trusted-looking business folder just by naming it "Rechnung.exe".
+        """
+        folder_name, matched_keyword = self.mapping.resolve(filename)
+        if matched_keyword is None:
+            folder_name, matched_keyword = mail_folder, mail_keyword
+
+        if _extension_of(filename) in self.config.blocked_extensions:
+            return self.config.quarantine_folder, matched_keyword, True
+        return folder_name, matched_keyword, False
 
     @staticmethod
     def _date_prefix(msg: Message) -> str:
