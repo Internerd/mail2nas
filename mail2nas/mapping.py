@@ -93,3 +93,75 @@ class Mapping:
             if keyword.lower() in haystack:
                 return folder, keyword
         return self._fallback_folder, None
+
+
+# --- editing helpers (used by the web UI) ------------------------------------
+#
+# The mapping stays a YAML file on the share rather than moving into a
+# database: the archiver already reloads it by mtime, it survives a broken
+# web UI, and it remains editable by hand as a fallback. The web UI is the
+# normal way to change it, not the only one - so anything written here has to
+# stay in the format a human would write.
+
+MAX_KEYWORD_LENGTH = 100
+
+
+class MappingError(ValueError):
+    """A rule the user tried to save is not usable."""
+
+
+def load_rules(storage: Storage, relative_path: str) -> dict[str, str]:
+    """Read the mapping file as an ordered keyword -> folder dict.
+
+    A missing file is an empty mapping, not an error: that is the state right
+    after installation, and the UI is exactly where it gets fixed.
+    """
+    try:
+        raw = yaml.safe_load(storage.read_text(relative_path)) or {}
+    except FileNotFoundError:
+        return {}
+    if not isinstance(raw, dict):
+        raise MappingError(
+            "Die Mapping-Datei enthaelt keine Stichwort/Ordner-Zuordnung und wird "
+            "nicht ueberschrieben. Bitte pruefen oder umbenennen."
+        )
+    return {str(keyword): str(folder) for keyword, folder in raw.items()}
+
+
+def save_rules(storage: Storage, relative_path: str, rules: dict[str, str]) -> None:
+    """Write the mapping file back, sorted by keyword for a stable diff."""
+    ordered = dict(sorted(rules.items(), key=lambda kv: kv[0].lower()))
+    text = yaml.safe_dump(ordered, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    storage.write_text(relative_path, text)
+
+
+def validate_keyword(keyword: str, existing: dict[str, str], replacing: str | None = None) -> str:
+    """Check a keyword the user typed, returning the cleaned version."""
+    keyword = keyword.strip()
+    if not keyword:
+        raise MappingError("Bitte ein Stichwort angeben.")
+    if len(keyword) > MAX_KEYWORD_LENGTH:
+        raise MappingError(f"Das Stichwort darf hoechstens {MAX_KEYWORD_LENGTH} Zeichen lang sein.")
+    if "\n" in keyword or "\r" in keyword:
+        raise MappingError("Das Stichwort darf keine Zeilenumbrueche enthalten.")
+    # Matching is case-insensitive, so two rules differing only in case would
+    # be indistinguishable - the second could never win.
+    lowered = keyword.lower()
+    for existing_keyword in existing:
+        if existing_keyword == replacing:
+            continue
+        if existing_keyword.lower() == lowered:
+            raise MappingError(f"Das Stichwort {existing_keyword!r} gibt es schon.")
+    return keyword
+
+
+def validate_folder(folder: str) -> str:
+    """Check a target folder, returning the cleaned relative path."""
+    folder = folder.strip().replace("\\", "/")
+    if not folder:
+        raise MappingError("Bitte einen Zielordner auswaehlen oder anlegen.")
+    try:
+        parts = safe_relative_parts(folder)
+    except ValueError as exc:
+        raise MappingError(f"Ungueltiger Zielordner: {exc}") from None
+    return "/".join(parts)

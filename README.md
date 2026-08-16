@@ -1,9 +1,10 @@
 # mail2nas
 
-Holt Mails per IMAP ab, sortiert Anhaenge anhand eines konfigurierbaren
-Mapping-Files (Stichwort im Betreff -> Zielordner) und legt sie auf einem
-SMB-Share ab. Gedacht zum Betrieb als Container auf Proxmox (LXC/Docker),
-kann aber genauso als einfacher systemd-Service laufen.
+Holt Mails per IMAP ab, sortiert Anhaenge anhand konfigurierbarer Stichwoerter
+(Stichwort im Betreff -> Zielordner) und legt sie auf einem SMB-Share ab. Die
+Zuordnungen werden ueber eine kleine, passwortgeschuetzte Weboberflaeche
+gepflegt. Gedacht zum Betrieb als Container auf Proxmox (LXC/Docker), kann aber
+genauso als einfacher systemd-Service laufen.
 
 ## Inhaltsverzeichnis
 
@@ -14,6 +15,7 @@ kann aber genauso als einfacher systemd-Service laufen.
 - [Weiter mit Docker Compose](#weiter-mit-docker-compose)
 - [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
 - [Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift)
+- [Weboberflaeche](#weboberflaeche)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -41,8 +43,10 @@ kann aber genauso als einfacher systemd-Service laufen.
    `IMAP_PROCESSED_FOLDER` verschoben). Zusaetzlich wird die Message-ID in
    einer lokalen SQLite-Datenbank vermerkt, damit nichts doppelt verarbeitet
    wird, selbst wenn das `\Seen`-Flag von woanders zurueckgesetzt wird.
-6. `mapping.yaml` liegt selbst auf dem SMB-Share und wird bei jedem Zyklus
-   neu eingelesen - Anpassungen wirken ohne Neustart/Redeploy.
+6. Die Zuordnungen liegen als `mapping.yaml` auf dem SMB-Share und werden bei
+   jedem Zyklus neu eingelesen - Anpassungen wirken ohne Neustart/Redeploy.
+   Gepflegt werden sie in der [Weboberflaeche](#weboberflaeche); die Datei
+   bleibt dabei das Original und ist im Notfall auch von Hand editierbar.
 
 Der Zugriff auf die Freigabe laeuft standardmaessig **direkt per SMB aus der
 Anwendung heraus**: es wird nichts gemountet, weder im Container noch auf dem
@@ -56,6 +60,8 @@ Proxmox-Host. Warum das so ist und welche Alternative es gibt, steht unter
 - Ein SMB-Share mit einem Benutzer, der Schreibrechte auf die Zielordner hat.
 - Ein Proxmox-Host mit einer LXC (Debian/Ubuntu-Template) oder VM, auf der
   entweder Docker+Compose oder Python 3.11+ verfuegbar ist.
+- Fuer die Weboberflaeche: ein freier Port (Default 8080) und ein Browser im
+  selben Netz. Sie ist optional (`WEB_ENABLED=false`).
 - **Kein** Mount und damit auch kein `cifs-utils` noetig - mail2nas spricht
   SMB selbst. Nur beim optionalen `STORAGE_BACKEND=local` muss das Share
   vorher vom Betriebssystem eingebunden sein.
@@ -80,8 +86,9 @@ Das Skript:
 1. Fragt (per whiptail-Dialogen) nach Container-Ressourcen (CTID, Hostname,
    CPU/RAM/Disk, Netzwerk-Bridge) - mit sinnvollen Defaults, die sich per
    "Standard-Einstellungen? Nein" auch im Detail anpassen lassen.
-2. Fragt anschliessend nach den IMAP- und SMB-Zugangsdaten sowie dem
-   Mapping-Pfad und Fallback-Ordner.
+2. Fragt anschliessend nach den IMAP- und SMB-Zugangsdaten, dem Mapping-Pfad
+   und Fallback-Ordner sowie danach, ob die Weboberflaeche aktiviert werden
+   soll (mit Port und Startpasswort).
 3. Legt eine neue, unprivilegierte Debian-12-LXC an (`pct create`).
 4. Installiert darin Docker und git, klont dieses Repository, schreibt die
    `.env` aus deinen Eingaben und startet den Dienst (`docker compose up -d`).
@@ -100,11 +107,12 @@ Defaults (siehe [Konfiguration](#konfiguration-environment-variablen)); nach
 der Installation einfach in `/opt/mail2nas/.env` in der LXC anpassen und
 `docker compose up -d` erneut ausfuehren.
 
-Danach fehlt nur noch `config/mapping.example.yaml` (liegt im Container unter
-`/opt/mail2nas/config/`) als `mapping.yaml` auf die Wurzel des SMB-Shares zu
-kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge). Da in
-der LXC nichts gemountet ist, geht das am einfachsten direkt vom NAS oder von
-einem beliebigen anderen Rechner mit Zugriff auf die Freigabe.
+Danach fehlen nur noch die Stichwort-Zuordnungen. Mit aktivierter
+Weboberflaeche geht das im Browser unter `http://<container-ip>:8080/` - das
+Skript zeigt die Adresse am Ende an. Ohne Weboberflaeche stattdessen
+`config/mapping.example.yaml` (liegt im Container unter
+`/opt/mail2nas/config/`) als `mapping.yaml` auf die Wurzel des SMB-Shares
+kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge).
 
 **Voraussetzung**: Der Proxmox-Host selbst braucht dafuer Internetzugriff auf
 GitHub (fuer den `curl`-Aufruf und den `git clone` in der LXC) sowie auf die
@@ -217,11 +225,15 @@ mail2nas selbst mit `//SMB_HOST/SMB_SHARE`. Beim Start wird einmal testweise
 geschrieben, damit falsche Zugangsdaten oder fehlende Schreibrechte sofort im
 Log stehen statt erst bei der ersten Mail.
 
-Danach `config/mapping.example.yaml` als `mapping.yaml` auf die Wurzel des
-Shares legen (Pfad relativ dazu ist in `MAPPING_PATH` konfigurierbar) und an
-die eigenen Stichwoerter/Ordner anpassen. Da das Share hier nirgends gemountet
-ist, geht das ueber einen beliebigen SMB-Client - Windows-Explorer, die
-Dateiverwaltung des NAS, oder `smbclient`:
+Die Stichwort-Zuordnungen werden danach in der
+[Weboberflaeche](#weboberflaeche) gepflegt: `http://<host>:8080/`, Anmeldung
+mit `WEB_PASSWORD` aus der `.env`.
+
+Wer die Oberflaeche nicht will (`WEB_ENABLED=false`), legt `mapping.yaml`
+stattdessen von Hand auf die Wurzel des Shares (Pfad relativ dazu ist in
+`MAPPING_PATH` konfigurierbar). Da das Share hier nirgends gemountet ist, geht
+das ueber einen beliebigen SMB-Client - Windows-Explorer, die Dateiverwaltung
+des NAS, oder `smbclient`:
 
 ```bash
 smbclient //nas.local/Belege -U mail2nas -c 'put config/mapping.example.yaml mapping.yaml'
@@ -308,8 +320,10 @@ systemctl status mail2nas
 journalctl -u mail2nas -f
 ```
 
-`mapping.yaml` wie im Docker-Abschnitt beschrieben auf die Wurzel der Freigabe
-(bzw. den konfigurierten `MAPPING_PATH`) legen.
+Die Weboberflaeche laeuft im systemd-Betrieb im selben Prozess mit, sobald
+`WEB_ENABLED=true` in der `.env` steht - ein zweiter Dienst ist nicht noetig.
+Alternativ `mapping.yaml` wie im Docker-Abschnitt beschrieben von Hand auf die
+Wurzel der Freigabe (bzw. den konfigurierten `MAPPING_PATH`) legen.
 
 Soll stattdessen ein bereits gemountetes Verzeichnis verwendet werden:
 `STORAGE_BACKEND=local` und `STORAGE_ROOT=/mnt/nas` in der `.env` setzen, und
@@ -388,6 +402,80 @@ bildet den User-Namespace ab 100000 ab. Ohne das gehoerten die Dateien im
 Container niemandem und waeren nicht beschreibbar. Bei einem privilegierten
 Container bleibt es bei `uid=1000`.
 
+## Weboberflaeche
+
+Eine kleine, passwortgeschuetzte Seite zum Pflegen der Stichwort-Zuordnungen -
+damit die `mapping.yaml` nicht mehr von Hand bearbeitet werden muss. Sie laeuft
+im selben Prozess wie der Archiver mit, es ist also kein zweiter Dienst und
+kein zweiter Container noetig.
+
+```
+http://<host-oder-container-ip>:8080/
+```
+
+Was sie kann:
+
+- **Stichwort zuordnen**: Stichwort eintippen und einen Zielordner aus einer
+  Liste der Ordner waehlen, die auf der Freigabe tatsaechlich existieren. Statt
+  einen Pfad zu tippen und sich zu vertippen, waehlt man aus - genau das ist
+  der Punkt der Oberflaeche. Ein neuer Ordner kann direkt angelegt werden.
+- **Zuordnung aendern oder loeschen**: pro Zeile ein Auswahlfeld und ein
+  Loeschen-Knopf. Der Ordner auf der Freigabe bleibt beim Loeschen bestehen,
+  entfernt wird nur die Regel.
+- **Passwort aendern**: nach dem Login unter „Passwort". Dabei werden alle
+  anderen angemeldeten Sitzungen abgemeldet.
+
+Aenderungen landen sofort in der `mapping.yaml` auf der Freigabe und wirken
+beim naechsten Durchlauf des Archivers - kein Neustart noetig.
+
+### Passwort
+
+`WEB_PASSWORD` in der `.env` ist das **Startpasswort**. Beim ersten Start wird
+es gehasht (scrypt) in der lokalen State-Datenbank abgelegt; ab dann gilt der
+gespeicherte Wert und `WEB_PASSWORD` wird ignoriert - eine Aenderung in der
+Oberflaeche ueberlebt also Neustarts und Updates. Mindestlaenge 8 Zeichen.
+
+Das Passwort in der `.env` nach der ersten Anmeldung zu aendern bringt nichts
+mehr; wer es wirklich zuruecksetzen muss, loescht den Eintrag in der
+State-Datenbank:
+
+```bash
+docker compose exec -T mail2nas python - <<'EOF'
+import sqlite3
+conn = sqlite3.connect("/data/state.db")
+conn.execute("DELETE FROM settings WHERE key = 'web_password_hash'")
+conn.commit()
+EOF
+docker compose restart
+```
+
+Danach gilt wieder das `WEB_PASSWORD` aus der `.env`.
+
+### Sicherheit
+
+Die Oberflaeche ist fuer das eigene LAN gedacht und entsprechend gebaut:
+
+- Ein Passwort, keine Benutzerverwaltung. Nach 5 Fehlversuchen ist die
+  Anmeldung fuer eine Minute gesperrt (pro IP).
+- Session-Cookie mit `HttpOnly` und `SameSite=Lax`, CSRF-Token in jedem
+  Formular, Sitzungsdauer 12 Stunden.
+- Kein JavaScript, keine externen Ressourcen, strikte Content-Security-Policy.
+- Zielordner werden genauso geprueft wie beim Archiver: `..` und absolute
+  Pfade werden abgelehnt, es kann also auch ueber die Oberflaeche nichts
+  ausserhalb der Archiv-Wurzel angelegt werden.
+
+**Nicht direkt aus dem Internet erreichbar machen.** Es gibt keine
+TLS-Terminierung und keine Zwei-Faktor-Authentisierung. Wer von aussen
+zugreifen will, nimmt VPN oder einen Reverse-Proxy mit HTTPS davor - und setzt
+dann `WEB_COOKIE_SECURE=true`, damit das Session-Cookie nur noch ueber TLS
+gesendet wird.
+
+Abschalten laesst sich das Ganze mit `WEB_ENABLED=false`; die `mapping.yaml`
+ist dann wieder ausschliesslich von Hand zu pflegen.
+
+`GET /healthz` antwortet ohne Anmeldung mit `ok` - praktisch fuer ein
+Monitoring-Check.
+
 ## Konfiguration (Environment-Variablen)
 
 | Variable | Beschreibung | Default |
@@ -418,6 +506,10 @@ Container bleibt es bei `uid=1000`.
 | `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
 | `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
+| `WEB_ENABLED` | [Weboberflaeche](#weboberflaeche) zum Pflegen der Zuordnungen starten | `false` |
+| `WEB_HOST` / `WEB_PORT` | Adresse und Port der Weboberflaeche | `0.0.0.0` / `8080` |
+| `WEB_PASSWORD` | Startpasswort (mind. 8 Zeichen); nur bis zur ersten Aenderung in der Oberflaeche relevant | - |
+| `WEB_COOKIE_SECURE` | Session-Cookie nur ueber HTTPS senden (hinter einem TLS-Reverse-Proxy auf `true`) | `false` |
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
 
@@ -434,7 +526,10 @@ Mount mehr - siehe
 
 ## Mapping-Datei und Mehrfach-Anhaenge
 
-Siehe `config/mapping.example.yaml`. Format:
+Normalerweise wird diese Datei ueber die [Weboberflaeche](#weboberflaeche)
+gepflegt. Sie bleibt aber eine gewoehnliche YAML-Datei auf der Freigabe und
+laesst sich genauso von Hand bearbeiten - die Oberflaeche schreibt exakt
+dieses Format. Siehe `config/mapping.example.yaml`:
 
 ```yaml
 RE: rechnungen
@@ -559,6 +654,15 @@ Mailserver/ClamAV) einplanen.
 - **`STORAGE_ROOT ... does not exist`** (nur bei `STORAGE_BACKEND=local`): das
   Share ist nicht gemountet. Entweder den Mount reparieren oder auf
   `STORAGE_BACKEND=smb` umstellen, dann wird kein Mount mehr gebraucht.
+- **Weboberflaeche nicht erreichbar**: `docker compose ps` zeigt, ob der Port
+  veroeffentlicht ist; `docker compose logs | grep "Web UI"` zeigt, ob sie
+  ueberhaupt gestartet ist (`WEB_ENABLED=true` gesetzt?). `curl
+  http://localhost:8080/healthz` muss `ok` liefern. Steht im Log
+  `Web UI cannot listen on ...`, ist der Port belegt - `WEB_PORT` aendern.
+- **Passwort der Weboberflaeche vergessen**: siehe
+  [Weboberflaeche -> Passwort](#passwort).
+- **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
+  selbst ab.
 
 ## Tests
 
@@ -590,6 +694,9 @@ python3 scripts/regenerate-bootstrap.py --check  # nur pruefen (fuer CI)
   Hauptpostfachs verwenden.
 - Dedizierten SMB-Benutzer mit Schreibrechten nur auf die relevanten
   Zielordner einrichten, statt vollem Share-Zugriff.
+- Die Weboberflaeche gehoert ins eigene LAN, nicht ins Internet: ein Passwort,
+  kein TLS von Haus aus. Details unter [Weboberflaeche](#weboberflaeche). Das
+  Startpasswort aus der `.env` nach der ersten Anmeldung dort aendern.
 - Die SMB-Zugangsdaten stehen ausschliesslich in der `.env` des Zielsystems.
   Es liegen keine Zugangsdaten und kein Mount auf dem Proxmox-Host, also
   bekommt auch niemand ueber eine Host-Shell oder ein Host-Backup Zugriff auf
@@ -736,7 +843,7 @@ auf.
 |---|---|---|
 | Zugangsdaten (IMAP + SMB) & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
 | Stichwort-Mapping | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
-| Bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
+| Bereits verarbeitete Mails, Passwort der Weboberflaeche | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert, und das geaenderte Passwort gilt weiter |
 
 Bringt eine neue Version zusaetzliche Konfigurationsvariablen mit, greifen
 dafuer automatisch die dokumentierten Defaults - eine aeltere `.env` bleibt

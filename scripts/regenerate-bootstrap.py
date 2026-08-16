@@ -39,12 +39,14 @@ EMBEDDED_FILES = (
     "mail2nas/filenames.py",
     "mail2nas/state.py",
     "mail2nas/archiver.py",
+    "mail2nas/web.py",
     "mail2nas/main.py",
     "tests/test_mapping.py",
     "tests/test_filenames.py",
     "tests/test_archiver.py",
     "tests/test_config.py",
     "tests/test_storage.py",
+    "tests/test_web.py",
 )
 
 HEADER = """\

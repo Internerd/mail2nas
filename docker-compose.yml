@@ -8,6 +8,12 @@ services:
       - .env
     environment:
       STATE_DB_PATH: /data/state.db
+    ports:
+      # Web UI for the keyword -> folder mapping. Host and container port are
+      # kept identical so WEB_PORT alone decides where it answers. Nothing
+      # listens here unless WEB_ENABLED=true - drop these two lines if you do
+      # not want the port published at all.
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
       # Only local state (processed-message tracking) - the archive itself is
       # reached over SMB by the application, so there is nothing to mount here.

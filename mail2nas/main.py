@@ -9,7 +9,7 @@ from . import storage as storage_module
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
-from .state import ProcessedStore
+from .state import ProcessedStore, SettingsStore
 
 logger = logging.getLogger("mail2nas")
 
@@ -29,6 +29,13 @@ def main() -> None:
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     archiver = Archiver(config, mapping, store, storage)
+
+    if config.web_enabled:
+        # Imported lazily so the archiver still runs if the web dependencies
+        # are missing (e.g. an older image built before the UI existed).
+        from . import web
+
+        web.serve(config, storage, SettingsStore(config.state_db_path))
 
     logger.info(
         "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s (%s) dry_run=%s",

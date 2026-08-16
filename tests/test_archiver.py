@@ -45,6 +45,11 @@ def _make_config(tmp_path, **overrides) -> Config:
         quarantine_folder="quarantaene",
         state_db_path=str(tmp_path / "state.db"),
         dry_run=False,
+        web_enabled=False,
+        web_host="127.0.0.1",
+        web_port=8080,
+        web_password="",
+        web_cookie_secure=False,
     )
     defaults.update(overrides)
     return Config(**defaults)

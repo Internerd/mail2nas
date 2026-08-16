@@ -110,6 +110,13 @@ class Config:
     state_db_path: str
     dry_run: bool
 
+    # Optional web UI for editing the keyword -> folder mapping.
+    web_enabled: bool
+    web_host: str
+    web_port: int
+    web_password: str  # initial password only; the stored hash wins once set
+    web_cookie_secure: bool
+
     @classmethod
     def from_env(cls) -> "Config":
         # Defaults to "local" so an existing install whose .env predates this
@@ -153,6 +160,11 @@ class Config:
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
+                web_enabled=_bool("WEB_ENABLED", False),
+                web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip(),
+                web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
+                web_password=os.environ.get("WEB_PASSWORD", ""),
+                web_cookie_secure=_bool("WEB_COOKIE_SECURE", False),
             )
         except KeyError as exc:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc

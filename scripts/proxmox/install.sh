@@ -17,6 +17,9 @@
 #
 # Mit STORAGE_BACKEND=local wird stattdessen in ein bereits vom Betriebssystem
 # gemountetes Verzeichnis (NAS_PATH, Default /mnt/nas) geschrieben.
+#
+# Die Weboberflaeche fuer das Mapping ist per Default an (WEB_ENABLED=true) und
+# braucht dann ein Startpasswort in WEB_PASSWORD.
 # Existiert bereits eine .env und werden keine Zugangsdaten uebergeben,
 # laeuft das Skript im Update-Modus und laesst die Konfiguration unveraendert.
 
@@ -76,8 +79,16 @@ fi
 
 STORAGE_BACKEND="${STORAGE_BACKEND:-smb}"
 NAS_PATH="${NAS_PATH:-/mnt/nas}"
+WEB_ENABLED="${WEB_ENABLED:-true}"
 
 if [ "$WRITE_ENV" -eq 1 ]; then
+  # Ohne Startpasswort wuerde die Oberflaeche beim Start abbrechen - das lieber
+  # hier sagen als im Container-Log.
+  if [ "$WEB_ENABLED" = "true" ] && [ -z "${WEB_PASSWORD:-}" ]; then
+    echo "FEHLER: WEB_ENABLED=true, aber WEB_PASSWORD ist nicht gesetzt." >&2
+    echo "Startpasswort setzen (mind. 8 Zeichen) oder WEB_ENABLED=false uebergeben." >&2
+    exit 1
+  fi
   if [ "$STORAGE_BACKEND" = "smb" ]; then
     # Nichts zu mounten - die Anwendung verbindet sich selbst zum NAS.
     : "${SMB_HOST:?SMB_HOST ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
@@ -142,6 +153,12 @@ IMAP_OVERSIZED_FOLDER=$(dq "${IMAP_OVERSIZED_FOLDER:-}")
 IMAP_MODE=$(dq "${IMAP_MODE:-idle}")
 POLL_INTERVAL_SECONDS=$(dq "${POLL_INTERVAL_SECONDS:-300}")
 
+WEB_ENABLED=$(dq "${WEB_ENABLED:-true}")
+WEB_HOST=$(dq "${WEB_HOST:-0.0.0.0}")
+WEB_PORT=$(dq "${WEB_PORT:-8080}")
+WEB_PASSWORD=$(dq "${WEB_PASSWORD:-}")
+WEB_COOKIE_SECURE=$(dq "${WEB_COOKIE_SECURE:-false}")
+
 STORAGE_BACKEND=$(dq "${STORAGE_BACKEND}")
 SMB_HOST=$(dq "${SMB_HOST:-}")
 SMB_SHARE=$(dq "${SMB_SHARE:-}")
@@ -202,10 +219,17 @@ else
 fi
 echo "Logs:    cd $TARGET_DIR && docker compose logs -f"
 echo "Config:  $TARGET_DIR/.env (chmod 600)"
+if [ "$WEB_ENABLED" = "true" ]; then
+  CT_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo "Weboberflaeche: http://${CT_IP:-<container-ip>}:${WEB_PORT:-8080}/"
+fi
 
 if [ "$WRITE_ENV" -eq 1 ]; then
   echo
-  if [ "$STORAGE_BACKEND" = "smb" ]; then
+  if [ "$WEB_ENABLED" = "true" ]; then
+    echo "Naechster Schritt: in der Weboberflaeche anmelden und die Stichwoerter"
+    echo "den Zielordnern zuordnen. Das Passwort dort bitte gleich aendern."
+  elif [ "$STORAGE_BACKEND" = "smb" ]; then
     echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml in die"
     echo "Wurzel der Freigabe //${SMB_HOST}/${SMB_SHARE} kopieren (vom NAS oder"
     echo "einem anderen Rechner aus) und an die eigenen Stichwoerter anpassen."

@@ -61,6 +61,27 @@ class Storage(ABC):
         """Read a UTF-8 text file relative to the root. Raises FileNotFoundError."""
 
     @abstractmethod
+    def write_text(self, relative: str, text: str) -> None:
+        """Overwrite a UTF-8 text file relative to the root, atomically.
+
+        Unlike `save_unique` this replaces an existing file - it is used for
+        the mapping file, which the web UI rewrites in place.
+        """
+
+    @abstractmethod
+    def list_folders(self, max_depth: int = 2) -> list[str]:
+        """Existing directories below the root, as relative POSIX paths.
+
+        Feeds the folder picker in the web UI, so people assign keywords to
+        folders that actually exist instead of typing a path by hand. Hidden
+        directories are skipped.
+        """
+
+    @abstractmethod
+    def create_folder(self, relative: str) -> None:
+        """Create a directory below the root, including parents."""
+
+    @abstractmethod
     def modified_time(self, relative: str) -> float:
         """Modification time of a file relative to the root. Raises FileNotFoundError."""
 
@@ -103,6 +124,34 @@ class LocalStorage(Storage):
 
     def read_text(self, relative: str) -> str:
         return self._resolve(relative).read_text(encoding="utf-8")
+
+    def write_text(self, relative: str, text: str) -> None:
+        path = self._resolve(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(path, text.encode("utf-8"))
+
+    def list_folders(self, max_depth: int = 2) -> list[str]:
+        found: list[str] = []
+
+        def walk(directory: Path, prefix: str, depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
+            except OSError:
+                return
+            for entry in entries:
+                if entry.name.startswith(".") or not entry.is_dir():
+                    continue
+                relative = f"{prefix}{entry.name}"
+                found.append(relative)
+                walk(entry, f"{relative}/", depth + 1)
+
+        walk(self._root, "", 1)
+        return found
+
+    def create_folder(self, relative: str) -> None:
+        self._root.joinpath(*safe_relative_parts(relative)).mkdir(parents=True, exist_ok=True)
 
     def modified_time(self, relative: str) -> float:
         return self._resolve(relative).stat().st_mtime
@@ -318,6 +367,60 @@ class SmbStorage(Storage):
             self._unc(parts[:-1], parts[-1]), mode="r", encoding="utf-8", **self._kwargs
         ) as fh:
             return fh.read()
+
+    def write_text(self, relative: str, text: str) -> None:
+        parts = safe_relative_parts(relative)
+        self._with_reconnect("write", lambda: self._write_text(parts, text))
+
+    def _write_text(self, parts: Sequence[str], text: str) -> None:
+        import smbclient
+
+        directory, name = tuple(parts[:-1]), parts[-1]
+        self._ensure_dir(directory)
+        tmp_path = self._unc(directory, f"{TEMP_PREFIX}{secrets.token_hex(8)}")
+        try:
+            with smbclient.open_file(tmp_path, mode="xb", **self._kwargs) as fh:
+                fh.write(text.encode("utf-8"))
+            smbclient.replace(tmp_path, self._unc(directory, name), **self._kwargs)
+        except BaseException:
+            try:
+                smbclient.remove(tmp_path, **self._kwargs)
+            except Exception:  # noqa: BLE001 - cleanup of a failed write is best effort
+                logger.debug("Could not remove temporary file %s", tmp_path, exc_info=True)
+            raise
+
+    def list_folders(self, max_depth: int = 2) -> list[str]:
+        return self._with_reconnect("list", lambda: self._list_folders(max_depth))
+
+    def _list_folders(self, max_depth: int) -> list[str]:
+        import smbclient
+
+        found: list[str] = []
+
+        def walk(parts: tuple[str, ...], prefix: str, depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(
+                    smbclient.scandir(self._unc(parts), **self._kwargs),
+                    key=lambda e: e.name.lower(),
+                )
+            except Exception:  # noqa: BLE001 - an unreadable subfolder must not hide the rest
+                logger.debug("Could not list %s", self._unc(parts), exc_info=True)
+                return
+            for entry in entries:
+                if entry.name.startswith(".") or not entry.is_dir():
+                    continue
+                relative = f"{prefix}{entry.name}"
+                found.append(relative)
+                walk((*parts, entry.name), f"{relative}/", depth + 1)
+
+        walk((), "", 1)
+        return found
+
+    def create_folder(self, relative: str) -> None:
+        parts = safe_relative_parts(relative)
+        self._with_reconnect("mkdir", lambda: self._ensure_dir(parts))
 
     def modified_time(self, relative: str) -> float:
         parts = safe_relative_parts(relative)

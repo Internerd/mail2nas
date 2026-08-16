@@ -17,4 +17,6 @@ RUN useradd --create-home --uid 1000 mail2nas \
 USER mail2nas
 
 ENV PYTHONUNBUFFERED=1
+# Only listened on when WEB_ENABLED=true (mapping web UI).
+EXPOSE 8080
 ENTRYPOINT ["python", "-m", "mail2nas.main"]

@@ -60,7 +60,7 @@ msg "mail2nas Proxmox-Installer
 
 Legt eine neue LXC an, installiert Docker darin und deployt mail2nas (IMAP -> SMB Anhang-Archivierung mit Stichwort-Mapping).
 
-Du wirst zuerst nach den Container-Ressourcen gefragt, danach nach IMAP- und SMB-Zugangsdaten. Alle Passwoerter landen ausschliesslich in der .env der Ziel-LXC, niemals im Bash-Verlauf des Proxmox-Hosts."
+Du wirst zuerst nach den Container-Ressourcen gefragt, danach nach IMAP- und SMB-Zugangsdaten sowie der optionalen Weboberflaeche zum Pflegen der Zuordnungen. Alle Passwoerter landen ausschliesslich in der .env der Ziel-LXC, niemals im Bash-Verlauf des Proxmox-Hosts."
 
 # --- Container-Einstellungen --------------------------------------------------
 
@@ -142,6 +142,26 @@ SMB_ROOT="$(input 'Unterordner innerhalb der Freigabe (leer = Wurzel der Freigab
 MAPPING_PATH="$(input 'Pfad zur mapping.yaml relativ zur Archiv-Wurzel' 'mapping.yaml')"
 FALLBACK_FOLDER="$(input 'Fallback-Ordner ohne Mapping-Treffer' 'unsorted')"
 
+# --- App-Konfiguration: Weboberflaeche ------------------------------------------
+
+if yesno "Weboberflaeche zum Pflegen der Stichwort-Zuordnungen aktivieren?
+
+Kleine, passwortgeschuetzte Seite im Container, auf der Stichwoerter den
+Zielordnern zugeordnet werden - dann muss die mapping.yaml nicht von Hand
+bearbeitet werden. Erreichbar ueber http://<container-ip>:<port>/"; then
+  WEB_ENABLED=true
+  WEB_PORT="$(input 'Port der Weboberflaeche' '8080')"
+  while :; do
+    WEB_PASSWORD="$(password 'Startpasswort fuer die Weboberflaeche (mind. 8 Zeichen, spaeter dort aenderbar)')"
+    [ "${#WEB_PASSWORD}" -ge 8 ] && break
+    msg "Das Passwort braucht mindestens 8 Zeichen."
+  done
+else
+  WEB_ENABLED=false
+  WEB_PORT=8080
+  WEB_PASSWORD=""
+fi
+
 # --- Hinweis: kein Mount, weder auf dem Host noch im Container -------------
 #
 # mail2nas spricht SMB direkt aus der Anwendung heraus. Damit entfaellt der
@@ -201,6 +221,10 @@ IMAP_PASSWORD=$(sq "$IMAP_PASSWORD")
 IMAP_FOLDER=$(sq "$IMAP_FOLDER")
 IMAP_MODE=$(sq "$IMAP_MODE")
 POLL_INTERVAL_SECONDS=$(sq "$POLL_INTERVAL_SECONDS")
+WEB_ENABLED=$(sq "$WEB_ENABLED")
+WEB_HOST='0.0.0.0'
+WEB_PORT=$(sq "$WEB_PORT")
+WEB_PASSWORD=$(sq "$WEB_PASSWORD")
 STORAGE_BACKEND='smb'
 SMB_HOST=$(sq "$SMB_HOST")
 SMB_SHARE=$(sq "$SMB_SHARE")
@@ -228,13 +252,21 @@ pct exec "$CTID" -- bash -c "chmod +x /root/mail2nas-install.sh && /root/mail2na
 
 CT_IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
 
+if [ "$WEB_ENABLED" = "true" ]; then
+  WEB_HINT="Naechster Schritt - Weboberflaeche oeffnen und die Stichwoerter den Zielordnern zuordnen:
+  http://${CT_IP:-<container-ip>}:${WEB_PORT}/
+Anmeldung mit dem eingegebenen Startpasswort; bitte dort gleich aendern. Die Oberflaeche schreibt die mapping.yaml auf der Freigabe."
+else
+  WEB_HINT="Naechster Schritt - Mapping-Datei auf der Freigabe anlegen (vom NAS oder einem Windows-Rechner aus): config/mapping.example.yaml aus dem Repo als mapping.yaml in die Wurzel der Freigabe kopieren und an die eigenen Stichwoerter anpassen. Ohne diese Datei landet alles im Fallback-Ordner '${FALLBACK_FOLDER}'."
+fi
+
 FINAL_MSG="Fertig!
 
 Container $CTID ($CT_HOSTNAME) laeuft unter ${CT_IP:-<unbekannt>}.
 
 mail2nas schreibt direkt per SMB auf //${SMB_HOST}/${SMB_SHARE} - es ist nichts gemountet, weder auf dem Proxmox-Host noch im Container. Die SMB-Zugangsdaten stehen ausschliesslich in /opt/mail2nas/.env innerhalb der LXC (chmod 600).
 
-Naechster Schritt - Mapping-Datei auf der Freigabe anlegen (vom NAS oder einem Windows-Rechner aus): config/mapping.example.yaml aus dem Repo als mapping.yaml in die Wurzel der Freigabe kopieren und an die eigenen Stichwoerter anpassen. Ohne diese Datei landet alles im Fallback-Ordner '${FALLBACK_FOLDER}'.
+${WEB_HINT}
 
 Logs pruefen:
   pct exec $CTID -- bash -c 'cd /opt/mail2nas && docker compose logs -f'
