@@ -21,6 +21,21 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Render a value as a double-quoted literal for docker compose's .env parser.
+#
+# Note this is deliberately NOT shell quoting: compose's dotenv parser does not
+# understand the shell's '\'' idiom for an embedded single quote and errors out
+# on it. Double quotes with \\ , \" and $$ escapes are what it does understand,
+# and that combination round-trips every character (quotes, backticks, $( ),
+# spaces, #) literally - so a password can never be executed or interpolated.
+dq() {
+  local v=${1-}
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  v=${v//\$/\$\$}
+  printf '"%s"' "$v"
+}
+
 if [ -f /root/mail2nas-install.env ]; then
   set -a
   # shellcheck disable=SC1091
@@ -65,37 +80,37 @@ cd "$TARGET_DIR"
 echo "==> .env schreiben ..."
 umask 077
 cat > .env <<ENVEOF
-IMAP_HOST=${IMAP_HOST}
-IMAP_PORT=${IMAP_PORT:-993}
-IMAP_SSL=${IMAP_SSL:-true}
-IMAP_USER=${IMAP_USER}
-IMAP_PASSWORD=${IMAP_PASSWORD}
-IMAP_FOLDER=${IMAP_FOLDER:-INBOX}
-IMAP_PROCESSED_FOLDER=${IMAP_PROCESSED_FOLDER:-}
-IMAP_OVERSIZED_FOLDER=${IMAP_OVERSIZED_FOLDER:-}
-IMAP_MODE=${IMAP_MODE:-idle}
-POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-300}
+IMAP_HOST=$(dq "${IMAP_HOST}")
+IMAP_PORT=$(dq "${IMAP_PORT:-993}")
+IMAP_SSL=$(dq "${IMAP_SSL:-true}")
+IMAP_USER=$(dq "${IMAP_USER}")
+IMAP_PASSWORD=$(dq "${IMAP_PASSWORD}")
+IMAP_FOLDER=$(dq "${IMAP_FOLDER:-INBOX}")
+IMAP_PROCESSED_FOLDER=$(dq "${IMAP_PROCESSED_FOLDER:-}")
+IMAP_OVERSIZED_FOLDER=$(dq "${IMAP_OVERSIZED_FOLDER:-}")
+IMAP_MODE=$(dq "${IMAP_MODE:-idle}")
+POLL_INTERVAL_SECONDS=$(dq "${POLL_INTERVAL_SECONDS:-300}")
 
-SMB_HOST=${SMB_HOST}
-SMB_SHARE=${SMB_SHARE}
-SMB_USER=${SMB_USER}
-SMB_PASSWORD=${SMB_PASSWORD}
-SMB_DOMAIN=${SMB_DOMAIN:-}
+SMB_HOST=$(dq "${SMB_HOST}")
+SMB_SHARE=$(dq "${SMB_SHARE}")
+SMB_USER=$(dq "${SMB_USER}")
+SMB_PASSWORD=$(dq "${SMB_PASSWORD}")
+SMB_DOMAIN=$(dq "${SMB_DOMAIN:-}")
 
-MAPPING_PATH=${MAPPING_PATH:-mapping.yaml}
-FALLBACK_FOLDER=${FALLBACK_FOLDER:-unsorted}
-MATCH_BODY=${MATCH_BODY:-false}
-FILENAME_PREFIX=${FILENAME_PREFIX:-date_sender}
+MAPPING_PATH=$(dq "${MAPPING_PATH:-mapping.yaml}")
+FALLBACK_FOLDER=$(dq "${FALLBACK_FOLDER:-unsorted}")
+MATCH_BODY=$(dq "${MATCH_BODY:-false}")
+FILENAME_PREFIX=$(dq "${FILENAME_PREFIX:-date_sender}")
 
-MAX_ATTACHMENT_SIZE_MB=${MAX_ATTACHMENT_SIZE_MB:-25}
-MAX_MESSAGE_SIZE_MB=${MAX_MESSAGE_SIZE_MB:-50}
-MAX_ATTACHMENTS_PER_MESSAGE=${MAX_ATTACHMENTS_PER_MESSAGE:-20}
-BLOCKED_EXTENSIONS=${BLOCKED_EXTENSIONS:-exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk}
-QUARANTINE_FOLDER=${QUARANTINE_FOLDER:-quarantaene}
+MAX_ATTACHMENT_SIZE_MB=$(dq "${MAX_ATTACHMENT_SIZE_MB:-25}")
+MAX_MESSAGE_SIZE_MB=$(dq "${MAX_MESSAGE_SIZE_MB:-50}")
+MAX_ATTACHMENTS_PER_MESSAGE=$(dq "${MAX_ATTACHMENTS_PER_MESSAGE:-20}")
+BLOCKED_EXTENSIONS=$(dq "${BLOCKED_EXTENSIONS:-exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk}")
+QUARANTINE_FOLDER=$(dq "${QUARANTINE_FOLDER:-quarantaene}")
 
-STATE_DB_PATH=/data/state.db
-LOG_LEVEL=${LOG_LEVEL:-INFO}
-DRY_RUN=${DRY_RUN:-false}
+STATE_DB_PATH="/data/state.db"
+LOG_LEVEL=$(dq "${LOG_LEVEL:-INFO}")
+DRY_RUN=$(dq "${DRY_RUN:-false}")
 ENVEOF
 chmod 600 .env
 

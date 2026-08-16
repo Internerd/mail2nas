@@ -39,6 +39,17 @@ if ! command -v whiptail >/dev/null 2>&1; then
   apt-get install -y whiptail
 fi
 
+# Render a value as a single-quoted shell/dotenv literal. Passwords and other
+# free-text input must never land unquoted in a file that gets `source`d or
+# parsed by docker compose - otherwise characters like ` or $( ) are executed
+# instead of being taken literally.
+sq() {
+  local v=${1-}
+  local q="'"
+  local esc="'\\''"
+  printf "%s%s%s" "$q" "${v//$q/$esc}" "$q"
+}
+
 msg() { whiptail --title "mail2nas" --msgbox "$1" 18 76; }
 yesno() { whiptail --title "mail2nas" --yesno "$1" 14 76; }
 input() { whiptail --title "mail2nas" --inputbox "$1" 10 76 "$2" 3>&1 1>&2 2>&3; }
@@ -167,23 +178,23 @@ fi
 ENV_FILE="$(mktemp)"
 chmod 600 "$ENV_FILE"
 cat > "$ENV_FILE" <<ENVEOF
-IMAP_HOST=${IMAP_HOST}
-IMAP_PORT=${IMAP_PORT}
-IMAP_SSL=true
-IMAP_USER=${IMAP_USER}
-IMAP_PASSWORD=${IMAP_PASSWORD}
-IMAP_FOLDER=${IMAP_FOLDER}
-IMAP_MODE=${IMAP_MODE}
-POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
-SMB_HOST=${SMB_HOST}
-SMB_SHARE=${SMB_SHARE}
-SMB_USER=${SMB_USER}
-SMB_PASSWORD=${SMB_PASSWORD}
-SMB_DOMAIN=${SMB_DOMAIN}
-MAPPING_PATH=${MAPPING_PATH}
-FALLBACK_FOLDER=${FALLBACK_FOLDER}
-MAIL2NAS_REPO_URL=${REPO_URL}
-MAIL2NAS_REPO_BRANCH=${REPO_BRANCH}
+IMAP_HOST=$(sq "$IMAP_HOST")
+IMAP_PORT=$(sq "$IMAP_PORT")
+IMAP_SSL='true'
+IMAP_USER=$(sq "$IMAP_USER")
+IMAP_PASSWORD=$(sq "$IMAP_PASSWORD")
+IMAP_FOLDER=$(sq "$IMAP_FOLDER")
+IMAP_MODE=$(sq "$IMAP_MODE")
+POLL_INTERVAL_SECONDS=$(sq "$POLL_INTERVAL_SECONDS")
+SMB_HOST=$(sq "$SMB_HOST")
+SMB_SHARE=$(sq "$SMB_SHARE")
+SMB_USER=$(sq "$SMB_USER")
+SMB_PASSWORD=$(sq "$SMB_PASSWORD")
+SMB_DOMAIN=$(sq "$SMB_DOMAIN")
+MAPPING_PATH=$(sq "$MAPPING_PATH")
+FALLBACK_FOLDER=$(sq "$FALLBACK_FOLDER")
+MAIL2NAS_REPO_URL=$(sq "$REPO_URL")
+MAIL2NAS_REPO_BRANCH=$(sq "$REPO_BRANCH")
 ENVEOF
 
 INSTALL_SCRIPT="$(mktemp)"

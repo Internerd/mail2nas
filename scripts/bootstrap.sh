@@ -37,6 +37,14 @@ MAIL2NAS_EOF
 # --- .env.example --------------------------------------------------------
 cat > .env.example <<'MAIL2NAS_EOF'
 # Copy to .env and fill in real values. Never commit the real .env file.
+#
+# QUOTING: Wenn ein Wert (typisch: ein Passwort) Sonderzeichen wie
+# Leerzeichen, #, $, ", ' oder ` enthaelt, den Wert in doppelte
+# Anfuehrungszeichen setzen und darin \ als \\ , " als \" und $ als $$
+# schreiben, z. B.:
+#     IMAP_PASSWORD="ab\$\$(x)c\"d'e`f #g"
+# Sonst interpretiert docker compose Teile des Werts (oder bricht ab).
+# Die Installer-Skripte in scripts/ erledigen das automatisch.
 
 # --- IMAP source mailbox -----------------------------------------------
 IMAP_HOST=imap.example.com
