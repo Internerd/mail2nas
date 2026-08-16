@@ -8,6 +8,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
 
+from .accounts import Account
 from .config import Config
 from .filenames import safe_relative_parts, sanitize_filename
 from .mapping import Mapping
@@ -26,8 +27,10 @@ def _decode(value: str | None) -> str:
         return value
 
 
-def _message_id(msg: Message, uid: int) -> str:
-    return msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>"
+def _message_id(msg: Message, uid: int, account_key: str) -> str:
+    """Idempotency key. Scoped per account: the same message delivered to two
+    watched mailboxes is two things to archive, not one."""
+    return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
 def _extension_of(filename: str) -> str:
@@ -37,17 +40,30 @@ def _extension_of(filename: str) -> str:
 
 
 class Archiver:
-    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore, storage: Storage):
+    def __init__(
+        self,
+        config: Config,
+        mapping: Mapping,
+        store: ProcessedStore,
+        storage: Storage,
+        account: Account,
+    ):
         self.config = config
         self.mapping = mapping
         self.store = store
         self.storage = storage
+        self.account = account
 
     def connect(self) -> IMAPClient:
-        client = IMAPClient(self.config.imap_host, port=self.config.imap_port, ssl=self.config.imap_ssl)
-        client.login(self.config.imap_user, self.config.imap_password)
-        client.select_folder(self.config.imap_folder)
+        client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
+        client.login(self.account.user, self.account.password)
+        client.select_folder(self.account.folder)
         return client
+
+    def _resolve(self, *texts: str) -> tuple[str, str | None]:
+        # Rules can be limited to a single mailbox, so the account has to be
+        # part of every lookup.
+        return self.mapping.resolve(*texts, account_id=self.account.key)
 
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
@@ -82,13 +98,13 @@ class Archiver:
             )
             if not self.config.dry_run:
                 client.add_flags([uid], [b"\\Seen"])
-                if self.config.imap_oversized_folder:
-                    client.move([uid], self.config.imap_oversized_folder)
+                if self.account.oversized_folder:
+                    client.move([uid], self.account.oversized_folder)
             return True
 
         raw = client.fetch([uid], ["RFC822"])[uid][b"RFC822"]
         msg = email.message_from_bytes(raw)
-        message_id = _message_id(msg, uid)
+        message_id = _message_id(msg, uid, self.account.key)
 
         if self.store.is_processed(message_id):
             logger.info("UID %s (%s) already processed, marking seen and skipping", uid, message_id)
@@ -98,7 +114,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
+        mail_folder, mail_keyword = self._resolve(subject, body)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -160,8 +176,8 @@ class Archiver:
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
             client.add_flags([uid], [b"\\Seen"])
-            if self.config.imap_processed_folder:
-                client.move([uid], self.config.imap_processed_folder)
+            if self.account.processed_folder:
+                client.move([uid], self.account.processed_folder)
         return True
 
     def _target_parts(self, folder_name: str) -> tuple[str, ...]:
@@ -197,7 +213,7 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self.mapping.resolve(filename)
+        folder_name, matched_keyword = self._resolve(filename)
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 

@@ -35,9 +35,13 @@ from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .mapping import (
+    ALL_ACCOUNTS,
     MappingError,
+    Rule,
     load_rules,
+    move_rule,
     save_rules,
+    set_account,
     validate_folder,
     validate_keyword,
 )
@@ -119,7 +123,7 @@ BASE_TEMPLATE = """
   th, td { text-align: left; padding: .5rem .4rem; border-bottom: 1px solid var(--line);
            vertical-align: middle; }
   th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  td.keyword { font-weight: 600; word-break: break-word; }
+  td.keyword { font-weight: 600; overflow-wrap: break-word; min-width: 9rem; }
   .table-wrap { overflow-x: auto; }
   input, select, button { font: inherit; color: inherit; }
   input[type=text], input[type=password], select {
@@ -134,8 +138,8 @@ BASE_TEMPLATE = """
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
   /* Inside a table cell the select and its button have to stay on one line,
      otherwise every rule takes two rows and the table gets hard to scan. */
-  td .row { flex-wrap: nowrap; gap: .4rem; }
-  td select { max-width: 18rem; }
+  .row.nowrap { flex-wrap: nowrap; gap: .4rem; }
+  td select { max-width: 16rem; min-width: 8rem; }
   .field { display: flex; flex-direction: column; gap: .25rem; }
   .field label { font-size: .8rem; color: var(--muted); }
   .hint { color: var(--muted); font-size: .85rem; }
@@ -146,6 +150,13 @@ BASE_TEMPLATE = """
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-all; }
   form.inline { display: inline; }
+  td.prio { white-space: nowrap; }
+  button.arrow { background: transparent; border: 1px solid var(--line); color: var(--fg);
+                 padding: .1rem .35rem; line-height: 1.1; }
+  button.arrow[disabled] { opacity: .35; cursor: default; }
+  code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+         padding: 0 .25rem; font-size: .85em; }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -155,6 +166,7 @@ BASE_TEMPLATE = """
     {% if logged_in %}
     <nav>
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
+      <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -210,38 +222,82 @@ MAPPING_BODY = """
         <label for="new_folder">oder neuen Ordner anlegen</label>
         <input id="new_folder" name="new_folder" type="text" placeholder="z. B. rechnungen/2026">
       </div>
+      {% if accounts|length > 1 %}
+      <div class="field">
+        <label for="account">Postfach</label>
+        <select id="account" name="account">
+          <option value="all">alle Postfaecher</option>
+          {% for account in accounts %}
+            <option value="{{ account.key }}">{{ account.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       <button type="submit">Hinzufuegen</button>
     </div>
   </form>
-  <p class="hint">Laengere Stichwoerter gewinnen vor kuerzeren, Gross-/Kleinschreibung
-  ist egal. Aenderungen wirken beim naechsten Durchlauf, ein Neustart ist nicht noetig.</p>
+  <p class="hint">Gross-/Kleinschreibung ist egal. <code>*</code> steht fuer beliebig
+  viele Zeichen, <code>?</code> fuer genau eines - <code>RE*2026</code> passt also auf
+  &bdquo;RE-4711 vom 03.2026&ldquo;. Aenderungen wirken beim naechsten Durchlauf,
+  ein Neustart ist nicht noetig.</p>
 </div>
 
 <div class="card">
   <h2 style="margin-top:0">Aktuelle Zuordnungen ({{ rules|length }})</h2>
   {% if rules %}
+  <p class="hint" style="margin-top:0">Von oben nach unten geprueft - die erste
+  passende Zuordnung gewinnt. Mit den Pfeilen verschieben.</p>
   <div class="table-wrap">
   <table>
-    <tr><th>Stichwort</th><th>Zielordner</th><th></th></tr>
-    {% for keyword, folder in rules.items() %}
     <tr>
-      <td class="keyword">{{ keyword }}</td>
-      <td>
-        <form method="post" action="{{ url_for('update_rule') }}" class="row">
+      <th>Prio</th><th>Stichwort</th><th>Ziel{% if accounts|length > 1 %} und Postfach{% endif %}</th><th></th>
+    </tr>
+    {% for rule in rules %}
+    <tr>
+      <td class="prio">
+        <form class="inline" method="post" action="{{ url_for('move_rule_up') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="keyword" value="{{ keyword }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button class="arrow" type="submit" title="nach oben"
+                  {% if loop.first %}disabled{% endif %}>&uarr;</button>
+        </form>
+        <form class="inline" method="post" action="{{ url_for('move_rule_down') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button class="arrow" type="submit" title="nach unten"
+                  {% if loop.last %}disabled{% endif %}>&darr;</button>
+        </form>
+        <span class="hint">{{ loop.index }}</span>
+      </td>
+      <td class="keyword">{{ rule.keyword }}</td>
+      <td>
+        <form method="post" action="{{ url_for('update_rule') }}" class="row nowrap">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
           <select name="folder">
-            {% for option in folder_options(folder) %}
-              <option value="{{ option }}" {% if option == folder %}selected{% endif %}>{{ option }}</option>
+            {% for option in folder_options(rule.folder) %}
+              <option value="{{ option }}" {% if option == rule.folder %}selected{% endif %}>{{ option }}</option>
             {% endfor %}
           </select>
+          {% if accounts|length > 1 %}
+          <select name="account">
+            <option value="all" {% if rule.account == 'all' %}selected{% endif %}>alle Postfaecher</option>
+            {% for account in accounts %}
+              <option value="{{ account.key }}"
+                {% if rule.account == account.key %}selected{% endif %}>{{ account.name }}</option>
+            {% endfor %}
+            {% if rule.account not in account_keys %}
+              <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
           <button class="secondary" type="submit">Speichern</button>
         </form>
       </td>
       <td>
         <form method="post" action="{{ url_for('delete_rule') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="keyword" value="{{ keyword }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
           <button class="danger" type="submit">Loeschen</button>
         </form>
       </td>
@@ -264,6 +320,154 @@ MAPPING_BODY = """
     <dt>Gesperrte Dateiendungen</dt><dd>{{ quarantine_folder }}</dd>
   </dl>
 </div>
+"""
+
+CONFIG_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Postfaecher</h2>
+  {% if accounts %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Postfach</th><th>Ordner</th><th>Modus</th><th>Status</th><th></th></tr>
+    {% for account in accounts %}
+    <tr>
+      <td class="keyword">{{ account.name }}</td>
+      <td>{{ account.user }}<br><span class="hint">{{ account.host }}:{{ account.port }}{%
+        if not account.ssl %} &middot; ohne TLS{% endif %}</span></td>
+      <td>{{ account.folder }}</td>
+      <td>{{ account.mode }}</td>
+      <td>{% if account.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_account', account_id=account.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Kein Postfach konfiguriert - es wird nichts abgeholt.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_account') }}">
+    <button type="button">Postfach hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Mapping-Datei</h2>
+  <form method="post" action="{{ url_for('move_mapping') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="mapping_path">Pfad relativ zur Archiv-Wurzel</label>
+        <input id="mapping_path" name="mapping_path" type="text" value="{{ mapping_path }}" required>
+      </div>
+      <button type="submit">Verschieben</button>
+    </div>
+    <p class="hint">Die vorhandene Datei wird an den neuen Ort kopiert und am
+    alten geloescht. Archiv: {{ storage_description }}</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Feste Einstellungen</h2>
+  <p class="hint" style="margin-top:0">Diese kommen aus der .env und brauchen einen
+  Neustart des Containers.</p>
+  <dl>
+    <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
+    <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
+    <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
+    <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
+    <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
+    <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
+    <dt>Testmodus (DRY_RUN)</dt><dd>{{ 'an' if dry_run else 'aus' }}</dd>
+  </dl>
+</div>
+"""
+
+ACCOUNT_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Postfach bearbeiten' if account else 'Postfach hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ account.name if account else '' }}"
+               placeholder="z. B. Buchhaltung" required>
+      </div>
+      <div class="field">
+        <label for="host">IMAP-Server</label>
+        <input id="host" name="host" type="text" value="{{ account.host if account else '' }}"
+               placeholder="imap.example.com" required>
+      </div>
+      <div class="field">
+        <label for="port">Port</label>
+        <input id="port" name="port" type="text" value="{{ account.port if account else '993' }}" required>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="user">Benutzer</label>
+        <input id="user" name="user" type="text" value="{{ account.user if account else '' }}" required>
+      </div>
+      <div class="field">
+        <label for="password">Passwort</label>
+        <input id="password" name="password" type="password" autocomplete="new-password"
+               {% if account %}placeholder="unveraendert lassen: leer"{% else %}required{% endif %}>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="folder">Zu ueberwachender Ordner</label>
+        <input id="folder" name="folder" type="text"
+               value="{{ account.folder if account else 'INBOX' }}" required>
+      </div>
+      <div class="field">
+        <label for="mode">Abrufmodus</label>
+        <select id="mode" name="mode">
+          <option value="idle" {% if account and account.mode == 'idle' %}selected{% endif %}>IDLE (Push)</option>
+          <option value="poll" {% if not account or account.mode == 'poll' %}selected{% endif %}>Polling</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="processed_folder">Verarbeitete Mails verschieben nach (optional)</label>
+        <input id="processed_folder" name="processed_folder" type="text"
+               value="{{ account.processed_folder if account else '' }}">
+      </div>
+      <div class="field">
+        <label for="oversized_folder">Zu grosse Mails verschieben nach (optional)</label>
+        <input id="oversized_folder" name="oversized_folder" type="text"
+               value="{{ account.oversized_folder if account else '' }}">
+      </div>
+    </div>
+    <p style="margin:.8rem 0 .2rem">
+      <label><input type="checkbox" name="ssl" value="1"
+        {% if not account or account.ssl %}checked{% endif %}> TLS/SSL verwenden</label>
+      &nbsp;&nbsp;
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Aenderungen greifen innerhalb weniger Sekunden; eine laufende
+  IMAP-Verbindung wird dafuer neu aufgebaut.</p>
+</div>
+
+{% if account %}
+<div class="card">
+  <h2 style="margin-top:0">Postfach loeschen</h2>
+  <form method="post" action="{{ url_for('delete_account', account_id=account.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Dieses Postfach loeschen</button>
+    <p class="hint">Zuordnungen, die nur fuer dieses Postfach gelten, bleiben
+    bestehen und greifen dann nicht mehr.</p>
+  </form>
+</div>
+{% endif %}
 """
 
 PASSWORD_BODY = """
@@ -291,8 +495,9 @@ PASSWORD_BODY = """
 """
 
 
-def create_app(config, storage, settings) -> Flask:
-    """Build the web UI. `settings` is a SettingsStore, `storage` a Storage."""
+def create_app(runtime) -> Flask:
+    """Build the web UI on top of a Runtime (config, storage, settings, accounts)."""
+    config, storage, settings = runtime.config, runtime.storage, runtime.settings
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=_secret_key(settings),
@@ -408,13 +613,28 @@ def create_app(config, storage, settings) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _rules() -> list[Rule]:
+        return load_rules(storage, runtime.mapping_path)
+
+    def _save(rules: list[Rule]) -> None:
+        save_rules(storage, runtime.mapping_path, rules)
+
+    def _index(rules: list[Rule]) -> int:
+        try:
+            index = int(request.form.get("index", ""))
+        except ValueError:
+            raise MappingError("Diese Zuordnung gibt es nicht mehr.") from None
+        if not 0 <= index < len(rules):
+            raise MappingError("Diese Zuordnung gibt es nicht mehr.")
+        return index
+
     @app.get("/mapping")
     @login_required
     def mapping_page():
         try:
-            rules = load_rules(storage, config.mapping_path)
+            rules = _rules()
         except MappingError as exc:
-            rules = {}
+            rules = []
             flash(str(exc), "error")
 
         try:
@@ -429,14 +649,17 @@ def create_app(config, storage, settings) -> Flask:
             # created on the first attachment), so keep it selectable.
             return sorted({*folders, current}) if current else folders
 
+        accounts = runtime.accounts.all()
         return render(
             MAPPING_BODY,
             "Zuordnungen",
             rules=rules,
             folders=folders,
             folder_options=folder_options,
+            accounts=accounts,
+            account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
             storage_description=storage.description,
-            mapping_path=config.mapping_path,
+            mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
         )
@@ -448,13 +671,14 @@ def create_app(config, storage, settings) -> Flask:
         new_folder = request.form.get("new_folder", "").strip()
         chosen = new_folder or request.form.get("folder", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
+            rules = _rules()
             keyword = validate_keyword(request.form.get("keyword", ""), rules)
             folder = validate_folder(chosen)
+            account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
             if new_folder:
                 storage.create_folder(folder)
-            rules[keyword] = folder
-            save_rules(storage, config.mapping_path, rules)
+            rules.append(Rule.create(keyword, folder, account))
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001 - surface storage failures in the UI
@@ -465,47 +689,188 @@ def create_app(config, storage, settings) -> Flask:
             flash(f"{keyword} → {folder} gespeichert.", "ok")
         return redirect(url_for("mapping_page"))
 
+    def _account_choice(value: str) -> str:
+        value = (value or ALL_ACCOUNTS).strip()
+        if value == ALL_ACCOUNTS:
+            return ALL_ACCOUNTS
+        if value not in {account.key for account in runtime.accounts.all()}:
+            raise MappingError("Dieses Postfach gibt es nicht.")
+        return value
+
     @app.post("/mapping/update")
     @login_required
     def update_rule():
         require_csrf()
-        keyword = request.form.get("keyword", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
-            if keyword not in rules:
-                raise MappingError(f"Das Stichwort {keyword!r} gibt es nicht mehr.")
+            rules = _rules()
+            index = _index(rules)
+            rule = rules[index]
             folder = validate_folder(request.form.get("folder", ""))
-            rules[keyword] = folder
-            save_rules(storage, config.mapping_path, rules)
+            account = _account_choice(request.form.get("account", rule.account))
+            rules[index] = set_account(Rule.create(rule.keyword, folder, account), account)
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Web UI: could not update rule")
             flash(f"Speichern fehlgeschlagen: {exc}", "error")
         else:
-            logger.info("Web UI: changed mapping %r -> %r", keyword, folder)
-            flash(f"{keyword} → {folder} gespeichert.", "ok")
+            logger.info("Web UI: changed mapping %r -> %r", rule.keyword, folder)
+            flash(f"{rule.keyword} → {folder} gespeichert.", "ok")
         return redirect(url_for("mapping_page"))
 
     @app.post("/mapping/delete")
     @login_required
     def delete_rule():
         require_csrf()
-        keyword = request.form.get("keyword", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
-            if rules.pop(keyword, None) is None:
-                raise MappingError(f"Das Stichwort {keyword!r} gibt es nicht mehr.")
-            save_rules(storage, config.mapping_path, rules)
+            rules = _rules()
+            index = _index(rules)
+            removed = rules.pop(index)
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Web UI: could not delete rule")
             flash(f"Loeschen fehlgeschlagen: {exc}", "error")
         else:
-            logger.info("Web UI: deleted mapping %r", keyword)
-            flash(f"{keyword} geloescht. Der Ordner selbst bleibt bestehen.", "ok")
+            logger.info("Web UI: deleted mapping %r", removed.keyword)
+            flash(f"{removed.keyword} geloescht. Der Ordner selbst bleibt bestehen.", "ok")
         return redirect(url_for("mapping_page"))
+
+    def _reorder(offset: int):
+        require_csrf()
+        try:
+            rules = _rules()
+            index = _index(rules)
+            _save(move_rule(rules, index, offset))
+        except MappingError as exc:
+            flash(str(exc), "error")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Web UI: could not reorder rules")
+            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
+        return redirect(url_for("mapping_page"))
+
+    @app.post("/mapping/up")
+    @login_required
+    def move_rule_up():
+        return _reorder(-1)
+
+    @app.post("/mapping/down")
+    @login_required
+    def move_rule_down():
+        return _reorder(1)
+
+    # --- configuration ---------------------------------------------------
+
+    @app.get("/config")
+    @login_required
+    def config_page():
+        return render(
+            CONFIG_BODY,
+            "Konfiguration",
+            accounts=runtime.accounts.all(),
+            mapping_path=runtime.mapping_path,
+            storage_description=storage.description,
+            storage_backend=config.storage_backend,
+            fallback_folder=config.fallback_folder,
+            quarantine_folder=config.quarantine_folder,
+            match_body=config.match_body,
+            filename_prefix=config.filename_prefix,
+            poll_interval=config.poll_interval,
+            dry_run=config.dry_run,
+        )
+
+    @app.post("/config/mapping-path")
+    @login_required
+    def move_mapping():
+        require_csrf()
+        try:
+            runtime.set_mapping_path(request.form.get("mapping_path", ""))
+        except MappingError as exc:
+            flash(str(exc), "error")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Web UI: could not move the mapping file")
+            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
+        else:
+            flash(f"Mapping-Datei liegt jetzt unter {runtime.mapping_path}.", "ok")
+        return redirect(url_for("config_page"))
+
+    def _account_form(account=None):
+        """Read the account form, keeping the stored password if left empty."""
+        password = request.form.get("password", "")
+        if not password and account is not None:
+            password = account.password
+        try:
+            port = int(request.form.get("port", "993").strip())
+        except ValueError:
+            raise MappingError("Der Port muss eine Zahl sein.") from None
+        if not 1 <= port <= 65535:
+            raise MappingError("Der Port muss zwischen 1 und 65535 liegen.")
+        if not request.form.get("host", "").strip():
+            raise MappingError("Bitte einen IMAP-Server angeben.")
+        if not request.form.get("user", "").strip():
+            raise MappingError("Bitte einen Benutzernamen angeben.")
+        if not password:
+            raise MappingError("Bitte ein Passwort angeben.")
+        return {
+            "name": request.form.get("name", ""),
+            "host": request.form.get("host", ""),
+            "port": port,
+            "ssl": bool(request.form.get("ssl")),
+            "user": request.form.get("user", ""),
+            "password": password,
+            "folder": request.form.get("folder", "INBOX"),
+            "mode": request.form.get("mode", "poll"),
+            "processed_folder": request.form.get("processed_folder", ""),
+            "oversized_folder": request.form.get("oversized_folder", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/accounts/new", methods=["GET", "POST"])
+    @login_required
+    def new_account():
+        if request.method == "POST":
+            require_csrf()
+            try:
+                runtime.accounts.add(**_account_form())
+            except MappingError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added IMAP account %r", request.form.get("host"))
+                flash("Postfach angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ACCOUNT_BODY, "Postfach", account=None)
+
+    @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_account(account_id: int):
+        account = runtime.accounts.get(account_id)
+        if account is None:
+            flash("Dieses Postfach gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                runtime.accounts.update(account_id, **_account_form(account))
+            except MappingError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated IMAP account %s", account_id)
+                flash("Postfach gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            account = runtime.accounts.get(account_id)
+        return render(ACCOUNT_BODY, "Postfach", account=account)
+
+    @app.post("/config/accounts/<int:account_id>/delete")
+    @login_required
+    def delete_account(account_id: int):
+        require_csrf()
+        runtime.accounts.delete(account_id)
+        logger.info("Web UI: deleted IMAP account %s", account_id)
+        flash("Postfach geloescht.", "ok")
+        return redirect(url_for("config_page"))
 
     @app.route("/password", methods=["GET", "POST"])
     @login_required
@@ -573,7 +938,7 @@ def ensure_password(settings, initial_password: str) -> None:
     logger.info("Web UI: initial password taken from WEB_PASSWORD")
 
 
-def serve(config, storage, settings) -> threading.Thread:
+def serve(runtime) -> threading.Thread:
     """Bind the port and serve the UI on a daemon thread.
 
     Binding happens here, in the caller's thread, so a port clash is a startup
@@ -582,8 +947,9 @@ def serve(config, storage, settings) -> threading.Thread:
     """
     from waitress import create_server
 
-    ensure_password(settings, config.web_password)
-    app = create_app(config, storage, settings)
+    config = runtime.config
+    ensure_password(runtime.settings, config.web_password)
+    app = create_app(runtime)
     try:
         server = create_server(app, host=config.web_host, port=config.web_port, threads=4)
     except OSError as exc:

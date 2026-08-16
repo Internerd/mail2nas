@@ -30,12 +30,16 @@ genauso als einfacher systemd-Service laufen.
 
 ## Funktionsweise
 
-1. Verbindet sich per IMAP mit dem Postfach (IDLE-Push oder Polling).
+1. Verbindet sich per IMAP mit einem oder mehreren Postfaechern (IDLE-Push
+   oder Polling, je Postfach einstellbar).
 2. Liest ungelesene Mails, sucht im Betreff (optional auch im Mailtext)
-   nach den Stichwoertern aus `mapping.yaml`.
-3. Der erste Treffer bestimmt den Zielordner unterhalb des SMB-Shares
+   nach den konfigurierten Stichwoertern.
+3. Die Zuordnungen werden **von oben nach unten** geprueft, die erste
+   passende gewinnt und bestimmt den Zielordner unterhalb des SMB-Shares
    (z. B. `RE`/`Rechnung` -> `rechnungen/`, `LS`/`Lieferschein` ->
-   `lieferscheine/`). Ohne Treffer landen Anhaenge im `FALLBACK_FOLDER`
+   `lieferscheine/`). Gross-/Kleinschreibung ist egal, `*` und `?` sind als
+   Platzhalter erlaubt, und eine Zuordnung kann auf ein einzelnes Postfach
+   beschraenkt werden. Ohne Treffer landen Anhaenge im `FALLBACK_FOLDER`
    (Default: `unsorted/`).
 4. Anhaenge werden mit Datums-/Absender-Praefix gespeichert, Namenskollisionen
    werden automatisch durch einen Zaehler-Suffix vermieden.
@@ -419,14 +423,70 @@ Was sie kann:
   Liste der Ordner waehlen, die auf der Freigabe tatsaechlich existieren. Statt
   einen Pfad zu tippen und sich zu vertippen, waehlt man aus - genau das ist
   der Punkt der Oberflaeche. Ein neuer Ordner kann direkt angelegt werden.
+- **Reihenfolge festlegen**: Die Liste wird von oben nach unten geprueft, die
+  erste passende Zuordnung gewinnt. Mit den Pfeilen `↑`/`↓` laesst sich jede
+  Zeile verschieben - so kommt z. B. `Rechnungskorrektur` ueber `RE`.
 - **Zuordnung aendern oder loeschen**: pro Zeile ein Auswahlfeld und ein
   Loeschen-Knopf. Der Ordner auf der Freigabe bleibt beim Loeschen bestehen,
   entfernt wird nur die Regel.
+- **Postfach je Zuordnung**: sobald mehr als ein Postfach eingerichtet ist,
+  hat jede Zeile zusaetzlich ein Auswahlfeld - „alle Postfaecher" oder genau
+  eines.
+- **Konfiguration**: Postfaecher anlegen/aendern/loeschen und die
+  Mapping-Datei verschieben, siehe unten.
 - **Passwort aendern**: nach dem Login unter „Passwort". Dabei werden alle
   anderen angemeldeten Sitzungen abgemeldet.
 
 Aenderungen landen sofort in der `mapping.yaml` auf der Freigabe und wirken
 beim naechsten Durchlauf des Archivers - kein Neustart noetig.
+
+### Stichwoerter, Reihenfolge und Platzhalter
+
+- **Gross-/Kleinschreibung ist egal.** `re`, `RE` und `Re` sind dasselbe.
+- **Gesucht wird als Teilstring**, nicht als ganzes Wort: `RE` passt auch auf
+  „VORAB-RECHNUNG". Wer das nicht will, nimmt ein laengeres Stichwort.
+- **`*` steht fuer beliebig viele Zeichen, `?` fuer genau eines.** Beispiele:
+  | Stichwort | passt auf | passt nicht auf |
+  |---|---|---|
+  | `RE*` | „Ihre RE-4711" | „Angebot" |
+  | `RE*2026` | „RE-4711 vom 03.2026" | „RE-4711 vom 03.2025" |
+  | `Rechn?ng` | „Rechnung", „Rechnang" | „Rechnuung" |
+
+  Alle anderen Sonderzeichen sind normale Zeichen - `RE.` sucht woertlich
+  nach „RE." und nicht nach einem regulaeren Ausdruck. Maximal 5 Platzhalter
+  pro Stichwort.
+- **Die Reihenfolge entscheidet.** Frueher gewann automatisch das laengere
+  Stichwort; jetzt steht die Prioritaet explizit in der Liste und ist mit den
+  Pfeilen aenderbar. Eine bestehende `mapping.yaml` im alten Format wird genau
+  in diese Reihenfolge uebernommen (laengstes Stichwort zuerst), es aendert
+  sich also nichts an der Einsortierung.
+
+### Mehrere Postfaecher
+
+Unter „Konfiguration" lassen sich beliebig viele IMAP-Postfaecher anlegen, mit
+je eigenem Server, Ordner und Abrufmodus. Jedes bekommt einen eigenen
+Verbindungs-Thread, damit ein Postfach im IDLE-Modus die anderen nicht
+blockiert. Ein Postfach kann pausiert (`aktiv` aus) statt geloescht werden.
+
+Jede Zuordnung gilt wahlweise fuer alle Postfaecher oder nur fuer eines. Wird
+ein Postfach geloescht, bleiben seine Zuordnungen bestehen, greifen aber nicht
+mehr - die Oberflaeche zeigt sie dann als „(geloeschtes Postfach)".
+
+Aenderungen an einem Postfach greifen innerhalb weniger Sekunden; die
+betroffene IMAP-Verbindung wird dafuer neu aufgebaut, die anderen laufen
+weiter. Reines Umbenennen loest keinen Reconnect aus.
+
+Die erste Konfiguration kommt aus den `IMAP_*`-Variablen der `.env`: daraus
+wird beim allerersten Start ein Postfach angelegt. Danach gilt die Datenbank,
+und die Variablen werden ignoriert - auch wenn das letzte Postfach in der
+Oberflaeche geloescht wurde, kommt es nicht aus der `.env` zurueck.
+
+### Mapping-Datei verschieben
+
+Unter „Konfiguration" laesst sich der Pfad der `mapping.yaml` (relativ zur
+Archiv-Wurzel) aendern. Die vorhandene Datei wird dabei an den neuen Ort
+kopiert und am alten geloescht; der Archiver zieht innerhalb weniger Sekunden
+nach. Pfade ausserhalb der Archiv-Wurzel werden abgelehnt.
 
 ### Passwort
 
@@ -480,9 +540,9 @@ Monitoring-Check.
 
 | Variable | Beschreibung | Default |
 |---|---|---|
-| `IMAP_HOST` / `IMAP_PORT` / `IMAP_SSL` | IMAP-Server-Zugangsdaten | - / `993` / `true` |
-| `IMAP_USER` / `IMAP_PASSWORD` | IMAP-Login | - |
-| `IMAP_FOLDER` | Zu ueberwachender Ordner | `INBOX` |
+| `IMAP_HOST` / `IMAP_PORT` / `IMAP_SSL` | IMAP-Server des **ersten** Postfachs; danach in der Oberflaeche gepflegt | - / `993` / `true` |
+| `IMAP_USER` / `IMAP_PASSWORD` | IMAP-Login des ersten Postfachs | - |
+| `IMAP_FOLDER` | Zu ueberwachender Ordner des ersten Postfachs | `INBOX` |
 | `IMAP_PROCESSED_FOLDER` | Optional: Zielordner fuer verarbeitete Mails | leer (nur `\Seen`) |
 | `IMAP_MODE` | `idle` (Push) oder `poll` | `poll` |
 | `POLL_INTERVAL_SECONDS` | Intervall im Poll-Modus bzw. IDLE-Refresh | `300` |
@@ -494,7 +554,7 @@ Monitoring-Check.
 | `SMB_ROOT` | Unterordner innerhalb der Freigabe, unter dem alles abgelegt wird | leer (Wurzel) |
 | `SMB_ENCRYPT` | SMB3-Verschluesselung erzwingen (`false` fuer aeltere Server) | `true` |
 | `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten Shares, nur bei `STORAGE_BACKEND=local` | `/mnt/nas` |
-| `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zur Archiv-Wurzel | `mapping.yaml` |
+| `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zur Archiv-Wurzel; spaeter in der Oberflaeche aenderbar | `mapping.yaml` |
 | `FALLBACK_FOLDER` | Zielordner ohne Mapping-Treffer | `unsorted` |
 | `MATCH_BODY` | Zusaetzlich den Mailtext durchsuchen | `false` |
 | `FILENAME_PREFIX` | `none` \| `date` \| `sender` \| `date_sender` | `date_sender` |
@@ -513,6 +573,12 @@ Monitoring-Check.
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
 
+**Die `IMAP_*`-Variablen sind Startwerte.** Beim allerersten Start wird daraus
+das erste Postfach angelegt; danach gilt die in der Oberflaeche gepflegte
+Konfiguration und die Variablen werden ignoriert. Dasselbe gilt fuer
+`WEB_PASSWORD` und `MAPPING_PATH`. Alles andere in dieser Tabelle wird bei
+jedem Start aus der `.env` gelesen.
+
 **Zum Default von `STORAGE_BACKEND`:** Der Default ist bewusst `local`, damit
 eine bestehende Installation, deren `.env` diese Variable noch nicht kennt,
 nach einem Update unveraendert mit ihrem gemounteten Share weiterlaeuft. Alle
@@ -529,17 +595,35 @@ Mount mehr - siehe
 Normalerweise wird diese Datei ueber die [Weboberflaeche](#weboberflaeche)
 gepflegt. Sie bleibt aber eine gewoehnliche YAML-Datei auf der Freigabe und
 laesst sich genauso von Hand bearbeiten - die Oberflaeche schreibt exakt
-dieses Format. Siehe `config/mapping.example.yaml`:
+dieses Format:
+
+```yaml
+version: 2
+rules:
+  - keyword: Rechnungskorrektur
+    folder: korrekturen
+  - keyword: "RE*"
+    folder: rechnungen
+  - keyword: Bestellung
+    folder: einkauf
+    account: "2"        # nur fuer Postfach mit dieser ID
+```
+
+Die Liste wird von oben nach unten geprueft, die erste passende Zuordnung
+gewinnt. `account` ist optional; fehlt es, gilt die Zuordnung fuer alle
+Postfaecher. Zu Platzhaltern und Reihenfolge siehe
+[Weboberflaeche](#stichwoerter-reihenfolge-und-platzhalter).
+
+**Aeltere Dateien werden weiter gelesen.** Das frueheres Flachformat
 
 ```yaml
 RE: rechnungen
-Rechnung: rechnungen
-LS: lieferscheine
 Lieferschein: lieferscheine
 ```
 
-Laengere Stichwoerter werden vor kuerzeren geprueft (verhindert, dass z. B.
-"Rechnungskorrektur" bereits durch "RE" gematcht wird).
+wird beim Laden uebernommen, laengstes Stichwort zuerst - also genau die
+Prioritaet, die diese Version implizit hatte. Umgeschrieben wird die Datei
+erst, wenn in der Oberflaeche etwas gespeichert wird.
 
 **Mehrere Anhaenge pro Mail werden einzeln behandelt.** Jeder Anhang wird
 zuerst anhand seines EIGENEN Dateinamens gegen das Mapping geprueft; erst
@@ -661,6 +745,16 @@ Mailserver/ClamAV) einplanen.
   `Web UI cannot listen on ...`, ist der Port belegt - `WEB_PORT` aendern.
 - **Passwort der Weboberflaeche vergessen**: siehe
   [Weboberflaeche -> Passwort](#passwort).
+- **Ein Postfach wird nicht abgeholt**: unter „Konfiguration" pruefen, ob es
+  auf `aktiv` steht. Im Log steht je Postfach eine Zeile
+  `Account <Name> <benutzer>: watching INBOX on <host>`; Verbindungsfehler
+  erscheinen mit demselben Praefix, sodass sich bei mehreren Postfaechern
+  zuordnen laesst, welches betroffen ist.
+- **Mail landet trotz passender Zuordnung im Fallback**: die Reihenfolge
+  pruefen (eine weiter oben stehende Zuordnung kann zuerst greifen) und ob die
+  Zuordnung auf ein anderes Postfach eingeschraenkt ist.
+- **`No enabled IMAP account configured`**: es ist kein Postfach aktiv - in der
+  Oberflaeche unter „Konfiguration" eines anlegen oder aktivieren.
 - **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
   selbst ab.
 
@@ -697,6 +791,17 @@ python3 scripts/regenerate-bootstrap.py --check  # nur pruefen (fuer CI)
 - Die Weboberflaeche gehoert ins eigene LAN, nicht ins Internet: ein Passwort,
   kein TLS von Haus aus. Details unter [Weboberflaeche](#weboberflaeche). Das
   Startpasswort aus der `.env` nach der ersten Anmeldung dort aendern.
+- **Die State-Datenbank enthaelt IMAP-Passwoerter im Klartext.** Seit die
+  Postfaecher in der Oberflaeche gepflegt werden, liegen sie dort statt nur in
+  der `.env` - sie muessen ja zum Anmelden verwendbar sein, ein Hash geht
+  nicht. mail2nas setzt die Datei beim Start auf `chmod 600`; sie verdient
+  denselben Schutz wie die `.env`:
+  - Das Docker-Volume `state` (bzw. `STATE_DB_PATH` im systemd-Betrieb) nicht
+    breiter freigeben als noetig.
+  - **Backups des Volumes enthalten die Passwoerter** - entsprechend ablegen.
+  - Wer Zugriff auf die Weboberflaeche hat, kann Postfaecher anlegen und damit
+    Mails von beliebigen Servern abholen lassen. Das Passwort dort ist also
+    kein „nur Zuordnungen"-Passwort.
 - Die SMB-Zugangsdaten stehen ausschliesslich in der `.env` des Zielsystems.
   Es liegen keine Zugangsdaten und kein Mount auf dem Proxmox-Host, also
   bekommt auch niemand ueber eine Host-Shell oder ein Host-Backup Zugriff auf
@@ -817,6 +922,39 @@ relevante Zwecke eingesetzt wird.
 Updates brauchen **keine Neukonfiguration**. Weder Zugangsdaten noch
 Mapping-Regeln muessen erneut eingegeben werden.
 
+### Kurzfassung
+
+| Installiert per | Update-Befehl |
+|---|---|
+| Helper-Skript / git (Variante 1) | `pct exec <CTID> -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"` |
+| Bootstrap-Skript (Variante 2A) | `bootstrap.sh` erneut ausfuehren, dann `docker compose up -d --build` |
+| scp/tar (Variante 2B) | Archiv neu uebertragen, `.env` behalten, dann `docker compose up -d --build` |
+| systemd/venv | Code aktualisieren, `venv/bin/pip install -r requirements.txt`, `systemctl restart mail2nas` |
+
+Nach dem Update einmal ins Log schauen (`docker compose logs -f`): dort steht,
+wie viele Zuordnungen geladen wurden und welche Postfaecher ueberwacht werden.
+
+### Was beim Update automatisch migriert wird
+
+- **Die `mapping.yaml` im alten Flachformat** wird weiter gelesen und in die
+  gleiche Prioritaet uebernommen (laengstes Stichwort zuerst). Die Datei wird
+  erst umgeschrieben, wenn in der Oberflaeche etwas gespeichert wird - bis
+  dahin ist ein Downgrade auf eine aeltere Version problemlos moeglich.
+- **Das erste Postfach** wird beim ersten Start nach dem Update aus den
+  `IMAP_*`-Variablen der bestehenden `.env` angelegt. Es ist danach unter
+  „Konfiguration" sichtbar und wird ab dann von dort gepflegt.
+- **Neue Konfigurationsvariablen** greifen mit ihren Defaults; eine alte `.env`
+  bleibt gueltig. Insbesondere bleibt `WEB_ENABLED` ohne Eintrag auf `false` -
+  wer die Weboberflaeche will, ergaenzt nach dem Update:
+  ```
+  WEB_ENABLED=true
+  WEB_PASSWORD=mindestens-8-zeichen
+  ```
+  und startet mit `docker compose up -d` neu.
+- **`STORAGE_BACKEND`** bleibt ohne Eintrag auf `local`, eine bestehende
+  Installation mit gemountetem Share laeuft also unveraendert weiter.
+  `update.sh` haengt in dem Fall automatisch `docker-compose.local.yml` an.
+
 ### Mit git installiert (Variante 1) - der einfache Weg
 
 Ein Befehl, direkt vom Proxmox-Host aus:
@@ -841,9 +979,13 @@ auf.
 
 | Was | Wo | Warum es das Update ueberlebt |
 |---|---|---|
-| Zugangsdaten (IMAP + SMB) & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
-| Stichwort-Mapping | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
-| Bereits verarbeitete Mails, Passwort der Weboberflaeche | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert, und das geaenderte Passwort gilt weiter |
+| SMB-Zugangsdaten & alle .env-Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
+| Stichwort-Zuordnungen | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
+| Postfaecher, Passwort der Weboberflaeche, bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
+
+Das Volume `state` ist damit das einzige, was ausser der `.env` gesichert
+werden muss - und es enthaelt IMAP-Passwoerter, siehe
+[Sicherheitshinweise](#sicherheitshinweise).
 
 Bringt eine neue Version zusaetzliche Konfigurationsvariablen mit, greifen
 dafuer automatisch die dokumentierten Defaults - eine aeltere `.env` bleibt

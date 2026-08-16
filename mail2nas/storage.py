@@ -19,6 +19,7 @@ import errno
 import logging
 import os
 import secrets
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
@@ -80,6 +81,10 @@ class Storage(ABC):
     @abstractmethod
     def create_folder(self, relative: str) -> None:
         """Create a directory below the root, including parents."""
+
+    @abstractmethod
+    def remove_file(self, relative: str) -> None:
+        """Delete a file below the root. Missing is not an error."""
 
     @abstractmethod
     def modified_time(self, relative: str) -> float:
@@ -153,6 +158,9 @@ class LocalStorage(Storage):
     def create_folder(self, relative: str) -> None:
         self._root.joinpath(*safe_relative_parts(relative)).mkdir(parents=True, exist_ok=True)
 
+    def remove_file(self, relative: str) -> None:
+        self._resolve(relative).unlink(missing_ok=True)
+
     def modified_time(self, relative: str) -> float:
         return self._resolve(relative).stat().st_mtime
 
@@ -198,6 +206,10 @@ class SmbStorage(Storage):
         # each operation - not just to register_session, which would otherwise
         # open a second (failing) connection on 445.
         self._kwargs = {"port": self._port}
+        # Several account workers share one storage object. smbclient's own
+        # connection pool is thread-safe, but the reconnect dance below is not:
+        # two threads resetting the same session at once would fight over it.
+        self._lock = threading.RLock()
 
     @property
     def description(self) -> str:
@@ -243,6 +255,10 @@ class SmbStorage(Storage):
         yet), not a broken connection - those propagate without a reconnect,
         so callers can still catch FileNotFoundError.
         """
+        with self._lock:
+            return self._with_reconnect_locked(operation, func)
+
+    def _with_reconnect_locked(self, operation: str, func):
         self._connect()
         try:
             return func()
@@ -421,6 +437,18 @@ class SmbStorage(Storage):
     def create_folder(self, relative: str) -> None:
         parts = safe_relative_parts(relative)
         self._with_reconnect("mkdir", lambda: self._ensure_dir(parts))
+
+    def remove_file(self, relative: str) -> None:
+        parts = safe_relative_parts(relative)
+        try:
+            self._with_reconnect("remove", lambda: self._remove_file(parts))
+        except FileNotFoundError:
+            pass
+
+    def _remove_file(self, parts) -> None:
+        import smbclient
+
+        smbclient.remove(self._unc(parts[:-1], parts[-1]), **self._kwargs)
 
     def modified_time(self, relative: str) -> float:
         parts = safe_relative_parts(relative)

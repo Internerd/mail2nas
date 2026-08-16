@@ -52,6 +52,9 @@ cat > .env.example <<'MAIL2NAS_EOF'
 # Die Installer-Skripte in scripts/ erledigen das automatisch.
 
 # --- IMAP source mailbox -----------------------------------------------
+# STARTWERTE. Beim ersten Start wird daraus das erste Postfach angelegt;
+# danach werden Postfaecher in der Weboberflaeche gepflegt (auch mehrere) und
+# diese Variablen werden ignoriert. Siehe README, Abschnitt Weboberflaeche.
 IMAP_HOST=imap.example.com
 IMAP_PORT=993
 IMAP_SSL=true
@@ -102,7 +105,8 @@ NAS_PATH=/mnt/nas
 
 # --- Mapping & filing behaviour -------------------------------------------
 # Pfad zur Mapping-Datei, relativ zur Wurzel des Archivs (Freigabe bzw.
-# SMB_ROOT, oder STORAGE_ROOT beim local-Backend).
+# SMB_ROOT, oder STORAGE_ROOT beim local-Backend). Ebenfalls nur ein
+# Startwert: in der Weboberflaeche laesst sich die Datei spaeter verschieben.
 # See config/mapping.example.yaml - copy it onto the share as mapping.yaml.
 # It is reloaded on every processing cycle, so edits apply without a restart.
 MAPPING_PATH=mapping.yaml
@@ -457,6 +461,316 @@ class Config:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
 MAIL2NAS_EOF
 
+# --- mail2nas/accounts.py ---
+cat > mail2nas/accounts.py <<'MAIL2NAS_EOF'
+"""IMAP accounts, stored locally so the web UI can edit them.
+
+Until now there was exactly one mailbox and it came from the environment.
+Editing it in the UI - and having more than one - means the configuration has
+to live somewhere writable, so it goes into the same SQLite file as the rest
+of the local state.
+
+The environment still seeds the first account on a fresh install, so an
+existing `.env` keeps working and nothing has to be re-entered. After that the
+database wins: changes made in the UI survive restarts and updates, and the
+IMAP_* variables are ignored.
+
+Note this means the state database now holds IMAP passwords in clear text.
+It needs the same protection as the `.env` file - see the README.
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+SETTING_ACCOUNTS_SEEDED = "imap_accounts_seeded"
+
+
+@dataclass(frozen=True)
+class Account:
+    """One mailbox to watch."""
+
+    id: int
+    name: str
+    host: str
+    port: int
+    ssl: bool
+    user: str
+    password: str
+    folder: str
+    mode: str  # "idle" or "poll"
+    processed_folder: str
+    oversized_folder: str
+    enabled: bool
+
+    @property
+    def key(self) -> str:
+        """Stable identifier, as referenced by a mapping rule."""
+        return str(self.id)
+
+    def fingerprint(self) -> tuple:
+        """Everything a worker thread needs; a change means restart it."""
+        return (
+            self.host,
+            self.port,
+            self.ssl,
+            self.user,
+            self.password,
+            self.folder,
+            self.mode,
+            self.processed_folder,
+            self.oversized_folder,
+            self.enabled,
+        )
+
+
+class AccountStore:
+    """CRUD for the configured mailboxes.
+
+    Opens a short-lived connection per call: the web UI answers requests on a
+    thread pool and the account workers read from their own threads, and one
+    sqlite3 connection must not be shared across threads.
+    """
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS imap_accounts ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, "
+                "host TEXT NOT NULL, "
+                "port INTEGER NOT NULL DEFAULT 993, "
+                "ssl INTEGER NOT NULL DEFAULT 1, "
+                "user TEXT NOT NULL, "
+                "password TEXT NOT NULL, "
+                "folder TEXT NOT NULL DEFAULT 'INBOX', "
+                "mode TEXT NOT NULL DEFAULT 'poll', "
+                "processed_folder TEXT NOT NULL DEFAULT '', "
+                "oversized_folder TEXT NOT NULL DEFAULT '', "
+                "enabled INTEGER NOT NULL DEFAULT 1)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    @staticmethod
+    def _row_to_account(row) -> Account:
+        return Account(
+            id=row[0],
+            name=row[1],
+            host=row[2],
+            port=row[3],
+            ssl=bool(row[4]),
+            user=row[5],
+            password=row[6],
+            folder=row[7],
+            mode=row[8],
+            processed_folder=row[9],
+            oversized_folder=row[10],
+            enabled=bool(row[11]),
+        )
+
+    _COLUMNS = (
+        "id, name, host, port, ssl, user, password, folder, mode, "
+        "processed_folder, oversized_folder, enabled"
+    )
+
+    def all(self) -> list[Account]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT {self._COLUMNS} FROM imap_accounts ORDER BY id").fetchall()
+        return [self._row_to_account(row) for row in rows]
+
+    def enabled(self) -> list[Account]:
+        return [account for account in self.all() if account.enabled]
+
+    def get(self, account_id: int) -> Account | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM imap_accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        return self._row_to_account(row) if row else None
+
+    def add(self, **fields) -> int:
+        values = _defaults(fields)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO imap_accounts (name, host, port, ssl, user, password, folder, "
+                "mode, processed_folder, oversized_folder, enabled) "
+                "VALUES (:name, :host, :port, :ssl, :user, :password, :folder, :mode, "
+                ":processed_folder, :oversized_folder, :enabled)",
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update(self, account_id: int, **fields) -> None:
+        current = self.get(account_id)
+        if current is None:
+            raise KeyError(account_id)
+        values = _defaults(
+            {
+                "name": current.name,
+                "host": current.host,
+                "port": current.port,
+                "ssl": current.ssl,
+                "user": current.user,
+                "password": current.password,
+                "folder": current.folder,
+                "mode": current.mode,
+                "processed_folder": current.processed_folder,
+                "oversized_folder": current.oversized_folder,
+                "enabled": current.enabled,
+                **fields,
+            }
+        )
+        values["id"] = account_id
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE imap_accounts SET name = :name, host = :host, port = :port, ssl = :ssl, "
+                "user = :user, password = :password, folder = :folder, mode = :mode, "
+                "processed_folder = :processed_folder, oversized_folder = :oversized_folder, "
+                "enabled = :enabled WHERE id = :id",
+                values,
+            )
+
+    def delete(self, account_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM imap_accounts WHERE id = ?", (account_id,))
+
+
+def _defaults(fields: dict) -> dict:
+    return {
+        "name": str(fields.get("name") or "").strip() or "Postfach",
+        "host": str(fields.get("host") or "").strip(),
+        "port": int(fields.get("port") or 993),
+        "ssl": 1 if fields.get("ssl", True) else 0,
+        "user": str(fields.get("user") or "").strip(),
+        "password": str(fields.get("password") or ""),
+        "folder": str(fields.get("folder") or "INBOX").strip() or "INBOX",
+        "mode": "idle" if str(fields.get("mode") or "poll").lower() == "idle" else "poll",
+        "processed_folder": str(fields.get("processed_folder") or "").strip(),
+        "oversized_folder": str(fields.get("oversized_folder") or "").strip(),
+        "enabled": 1 if fields.get("enabled", True) else 0,
+    }
+
+
+def seed_from_config(store: AccountStore, settings, config) -> None:
+    """Create the first account from the environment, once.
+
+    Guarded by a flag rather than by "is the table empty", so deleting the
+    last account in the UI does not resurrect it from the .env on the next
+    restart.
+    """
+    if settings.get(SETTING_ACCOUNTS_SEEDED):
+        return
+    if store.all():
+        settings.set(SETTING_ACCOUNTS_SEEDED, "1")
+        return
+
+    store.add(
+        name=config.imap_user or "Postfach",
+        host=config.imap_host,
+        port=config.imap_port,
+        ssl=config.imap_ssl,
+        user=config.imap_user,
+        password=config.imap_password,
+        folder=config.imap_folder,
+        mode=config.imap_mode,
+        processed_folder=config.imap_processed_folder or "",
+        oversized_folder=config.imap_oversized_folder or "",
+        enabled=True,
+    )
+    settings.set(SETTING_ACCOUNTS_SEEDED, "1")
+    logger.info("Created the first IMAP account from the configuration (%s)", config.imap_host)
+MAIL2NAS_EOF
+
+# --- mail2nas/runtime.py ---
+cat > mail2nas/runtime.py <<'MAIL2NAS_EOF'
+"""The objects the archiver and the web UI both work on.
+
+Settings that used to be environment-only can now be changed at runtime, so
+something has to hold the live state and let one side tell the other that it
+moved. That is all this is: a small container plus the two operations that
+need coordinating.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+
+from .mapping import MappingError
+from .filenames import safe_relative_parts
+
+logger = logging.getLogger(__name__)
+
+SETTING_MAPPING_PATH = "mapping_path"
+
+
+class Runtime:
+    """Shared handles, plus the mapping-file location that can move."""
+
+    def __init__(self, config, storage, mapping, store, settings, accounts):
+        self.config = config
+        self.storage = storage
+        self.mapping = mapping
+        self.store = store
+        self.settings = settings
+        self.accounts = accounts
+        # Set by the web UI, consumed by the supervisor loop: the archiver
+        # threads must not read a half-changed path.
+        self.mapping_path_changed = threading.Event()
+
+    @property
+    def mapping_path(self) -> str:
+        """Where the rules live - the stored value wins over the .env one."""
+        return self.settings.get(SETTING_MAPPING_PATH) or self.config.mapping_path
+
+    def set_mapping_path(self, new_path: str, move_existing: bool = True) -> None:
+        """Point the archiver at a different mapping file, optionally moving it.
+
+        Moving is a copy followed by a delete rather than a rename: the
+        storage backends deliberately expose no rename, and a copy that fails
+        halfway leaves the original in place, which is the safer direction.
+        """
+        new_path = (new_path or "").strip().replace("\\", "/")
+        try:
+            parts = safe_relative_parts(new_path)
+        except ValueError as exc:
+            raise MappingError(f"Ungueltiger Pfad: {exc}") from None
+        new_path = "/".join(parts)
+
+        old_path = self.mapping_path
+        if new_path == old_path:
+            return
+
+        if move_existing:
+            try:
+                content = self.storage.read_text(old_path)
+            except FileNotFoundError:
+                content = None
+            if content is not None:
+                self.storage.write_text(new_path, content)
+                self.storage.remove_file(old_path)
+                logger.info("Moved the mapping file from %s to %s", old_path, new_path)
+
+        self.settings.set(SETTING_MAPPING_PATH, new_path)
+        self.mapping.set_path(new_path)
+        self.mapping_path_changed.set()
+
+    def apply_mapping_path(self) -> None:
+        """Re-point the shared Mapping if the stored path changed."""
+        wanted = self.mapping_path
+        if self.mapping.path != wanted:
+            self.mapping.set_path(wanted)
+MAIL2NAS_EOF
+
 # --- mail2nas/storage.py ---
 cat > mail2nas/storage.py <<'MAIL2NAS_EOF'
 """Where archived attachments end up.
@@ -480,6 +794,7 @@ import errno
 import logging
 import os
 import secrets
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
@@ -541,6 +856,10 @@ class Storage(ABC):
     @abstractmethod
     def create_folder(self, relative: str) -> None:
         """Create a directory below the root, including parents."""
+
+    @abstractmethod
+    def remove_file(self, relative: str) -> None:
+        """Delete a file below the root. Missing is not an error."""
 
     @abstractmethod
     def modified_time(self, relative: str) -> float:
@@ -614,6 +933,9 @@ class LocalStorage(Storage):
     def create_folder(self, relative: str) -> None:
         self._root.joinpath(*safe_relative_parts(relative)).mkdir(parents=True, exist_ok=True)
 
+    def remove_file(self, relative: str) -> None:
+        self._resolve(relative).unlink(missing_ok=True)
+
     def modified_time(self, relative: str) -> float:
         return self._resolve(relative).stat().st_mtime
 
@@ -659,6 +981,10 @@ class SmbStorage(Storage):
         # each operation - not just to register_session, which would otherwise
         # open a second (failing) connection on 445.
         self._kwargs = {"port": self._port}
+        # Several account workers share one storage object. smbclient's own
+        # connection pool is thread-safe, but the reconnect dance below is not:
+        # two threads resetting the same session at once would fight over it.
+        self._lock = threading.RLock()
 
     @property
     def description(self) -> str:
@@ -704,6 +1030,10 @@ class SmbStorage(Storage):
         yet), not a broken connection - those propagate without a reconnect,
         so callers can still catch FileNotFoundError.
         """
+        with self._lock:
+            return self._with_reconnect_locked(operation, func)
+
+    def _with_reconnect_locked(self, operation: str, func):
         self._connect()
         try:
             return func()
@@ -883,6 +1213,18 @@ class SmbStorage(Storage):
         parts = safe_relative_parts(relative)
         self._with_reconnect("mkdir", lambda: self._ensure_dir(parts))
 
+    def remove_file(self, relative: str) -> None:
+        parts = safe_relative_parts(relative)
+        try:
+            self._with_reconnect("remove", lambda: self._remove_file(parts))
+        except FileNotFoundError:
+            pass
+
+    def _remove_file(self, parts) -> None:
+        import smbclient
+
+        smbclient.remove(self._unc(parts[:-1], parts[-1]), **self._kwargs)
+
     def modified_time(self, relative: str) -> float:
         parts = safe_relative_parts(relative)
         return self._with_reconnect("stat", lambda: self._modified_time(parts))
@@ -914,9 +1256,38 @@ MAIL2NAS_EOF
 
 # --- mail2nas/mapping.py ---
 cat > mail2nas/mapping.py <<'MAIL2NAS_EOF'
+"""Keyword -> folder rules: file format, matching, and editing.
+
+The rules live as YAML on the archive share, so they survive a broken web UI
+and stay editable by hand. Two things they have to express beyond the keyword
+and the target folder:
+
+* **Order.** The first matching rule wins, and the order is explicit rather
+  than derived, so "Rechnungskorrektur" can be placed above "RE" instead of
+  relying on it happening to be the longer word.
+* **Which mailbox a rule applies to**, once more than one IMAP account is
+  configured.
+
+Format (version 2)::
+
+    version: 2
+    rules:
+      - keyword: Rechnungskorrektur
+        folder: korrekturen
+      - keyword: "RE*"
+        folder: rechnungen
+        account: "2"
+
+The old flat `keyword: folder` format is still read: it is migrated in
+memory, longest keyword first, which is exactly the priority that version
+applied implicitly. Nothing is rewritten until the rules are saved.
+"""
 from __future__ import annotations
 
 import logging
+import re
+import threading
+from dataclasses import dataclass, field, replace
 
 import yaml
 
@@ -925,36 +1296,162 @@ from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
+FILE_VERSION = 2
+ALL_ACCOUNTS = "all"
+MAX_KEYWORD_LENGTH = 100
+# A pattern is a chain of ".*?" separated by literals, so matching cost grows
+# with (wildcards x text length). Mail subjects and bodies are attacker-
+# supplied, so both factors are bounded rather than trusted: without this a
+# keyword like "a*a*a*a*a*..." plus a large body (MATCH_BODY=true) would tie
+# up an account worker for a very long time.
+MAX_WILDCARDS = 5
+MAX_MATCH_LENGTH = 100_000
+
+
+class MappingError(ValueError):
+    """A rule the user tried to save is not usable."""
+
+
+def _compile(keyword: str) -> re.Pattern[str] | None:
+    """Build a matcher for a keyword containing `*` / `?`, or None for plain text.
+
+    Wildcards stay *within* the substring search people already know: the
+    pattern is not anchored, so "RE*2026" matches a subject that has "RE"
+    somewhere followed later by "2026". `*Rechnung*` therefore means the same
+    as plain `Rechnung`.
+    """
+    if "*" not in keyword and "?" not in keyword:
+        return None
+    if keyword.count("*") > MAX_WILDCARDS:
+        # Loaded from a file that may have been edited by hand, so this has to
+        # degrade rather than raise: treat it as plain text, which can only
+        # match less, never more.
+        logger.warning(
+            "Keyword %r has more than %d wildcards - treating it as literal text",
+            keyword,
+            MAX_WILDCARDS,
+        )
+        return None
+    pattern = "".join(
+        ".*?" if char == "*" else "." if char == "?" else re.escape(char) for char in keyword
+    )
+    return re.compile(pattern, re.IGNORECASE | re.DOTALL)
+
+
+@dataclass(frozen=True)
+class Rule:
+    """One keyword -> folder assignment."""
+
+    keyword: str
+    folder: str
+    account: str = ALL_ACCOUNTS  # ALL_ACCOUNTS or an account id as a string
+    _matcher: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
+
+    @classmethod
+    def create(cls, keyword: str, folder: str, account: str = ALL_ACCOUNTS) -> "Rule":
+        return cls(keyword, folder, account or ALL_ACCOUNTS, _compile(keyword))
+
+    @property
+    def has_wildcard(self) -> bool:
+        return self._matcher is not None
+
+    def applies_to(self, account_id: str | None) -> bool:
+        if self.account == ALL_ACCOUNTS or account_id is None:
+            return True
+        return self.account == str(account_id)
+
+    def matches(self, haystack_lower: str, haystack: str) -> bool:
+        if self._matcher is not None:
+            return self._matcher.search(haystack[:MAX_MATCH_LENGTH]) is not None
+        return self.keyword.lower() in haystack_lower
+
+    def as_dict(self) -> dict[str, str]:
+        data = {"keyword": self.keyword, "folder": self.folder}
+        if self.account != ALL_ACCOUNTS:
+            data["account"] = self.account
+        return data
+
+
+def parse_rules(raw) -> list[Rule]:
+    """Turn parsed YAML into rules, accepting both file formats."""
+    if not raw:
+        return []
+
+    if isinstance(raw, dict) and "rules" in raw:
+        entries = raw.get("rules") or []
+        if not isinstance(entries, list):
+            raise MappingError("'rules' muss eine Liste von Zuordnungen sein.")
+        rules = []
+        for entry in entries:
+            if not isinstance(entry, dict) or "keyword" not in entry or "folder" not in entry:
+                raise MappingError("Jede Zuordnung braucht 'keyword' und 'folder'.")
+            rules.append(
+                Rule.create(
+                    str(entry["keyword"]),
+                    str(entry["folder"]),
+                    str(entry.get("account", ALL_ACCOUNTS)),
+                )
+            )
+        return rules
+
+    if isinstance(raw, dict):
+        # Legacy flat format. Longest keyword first reproduces the priority the
+        # old matcher applied implicitly, so migrating cannot change behaviour.
+        pairs = sorted(raw.items(), key=lambda kv: len(str(kv[0])), reverse=True)
+        return [Rule.create(str(keyword), str(folder)) for keyword, folder in pairs]
+
+    raise MappingError("Die Datei enthaelt keine Stichwort/Ordner-Zuordnungen.")
+
+
+def dump_rules(rules: list[Rule]) -> str:
+    """Render rules as YAML, preserving their order."""
+    document = {"version": FILE_VERSION, "rules": [rule.as_dict() for rule in rules]}
+    return yaml.safe_dump(document, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
 
 class Mapping:
-    """Keyword -> target-subfolder mapping, reloaded on demand.
+    """The rule list, reloaded from the share when the file changes.
 
-    The mapping file lives on the same share the attachments are archived
-    to, so it can be edited by anyone with access to the share without
-    touching the container/deployment. It is read through the storage
-    backend, so it works the same whether the share is mounted or reached
-    over SMB directly.
+    Shared by every account worker, so reloading is guarded by a lock: each
+    worker calls `reload()` at the start of its cycle.
     """
 
     def __init__(self, storage: Storage, relative_path: str, fallback_folder: str):
         self._storage = storage
-        self._path = storage.display(safe_relative_parts(relative_path))
-        self._relative_path = relative_path
         self._fallback_folder = fallback_folder
-        self._rules: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
+        self._rules: list[Rule] = []
         self._mtime: float | None = None
+        self.set_path(relative_path)
+
+    @property
+    def path(self) -> str:
+        return self._relative_path
+
+    def set_path(self, relative_path: str) -> None:
+        """Point at a different mapping file and load it immediately."""
+        with self._lock:
+            self._relative_path = relative_path
+            self._display_path = self._storage.display(safe_relative_parts(relative_path))
+            self._mtime = None
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
+        with self._lock:
+            relative_path, display_path = self._relative_path, self._display_path
+            known_mtime, rule_count = self._mtime, len(self._rules)
+
         try:
-            mtime = self._storage.modified_time(self._relative_path)
+            mtime = self._storage.modified_time(relative_path)
         except FileNotFoundError:
             if force:
                 logger.warning(
-                    "Mapping file %s not found, all mail will go to the fallback folder", self._path
+                    "Mapping file %s not found, all mail will go to the fallback folder",
+                    display_path,
                 )
-                self._rules = []
-                self._mtime = None
+                with self._lock:
+                    self._rules = []
+                    self._mtime = None
             return
         except Exception as exc:  # noqa: BLE001 - a dropped share must not kill the loop
             # With the SMB backend this is a network call, so it can fail for
@@ -962,96 +1459,72 @@ class Mapping:
             # rules we already have; the next cycle tries again.
             logger.warning(
                 "Could not check mapping file %s (%s) - keeping the previous %d rule(s)",
-                self._path,
+                display_path,
                 exc,
-                len(self._rules),
+                rule_count,
             )
             return
 
-        if not force and self._mtime == mtime:
+        if not force and known_mtime == mtime:
             return
 
-        # The mapping file is edited by hand on a network share, so a malformed
-        # or half-written version is a matter of when, not if. Keep serving the
-        # last good rules instead of letting the exception escape: it would
-        # propagate out of the IMAP loop and leave the service reconnecting in
-        # a tight loop, archiving nothing at all until someone noticed.
+        # The file can also be edited by hand on a network share, so a
+        # malformed or half-written version is a matter of when, not if. Keep
+        # serving the last good rules instead of letting the exception escape:
+        # it would propagate out of the IMAP loop and leave the service
+        # reconnecting in a tight loop, archiving nothing until someone noticed.
         try:
-            raw = yaml.safe_load(self._storage.read_text(self._relative_path)) or {}
-            if not isinstance(raw, dict):
-                raise ValueError("file must contain a mapping of keyword -> folder")
-            rules = sorted(
-                ((str(keyword), str(folder)) for keyword, folder in raw.items()),
-                # Longest keyword first, so "Rechnungskorrektur" beats "RE".
-                key=lambda kv: len(kv[0]),
-                reverse=True,
-            )
-        except Exception as exc:
+            rules = parse_rules(yaml.safe_load(self._storage.read_text(relative_path)))
+        except Exception as exc:  # noqa: BLE001
             # Remember the mtime anyway, so a persistently broken file is
             # reported once rather than on every single cycle.
-            self._mtime = mtime
+            with self._lock:
+                self._mtime = mtime
             logger.error(
                 "Could not load mapping file %s (%s) - keeping the previous %d rule(s)",
-                self._path,
+                display_path,
                 exc,
-                len(self._rules),
+                rule_count,
             )
             return
 
-        self._rules = rules
-        self._mtime = mtime
-        logger.info("Loaded %d mapping rule(s) from %s", len(self._rules), self._path)
+        with self._lock:
+            self._rules = rules
+            self._mtime = mtime
+        logger.info("Loaded %d mapping rule(s) from %s", len(rules), display_path)
 
-    def resolve(self, *texts: str) -> tuple[str, str | None]:
-        """Return (target_folder, matched_keyword). Falls back if nothing matches."""
-        haystack = " ".join(t for t in texts if t).lower()
-        for keyword, folder in self._rules:
-            if keyword.lower() in haystack:
-                return folder, keyword
+    def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
+        """Return (target_folder, matched_keyword) for the first matching rule."""
+        haystack = " ".join(t for t in texts if t)
+        haystack_lower = haystack.lower()
+        with self._lock:
+            rules = self._rules
+        for rule in rules:
+            if rule.applies_to(account_id) and rule.matches(haystack_lower, haystack):
+                return rule.folder, rule.keyword
         return self._fallback_folder, None
 
 
 # --- editing helpers (used by the web UI) ------------------------------------
-#
-# The mapping stays a YAML file on the share rather than moving into a
-# database: the archiver already reloads it by mtime, it survives a broken
-# web UI, and it remains editable by hand as a fallback. The web UI is the
-# normal way to change it, not the only one - so anything written here has to
-# stay in the format a human would write.
-
-MAX_KEYWORD_LENGTH = 100
 
 
-class MappingError(ValueError):
-    """A rule the user tried to save is not usable."""
+def load_rules(storage: Storage, relative_path: str) -> list[Rule]:
+    """Read the rule list for editing.
 
-
-def load_rules(storage: Storage, relative_path: str) -> dict[str, str]:
-    """Read the mapping file as an ordered keyword -> folder dict.
-
-    A missing file is an empty mapping, not an error: that is the state right
-    after installation, and the UI is exactly where it gets fixed.
+    A missing file is an empty rule list, not an error: that is the state
+    right after installation, and the UI is where it gets fixed.
     """
     try:
-        raw = yaml.safe_load(storage.read_text(relative_path)) or {}
+        return parse_rules(yaml.safe_load(storage.read_text(relative_path)))
     except FileNotFoundError:
-        return {}
-    if not isinstance(raw, dict):
-        raise MappingError(
-            "Die Mapping-Datei enthaelt keine Stichwort/Ordner-Zuordnung und wird "
-            "nicht ueberschrieben. Bitte pruefen oder umbenennen."
-        )
-    return {str(keyword): str(folder) for keyword, folder in raw.items()}
+        return []
 
 
-def save_rules(storage: Storage, relative_path: str, rules: dict[str, str]) -> None:
-    """Write the mapping file back, sorted by keyword for a stable diff."""
-    ordered = dict(sorted(rules.items(), key=lambda kv: kv[0].lower()))
-    text = yaml.safe_dump(ordered, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    storage.write_text(relative_path, text)
+def save_rules(storage: Storage, relative_path: str, rules: list[Rule]) -> None:
+    storage.write_text(relative_path, dump_rules(rules))
 
 
-def validate_keyword(keyword: str, existing: dict[str, str], replacing: str | None = None) -> str:
+def validate_keyword(keyword: str, existing: list[Rule], replacing: int | None = None) -> str:
     """Check a keyword the user typed, returning the cleaned version."""
     keyword = keyword.strip()
     if not keyword:
@@ -1060,14 +1533,18 @@ def validate_keyword(keyword: str, existing: dict[str, str], replacing: str | No
         raise MappingError(f"Das Stichwort darf hoechstens {MAX_KEYWORD_LENGTH} Zeichen lang sein.")
     if "\n" in keyword or "\r" in keyword:
         raise MappingError("Das Stichwort darf keine Zeilenumbrueche enthalten.")
-    # Matching is case-insensitive, so two rules differing only in case would
-    # be indistinguishable - the second could never win.
+    if keyword.strip("*? ") == "":
+        raise MappingError("Ein Stichwort aus lauter Platzhaltern wuerde auf alles passen.")
+    if keyword.count("*") > MAX_WILDCARDS:
+        raise MappingError(f"Hoechstens {MAX_WILDCARDS} Platzhalter (*) pro Stichwort.")
+    # Matching is case-insensitive, so two rules with the same keyword for the
+    # same account would be indistinguishable - the second could never win.
     lowered = keyword.lower()
-    for existing_keyword in existing:
-        if existing_keyword == replacing:
+    for index, rule in enumerate(existing):
+        if index == replacing:
             continue
-        if existing_keyword.lower() == lowered:
-            raise MappingError(f"Das Stichwort {existing_keyword!r} gibt es schon.")
+        if rule.keyword.lower() == lowered:
+            raise MappingError(f"Das Stichwort {rule.keyword!r} gibt es schon.")
     return keyword
 
 
@@ -1081,6 +1558,22 @@ def validate_folder(folder: str) -> str:
     except ValueError as exc:
         raise MappingError(f"Ungueltiger Zielordner: {exc}") from None
     return "/".join(parts)
+
+
+def move_rule(rules: list[Rule], index: int, offset: int) -> list[Rule]:
+    """Return the rules with one entry moved up or down."""
+    if not 0 <= index < len(rules):
+        raise MappingError("Diese Zuordnung gibt es nicht mehr.")
+    target = index + offset
+    if not 0 <= target < len(rules):
+        return rules
+    reordered = list(rules)
+    reordered.insert(target, reordered.pop(index))
+    return reordered
+
+
+def set_account(rule: Rule, account: str) -> Rule:
+    return replace(rule, account=account or ALL_ACCOUNTS)
 MAIL2NAS_EOF
 
 # --- mail2nas/filenames.py ---
@@ -1227,6 +1720,7 @@ cat > mail2nas/state.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 
@@ -1236,32 +1730,41 @@ class ProcessedStore:
     IMAP's \\Seen flag alone is not a safe idempotency marker (it can be
     reset by another client, or the folder can be re-synced), so we keep a
     small local record of what has actually been written to the share.
+
+    One connection shared by every account worker, guarded by a lock:
+    sqlite3 connections are not safe to use from several threads at once, and
+    the writes here are short enough that serialising them costs nothing.
     """
 
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS processed_messages ("
-            "message_id TEXT PRIMARY KEY, "
-            "processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        )
-        self._conn.commit()
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS processed_messages ("
+                "message_id TEXT PRIMARY KEY, "
+                "processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            self._conn.commit()
 
     def is_processed(self, message_id: str) -> bool:
-        cur = self._conn.execute(
-            "SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,)
-        )
-        return cur.fetchone() is not None
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,)
+            )
+            return cur.fetchone() is not None
 
     def mark_processed(self, message_id: str) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)", (message_id,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)", (message_id,)
+            )
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 class SettingsStore:
@@ -1318,6 +1821,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
 
+from .accounts import Account
 from .config import Config
 from .filenames import safe_relative_parts, sanitize_filename
 from .mapping import Mapping
@@ -1336,8 +1840,10 @@ def _decode(value: str | None) -> str:
         return value
 
 
-def _message_id(msg: Message, uid: int) -> str:
-    return msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>"
+def _message_id(msg: Message, uid: int, account_key: str) -> str:
+    """Idempotency key. Scoped per account: the same message delivered to two
+    watched mailboxes is two things to archive, not one."""
+    return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
 def _extension_of(filename: str) -> str:
@@ -1347,17 +1853,30 @@ def _extension_of(filename: str) -> str:
 
 
 class Archiver:
-    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore, storage: Storage):
+    def __init__(
+        self,
+        config: Config,
+        mapping: Mapping,
+        store: ProcessedStore,
+        storage: Storage,
+        account: Account,
+    ):
         self.config = config
         self.mapping = mapping
         self.store = store
         self.storage = storage
+        self.account = account
 
     def connect(self) -> IMAPClient:
-        client = IMAPClient(self.config.imap_host, port=self.config.imap_port, ssl=self.config.imap_ssl)
-        client.login(self.config.imap_user, self.config.imap_password)
-        client.select_folder(self.config.imap_folder)
+        client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
+        client.login(self.account.user, self.account.password)
+        client.select_folder(self.account.folder)
         return client
+
+    def _resolve(self, *texts: str) -> tuple[str, str | None]:
+        # Rules can be limited to a single mailbox, so the account has to be
+        # part of every lookup.
+        return self.mapping.resolve(*texts, account_id=self.account.key)
 
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
@@ -1392,13 +1911,13 @@ class Archiver:
             )
             if not self.config.dry_run:
                 client.add_flags([uid], [b"\\Seen"])
-                if self.config.imap_oversized_folder:
-                    client.move([uid], self.config.imap_oversized_folder)
+                if self.account.oversized_folder:
+                    client.move([uid], self.account.oversized_folder)
             return True
 
         raw = client.fetch([uid], ["RFC822"])[uid][b"RFC822"]
         msg = email.message_from_bytes(raw)
-        message_id = _message_id(msg, uid)
+        message_id = _message_id(msg, uid, self.account.key)
 
         if self.store.is_processed(message_id):
             logger.info("UID %s (%s) already processed, marking seen and skipping", uid, message_id)
@@ -1408,7 +1927,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
+        mail_folder, mail_keyword = self._resolve(subject, body)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -1470,8 +1989,8 @@ class Archiver:
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
             client.add_flags([uid], [b"\\Seen"])
-            if self.config.imap_processed_folder:
-                client.move([uid], self.config.imap_processed_folder)
+            if self.account.processed_folder:
+                client.move([uid], self.account.processed_folder)
         return True
 
     def _target_parts(self, folder_name: str) -> tuple[str, ...]:
@@ -1507,7 +2026,7 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self.mapping.resolve(filename)
+        folder_name, matched_keyword = self._resolve(filename)
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 
@@ -1612,9 +2131,13 @@ from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .mapping import (
+    ALL_ACCOUNTS,
     MappingError,
+    Rule,
     load_rules,
+    move_rule,
     save_rules,
+    set_account,
     validate_folder,
     validate_keyword,
 )
@@ -1696,7 +2219,7 @@ BASE_TEMPLATE = """
   th, td { text-align: left; padding: .5rem .4rem; border-bottom: 1px solid var(--line);
            vertical-align: middle; }
   th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  td.keyword { font-weight: 600; word-break: break-word; }
+  td.keyword { font-weight: 600; overflow-wrap: break-word; min-width: 9rem; }
   .table-wrap { overflow-x: auto; }
   input, select, button { font: inherit; color: inherit; }
   input[type=text], input[type=password], select {
@@ -1711,8 +2234,8 @@ BASE_TEMPLATE = """
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
   /* Inside a table cell the select and its button have to stay on one line,
      otherwise every rule takes two rows and the table gets hard to scan. */
-  td .row { flex-wrap: nowrap; gap: .4rem; }
-  td select { max-width: 18rem; }
+  .row.nowrap { flex-wrap: nowrap; gap: .4rem; }
+  td select { max-width: 16rem; min-width: 8rem; }
   .field { display: flex; flex-direction: column; gap: .25rem; }
   .field label { font-size: .8rem; color: var(--muted); }
   .hint { color: var(--muted); font-size: .85rem; }
@@ -1723,6 +2246,13 @@ BASE_TEMPLATE = """
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-all; }
   form.inline { display: inline; }
+  td.prio { white-space: nowrap; }
+  button.arrow { background: transparent; border: 1px solid var(--line); color: var(--fg);
+                 padding: .1rem .35rem; line-height: 1.1; }
+  button.arrow[disabled] { opacity: .35; cursor: default; }
+  code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+         padding: 0 .25rem; font-size: .85em; }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -1732,6 +2262,7 @@ BASE_TEMPLATE = """
     {% if logged_in %}
     <nav>
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
+      <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -1787,38 +2318,82 @@ MAPPING_BODY = """
         <label for="new_folder">oder neuen Ordner anlegen</label>
         <input id="new_folder" name="new_folder" type="text" placeholder="z. B. rechnungen/2026">
       </div>
+      {% if accounts|length > 1 %}
+      <div class="field">
+        <label for="account">Postfach</label>
+        <select id="account" name="account">
+          <option value="all">alle Postfaecher</option>
+          {% for account in accounts %}
+            <option value="{{ account.key }}">{{ account.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       <button type="submit">Hinzufuegen</button>
     </div>
   </form>
-  <p class="hint">Laengere Stichwoerter gewinnen vor kuerzeren, Gross-/Kleinschreibung
-  ist egal. Aenderungen wirken beim naechsten Durchlauf, ein Neustart ist nicht noetig.</p>
+  <p class="hint">Gross-/Kleinschreibung ist egal. <code>*</code> steht fuer beliebig
+  viele Zeichen, <code>?</code> fuer genau eines - <code>RE*2026</code> passt also auf
+  &bdquo;RE-4711 vom 03.2026&ldquo;. Aenderungen wirken beim naechsten Durchlauf,
+  ein Neustart ist nicht noetig.</p>
 </div>
 
 <div class="card">
   <h2 style="margin-top:0">Aktuelle Zuordnungen ({{ rules|length }})</h2>
   {% if rules %}
+  <p class="hint" style="margin-top:0">Von oben nach unten geprueft - die erste
+  passende Zuordnung gewinnt. Mit den Pfeilen verschieben.</p>
   <div class="table-wrap">
   <table>
-    <tr><th>Stichwort</th><th>Zielordner</th><th></th></tr>
-    {% for keyword, folder in rules.items() %}
     <tr>
-      <td class="keyword">{{ keyword }}</td>
-      <td>
-        <form method="post" action="{{ url_for('update_rule') }}" class="row">
+      <th>Prio</th><th>Stichwort</th><th>Ziel{% if accounts|length > 1 %} und Postfach{% endif %}</th><th></th>
+    </tr>
+    {% for rule in rules %}
+    <tr>
+      <td class="prio">
+        <form class="inline" method="post" action="{{ url_for('move_rule_up') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="keyword" value="{{ keyword }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button class="arrow" type="submit" title="nach oben"
+                  {% if loop.first %}disabled{% endif %}>&uarr;</button>
+        </form>
+        <form class="inline" method="post" action="{{ url_for('move_rule_down') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button class="arrow" type="submit" title="nach unten"
+                  {% if loop.last %}disabled{% endif %}>&darr;</button>
+        </form>
+        <span class="hint">{{ loop.index }}</span>
+      </td>
+      <td class="keyword">{{ rule.keyword }}</td>
+      <td>
+        <form method="post" action="{{ url_for('update_rule') }}" class="row nowrap">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
           <select name="folder">
-            {% for option in folder_options(folder) %}
-              <option value="{{ option }}" {% if option == folder %}selected{% endif %}>{{ option }}</option>
+            {% for option in folder_options(rule.folder) %}
+              <option value="{{ option }}" {% if option == rule.folder %}selected{% endif %}>{{ option }}</option>
             {% endfor %}
           </select>
+          {% if accounts|length > 1 %}
+          <select name="account">
+            <option value="all" {% if rule.account == 'all' %}selected{% endif %}>alle Postfaecher</option>
+            {% for account in accounts %}
+              <option value="{{ account.key }}"
+                {% if rule.account == account.key %}selected{% endif %}>{{ account.name }}</option>
+            {% endfor %}
+            {% if rule.account not in account_keys %}
+              <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
           <button class="secondary" type="submit">Speichern</button>
         </form>
       </td>
       <td>
         <form method="post" action="{{ url_for('delete_rule') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="keyword" value="{{ keyword }}">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
           <button class="danger" type="submit">Loeschen</button>
         </form>
       </td>
@@ -1841,6 +2416,154 @@ MAPPING_BODY = """
     <dt>Gesperrte Dateiendungen</dt><dd>{{ quarantine_folder }}</dd>
   </dl>
 </div>
+"""
+
+CONFIG_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Postfaecher</h2>
+  {% if accounts %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Postfach</th><th>Ordner</th><th>Modus</th><th>Status</th><th></th></tr>
+    {% for account in accounts %}
+    <tr>
+      <td class="keyword">{{ account.name }}</td>
+      <td>{{ account.user }}<br><span class="hint">{{ account.host }}:{{ account.port }}{%
+        if not account.ssl %} &middot; ohne TLS{% endif %}</span></td>
+      <td>{{ account.folder }}</td>
+      <td>{{ account.mode }}</td>
+      <td>{% if account.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_account', account_id=account.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Kein Postfach konfiguriert - es wird nichts abgeholt.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_account') }}">
+    <button type="button">Postfach hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Mapping-Datei</h2>
+  <form method="post" action="{{ url_for('move_mapping') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="mapping_path">Pfad relativ zur Archiv-Wurzel</label>
+        <input id="mapping_path" name="mapping_path" type="text" value="{{ mapping_path }}" required>
+      </div>
+      <button type="submit">Verschieben</button>
+    </div>
+    <p class="hint">Die vorhandene Datei wird an den neuen Ort kopiert und am
+    alten geloescht. Archiv: {{ storage_description }}</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Feste Einstellungen</h2>
+  <p class="hint" style="margin-top:0">Diese kommen aus der .env und brauchen einen
+  Neustart des Containers.</p>
+  <dl>
+    <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
+    <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
+    <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
+    <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
+    <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
+    <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
+    <dt>Testmodus (DRY_RUN)</dt><dd>{{ 'an' if dry_run else 'aus' }}</dd>
+  </dl>
+</div>
+"""
+
+ACCOUNT_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Postfach bearbeiten' if account else 'Postfach hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ account.name if account else '' }}"
+               placeholder="z. B. Buchhaltung" required>
+      </div>
+      <div class="field">
+        <label for="host">IMAP-Server</label>
+        <input id="host" name="host" type="text" value="{{ account.host if account else '' }}"
+               placeholder="imap.example.com" required>
+      </div>
+      <div class="field">
+        <label for="port">Port</label>
+        <input id="port" name="port" type="text" value="{{ account.port if account else '993' }}" required>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="user">Benutzer</label>
+        <input id="user" name="user" type="text" value="{{ account.user if account else '' }}" required>
+      </div>
+      <div class="field">
+        <label for="password">Passwort</label>
+        <input id="password" name="password" type="password" autocomplete="new-password"
+               {% if account %}placeholder="unveraendert lassen: leer"{% else %}required{% endif %}>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="folder">Zu ueberwachender Ordner</label>
+        <input id="folder" name="folder" type="text"
+               value="{{ account.folder if account else 'INBOX' }}" required>
+      </div>
+      <div class="field">
+        <label for="mode">Abrufmodus</label>
+        <select id="mode" name="mode">
+          <option value="idle" {% if account and account.mode == 'idle' %}selected{% endif %}>IDLE (Push)</option>
+          <option value="poll" {% if not account or account.mode == 'poll' %}selected{% endif %}>Polling</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="processed_folder">Verarbeitete Mails verschieben nach (optional)</label>
+        <input id="processed_folder" name="processed_folder" type="text"
+               value="{{ account.processed_folder if account else '' }}">
+      </div>
+      <div class="field">
+        <label for="oversized_folder">Zu grosse Mails verschieben nach (optional)</label>
+        <input id="oversized_folder" name="oversized_folder" type="text"
+               value="{{ account.oversized_folder if account else '' }}">
+      </div>
+    </div>
+    <p style="margin:.8rem 0 .2rem">
+      <label><input type="checkbox" name="ssl" value="1"
+        {% if not account or account.ssl %}checked{% endif %}> TLS/SSL verwenden</label>
+      &nbsp;&nbsp;
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Aenderungen greifen innerhalb weniger Sekunden; eine laufende
+  IMAP-Verbindung wird dafuer neu aufgebaut.</p>
+</div>
+
+{% if account %}
+<div class="card">
+  <h2 style="margin-top:0">Postfach loeschen</h2>
+  <form method="post" action="{{ url_for('delete_account', account_id=account.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Dieses Postfach loeschen</button>
+    <p class="hint">Zuordnungen, die nur fuer dieses Postfach gelten, bleiben
+    bestehen und greifen dann nicht mehr.</p>
+  </form>
+</div>
+{% endif %}
 """
 
 PASSWORD_BODY = """
@@ -1868,8 +2591,9 @@ PASSWORD_BODY = """
 """
 
 
-def create_app(config, storage, settings) -> Flask:
-    """Build the web UI. `settings` is a SettingsStore, `storage` a Storage."""
+def create_app(runtime) -> Flask:
+    """Build the web UI on top of a Runtime (config, storage, settings, accounts)."""
+    config, storage, settings = runtime.config, runtime.storage, runtime.settings
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=_secret_key(settings),
@@ -1985,13 +2709,28 @@ def create_app(config, storage, settings) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _rules() -> list[Rule]:
+        return load_rules(storage, runtime.mapping_path)
+
+    def _save(rules: list[Rule]) -> None:
+        save_rules(storage, runtime.mapping_path, rules)
+
+    def _index(rules: list[Rule]) -> int:
+        try:
+            index = int(request.form.get("index", ""))
+        except ValueError:
+            raise MappingError("Diese Zuordnung gibt es nicht mehr.") from None
+        if not 0 <= index < len(rules):
+            raise MappingError("Diese Zuordnung gibt es nicht mehr.")
+        return index
+
     @app.get("/mapping")
     @login_required
     def mapping_page():
         try:
-            rules = load_rules(storage, config.mapping_path)
+            rules = _rules()
         except MappingError as exc:
-            rules = {}
+            rules = []
             flash(str(exc), "error")
 
         try:
@@ -2006,14 +2745,17 @@ def create_app(config, storage, settings) -> Flask:
             # created on the first attachment), so keep it selectable.
             return sorted({*folders, current}) if current else folders
 
+        accounts = runtime.accounts.all()
         return render(
             MAPPING_BODY,
             "Zuordnungen",
             rules=rules,
             folders=folders,
             folder_options=folder_options,
+            accounts=accounts,
+            account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
             storage_description=storage.description,
-            mapping_path=config.mapping_path,
+            mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
         )
@@ -2025,13 +2767,14 @@ def create_app(config, storage, settings) -> Flask:
         new_folder = request.form.get("new_folder", "").strip()
         chosen = new_folder or request.form.get("folder", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
+            rules = _rules()
             keyword = validate_keyword(request.form.get("keyword", ""), rules)
             folder = validate_folder(chosen)
+            account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
             if new_folder:
                 storage.create_folder(folder)
-            rules[keyword] = folder
-            save_rules(storage, config.mapping_path, rules)
+            rules.append(Rule.create(keyword, folder, account))
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001 - surface storage failures in the UI
@@ -2042,47 +2785,188 @@ def create_app(config, storage, settings) -> Flask:
             flash(f"{keyword} → {folder} gespeichert.", "ok")
         return redirect(url_for("mapping_page"))
 
+    def _account_choice(value: str) -> str:
+        value = (value or ALL_ACCOUNTS).strip()
+        if value == ALL_ACCOUNTS:
+            return ALL_ACCOUNTS
+        if value not in {account.key for account in runtime.accounts.all()}:
+            raise MappingError("Dieses Postfach gibt es nicht.")
+        return value
+
     @app.post("/mapping/update")
     @login_required
     def update_rule():
         require_csrf()
-        keyword = request.form.get("keyword", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
-            if keyword not in rules:
-                raise MappingError(f"Das Stichwort {keyword!r} gibt es nicht mehr.")
+            rules = _rules()
+            index = _index(rules)
+            rule = rules[index]
             folder = validate_folder(request.form.get("folder", ""))
-            rules[keyword] = folder
-            save_rules(storage, config.mapping_path, rules)
+            account = _account_choice(request.form.get("account", rule.account))
+            rules[index] = set_account(Rule.create(rule.keyword, folder, account), account)
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Web UI: could not update rule")
             flash(f"Speichern fehlgeschlagen: {exc}", "error")
         else:
-            logger.info("Web UI: changed mapping %r -> %r", keyword, folder)
-            flash(f"{keyword} → {folder} gespeichert.", "ok")
+            logger.info("Web UI: changed mapping %r -> %r", rule.keyword, folder)
+            flash(f"{rule.keyword} → {folder} gespeichert.", "ok")
         return redirect(url_for("mapping_page"))
 
     @app.post("/mapping/delete")
     @login_required
     def delete_rule():
         require_csrf()
-        keyword = request.form.get("keyword", "")
         try:
-            rules = load_rules(storage, config.mapping_path)
-            if rules.pop(keyword, None) is None:
-                raise MappingError(f"Das Stichwort {keyword!r} gibt es nicht mehr.")
-            save_rules(storage, config.mapping_path, rules)
+            rules = _rules()
+            index = _index(rules)
+            removed = rules.pop(index)
+            _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Web UI: could not delete rule")
             flash(f"Loeschen fehlgeschlagen: {exc}", "error")
         else:
-            logger.info("Web UI: deleted mapping %r", keyword)
-            flash(f"{keyword} geloescht. Der Ordner selbst bleibt bestehen.", "ok")
+            logger.info("Web UI: deleted mapping %r", removed.keyword)
+            flash(f"{removed.keyword} geloescht. Der Ordner selbst bleibt bestehen.", "ok")
         return redirect(url_for("mapping_page"))
+
+    def _reorder(offset: int):
+        require_csrf()
+        try:
+            rules = _rules()
+            index = _index(rules)
+            _save(move_rule(rules, index, offset))
+        except MappingError as exc:
+            flash(str(exc), "error")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Web UI: could not reorder rules")
+            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
+        return redirect(url_for("mapping_page"))
+
+    @app.post("/mapping/up")
+    @login_required
+    def move_rule_up():
+        return _reorder(-1)
+
+    @app.post("/mapping/down")
+    @login_required
+    def move_rule_down():
+        return _reorder(1)
+
+    # --- configuration ---------------------------------------------------
+
+    @app.get("/config")
+    @login_required
+    def config_page():
+        return render(
+            CONFIG_BODY,
+            "Konfiguration",
+            accounts=runtime.accounts.all(),
+            mapping_path=runtime.mapping_path,
+            storage_description=storage.description,
+            storage_backend=config.storage_backend,
+            fallback_folder=config.fallback_folder,
+            quarantine_folder=config.quarantine_folder,
+            match_body=config.match_body,
+            filename_prefix=config.filename_prefix,
+            poll_interval=config.poll_interval,
+            dry_run=config.dry_run,
+        )
+
+    @app.post("/config/mapping-path")
+    @login_required
+    def move_mapping():
+        require_csrf()
+        try:
+            runtime.set_mapping_path(request.form.get("mapping_path", ""))
+        except MappingError as exc:
+            flash(str(exc), "error")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Web UI: could not move the mapping file")
+            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
+        else:
+            flash(f"Mapping-Datei liegt jetzt unter {runtime.mapping_path}.", "ok")
+        return redirect(url_for("config_page"))
+
+    def _account_form(account=None):
+        """Read the account form, keeping the stored password if left empty."""
+        password = request.form.get("password", "")
+        if not password and account is not None:
+            password = account.password
+        try:
+            port = int(request.form.get("port", "993").strip())
+        except ValueError:
+            raise MappingError("Der Port muss eine Zahl sein.") from None
+        if not 1 <= port <= 65535:
+            raise MappingError("Der Port muss zwischen 1 und 65535 liegen.")
+        if not request.form.get("host", "").strip():
+            raise MappingError("Bitte einen IMAP-Server angeben.")
+        if not request.form.get("user", "").strip():
+            raise MappingError("Bitte einen Benutzernamen angeben.")
+        if not password:
+            raise MappingError("Bitte ein Passwort angeben.")
+        return {
+            "name": request.form.get("name", ""),
+            "host": request.form.get("host", ""),
+            "port": port,
+            "ssl": bool(request.form.get("ssl")),
+            "user": request.form.get("user", ""),
+            "password": password,
+            "folder": request.form.get("folder", "INBOX"),
+            "mode": request.form.get("mode", "poll"),
+            "processed_folder": request.form.get("processed_folder", ""),
+            "oversized_folder": request.form.get("oversized_folder", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/accounts/new", methods=["GET", "POST"])
+    @login_required
+    def new_account():
+        if request.method == "POST":
+            require_csrf()
+            try:
+                runtime.accounts.add(**_account_form())
+            except MappingError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added IMAP account %r", request.form.get("host"))
+                flash("Postfach angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ACCOUNT_BODY, "Postfach", account=None)
+
+    @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_account(account_id: int):
+        account = runtime.accounts.get(account_id)
+        if account is None:
+            flash("Dieses Postfach gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                runtime.accounts.update(account_id, **_account_form(account))
+            except MappingError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated IMAP account %s", account_id)
+                flash("Postfach gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            account = runtime.accounts.get(account_id)
+        return render(ACCOUNT_BODY, "Postfach", account=account)
+
+    @app.post("/config/accounts/<int:account_id>/delete")
+    @login_required
+    def delete_account(account_id: int):
+        require_csrf()
+        runtime.accounts.delete(account_id)
+        logger.info("Web UI: deleted IMAP account %s", account_id)
+        flash("Postfach geloescht.", "ok")
+        return redirect(url_for("config_page"))
 
     @app.route("/password", methods=["GET", "POST"])
     @login_required
@@ -2150,7 +3034,7 @@ def ensure_password(settings, initial_password: str) -> None:
     logger.info("Web UI: initial password taken from WEB_PASSWORD")
 
 
-def serve(config, storage, settings) -> threading.Thread:
+def serve(runtime) -> threading.Thread:
     """Bind the port and serve the UI on a daemon thread.
 
     Binding happens here, in the caller's thread, so a port clash is a startup
@@ -2159,8 +3043,9 @@ def serve(config, storage, settings) -> threading.Thread:
     """
     from waitress import create_server
 
-    ensure_password(settings, config.web_password)
-    app = create_app(config, storage, settings)
+    config = runtime.config
+    ensure_password(runtime.settings, config.web_password)
+    app = create_app(runtime)
     try:
         server = create_server(app, host=config.web_host, port=config.web_port, threads=4)
     except OSError as exc:
@@ -2181,15 +3066,22 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
+import threading
 
 from . import storage as storage_module
+from .accounts import AccountStore, seed_from_config
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
+from .runtime import SETTING_MAPPING_PATH, Runtime
 from .state import ProcessedStore, SettingsStore
 
 logger = logging.getLogger("mail2nas")
+
+# How often the supervisor notices that accounts were added, changed or
+# removed in the web UI. Short enough to feel immediate, long enough to be
+# free.
+SUPERVISOR_INTERVAL = 5
 
 
 def main() -> None:
@@ -2204,77 +3096,200 @@ def main() -> None:
     # Fail fast: an unreachable share is otherwise indistinguishable from an
     # empty one, and attachments would land somewhere they silently vanish.
     storage.check_writable()
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+
+    settings = SettingsStore(config.state_db_path)
+    accounts = AccountStore(config.state_db_path)
+    # Before seeding: from here on the file contains IMAP passwords.
+    _protect_state_file(config.state_db_path)
+    seed_from_config(accounts, settings, config)
+
+    mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
+    mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    archiver = Archiver(config, mapping, store, storage)
+    runtime = Runtime(config, storage, mapping, store, settings, accounts)
 
     if config.web_enabled:
         # Imported lazily so the archiver still runs if the web dependencies
         # are missing (e.g. an older image built before the UI existed).
         from . import web
 
-        web.serve(config, storage, SettingsStore(config.state_db_path))
+        web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s (%s) dry_run=%s",
-        config.imap_host,
-        config.imap_folder,
-        config.imap_mode,
+        "Starting mail2nas: storage=%s (%s) mapping=%s dry_run=%s",
         storage.description,
         config.storage_backend,
+        mapping_path,
         config.dry_run,
     )
 
     try:
-        while True:
-            try:
-                client = archiver.connect()
-            except Exception:
-                logger.exception("IMAP connection failed, retrying in %ss", config.poll_interval)
-                time.sleep(config.poll_interval)
-                continue
-
-            try:
-                if config.imap_mode == "idle":
-                    _run_idle(archiver, client, config)
-                else:
-                    _run_poll(archiver, client, config)
-            except Exception:
-                logger.exception("IMAP session failed, reconnecting in %ss", config.poll_interval)
-            finally:
-                try:
-                    client.logout()
-                except Exception:
-                    pass
-            time.sleep(config.poll_interval)
+        _supervise(runtime)
     finally:
         store.close()
         storage.close()
 
 
-def _run_poll(archiver: Archiver, client, config: Config) -> None:
-    while True:
+def _protect_state_file(path: str) -> None:
+    """The state database holds IMAP passwords, so nobody else may read it."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning("Could not restrict permissions on %s (%s)", path, exc)
+
+
+class _Worker:
+    """One IMAP account, watched on its own thread.
+
+    A thread per account rather than one loop over all of them: IMAP IDLE
+    blocks, so a single loop would leave every other mailbox waiting for the
+    first one's timeout.
+    """
+
+    def __init__(self, runtime: Runtime, account):
+        self.account = account
+        self.fingerprint = account.fingerprint()
+        self._runtime = runtime
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"mail2nas-imap-{account.id}", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def _run(self) -> None:
+        config = self._runtime.config
+        archiver = Archiver(
+            config,
+            self._runtime.mapping,
+            self._runtime.store,
+            self._runtime.storage,
+            self.account,
+        )
+        label = f"{self.account.name} <{self.account.user}>"
+        logger.info(
+            "Account %s: watching %s on %s (%s mode)",
+            label,
+            self.account.folder,
+            self.account.host,
+            self.account.mode,
+        )
+
+        while not self._stop.is_set():
+            try:
+                client = archiver.connect()
+            except Exception:
+                logger.exception(
+                    "Account %s: IMAP connection failed, retrying in %ss",
+                    label,
+                    config.poll_interval,
+                )
+                self._stop.wait(config.poll_interval)
+                continue
+
+            try:
+                if self.account.mode == "idle":
+                    self._run_idle(archiver, client, label)
+                else:
+                    self._run_poll(archiver, client, label)
+            except Exception:
+                logger.exception(
+                    "Account %s: IMAP session failed, reconnecting in %ss",
+                    label,
+                    config.poll_interval,
+                )
+            finally:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+            self._stop.wait(config.poll_interval)
+
+        logger.info("Account %s: stopped", label)
+
+    def _cycle(self, archiver: Archiver, client, label: str) -> None:
         count = archiver.run_once(client)
         if count:
-            logger.info("Processed %d message(s)", count)
-        time.sleep(config.poll_interval)
+            logger.info("Account %s: processed %d message(s)", label, count)
+
+    def _run_poll(self, archiver: Archiver, client, label: str) -> None:
+        while not self._stop.is_set():
+            self._cycle(archiver, client, label)
+            self._stop.wait(self._runtime.config.poll_interval)
+
+    def _run_idle(self, archiver: Archiver, client, label: str) -> None:
+        self._cycle(archiver, client, label)
+        idle_timeout = self._runtime.config.poll_interval or 300
+        while not self._stop.is_set():
+            client.idle()
+            try:
+                client.idle_check(timeout=idle_timeout)
+            finally:
+                client.idle_done()
+            self._cycle(archiver, client, label)
 
 
-def _run_idle(archiver: Archiver, client, config: Config) -> None:
-    count = archiver.run_once(client)
-    if count:
-        logger.info("Processed %d message(s)", count)
+def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
+    """Start, stop and restart workers so they match the configured accounts.
 
-    idle_timeout = config.poll_interval or 300
-    while True:
-        client.idle()
-        try:
-            client.idle_check(timeout=idle_timeout)
-        finally:
-            client.idle_done()
-        count = archiver.run_once(client)
-        if count:
-            logger.info("Processed %d message(s)", count)
+    Split out of the loop below so the decision - which worker survives a
+    configuration change - can be tested without real IMAP connections.
+    """
+    factory = factory or (lambda account: _Worker(runtime, account))
+    wanted = {account.id: account for account in runtime.accounts.enabled()}
+
+    for account_id, worker in list(workers.items()):
+        account = wanted.get(account_id)
+        if account is None or account.fingerprint() != worker.fingerprint:
+            # Settings changed or the account is gone. The worker notices at
+            # the end of its current cycle, so a reconnect can lag by up to
+            # one poll interval.
+            if account is not None:
+                logger.info("Account %s: configuration changed, restarting", account.name)
+            worker.stop()
+            del workers[account_id]
+        elif not worker.is_alive():
+            del workers[account_id]
+
+    for account_id, account in wanted.items():
+        if account_id not in workers:
+            worker = factory(account)
+            workers[account_id] = worker
+            worker.start()
+
+    return workers
+
+
+def _supervise(runtime: Runtime) -> None:
+    """Keep one worker per enabled account, following changes made in the UI."""
+    workers: dict[int, _Worker] = {}
+    idle_warning_shown = False
+    try:
+        while True:
+            reconcile(runtime, workers)
+
+            if not workers and not idle_warning_shown:
+                # Once, not on every pass - this loop runs every few seconds.
+                logger.warning(
+                    "No enabled IMAP account configured - nothing is being watched. "
+                    "Add one in the web UI."
+                )
+            idle_warning_shown = bool(not workers)
+
+            runtime.mapping_path_changed.wait(SUPERVISOR_INTERVAL)
+            if runtime.mapping_path_changed.is_set():
+                runtime.mapping_path_changed.clear()
+                runtime.apply_mapping_path()
+    finally:
+        for worker in workers.values():
+            worker.stop()
 
 
 if __name__ == "__main__":
@@ -2288,8 +3303,27 @@ from __future__ import annotations
 import os
 import textwrap
 
-from mail2nas.mapping import Mapping
+import pytest
+
+from mail2nas.mapping import (
+    Mapping,
+    MappingError,
+    Rule,
+    load_rules,
+    move_rule,
+    save_rules,
+    validate_keyword,
+)
 from mail2nas.storage import LocalStorage
+
+
+def _write_rules(tmp_path, rules) -> None:
+    """Write rules in the current format, as (keyword, folder[, account])."""
+    save_rules(
+        LocalStorage(str(tmp_path)),
+        "mapping.yaml",
+        [Rule.create(*rule) for rule in rules],
+    )
 
 
 def _write_mapping(path, content: str) -> None:
@@ -2409,6 +3443,160 @@ def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
         mapping.reload()
 
     assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+# --- priority: explicit order, first match wins --------------------------------
+
+
+def test_first_matching_rule_wins_regardless_of_keyword_length(tmp_path):
+    """Order is explicit now - a short keyword placed first beats a longer one."""
+    _write_rules(tmp_path, [("RE", "rechnungen"), ("Rechnungskorrektur", "korrekturen")])
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "rechnungen"
+
+
+def test_moving_a_rule_up_changes_which_one_wins(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen"), ("Rechnungskorrektur", "korrekturen")])
+    rules = load_rules(LocalStorage(str(tmp_path)), "mapping.yaml")
+
+    save_rules(LocalStorage(str(tmp_path)), "mapping.yaml", move_rule(rules, 1, -1))
+
+    assert _mapping(tmp_path).resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+
+
+def test_moving_beyond_the_ends_is_a_no_op(tmp_path):
+    rules = [Rule.create("A", "a"), Rule.create("B", "b")]
+
+    assert [r.keyword for r in move_rule(rules, 0, -1)] == ["A", "B"]
+    assert [r.keyword for r in move_rule(rules, 1, 1)] == ["A", "B"]
+
+
+# --- legacy format --------------------------------------------------------------
+
+
+def test_old_flat_file_is_read_with_its_original_priority(tmp_path):
+    """The pre-2.0 format matched the longest keyword first; migration must not
+    change which folder a mail lands in."""
+    _write_mapping(tmp_path / "mapping.yaml", """
+        RE: rechnungen
+        Rechnungskorrektur: korrekturen
+    """)
+
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+    assert mapping.resolve("RE-1")[0] == "rechnungen"
+
+
+def test_saving_writes_the_versioned_format(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "2")])
+
+    text = storage.read_text("mapping.yaml")
+
+    assert "version: 2" in text
+    assert "keyword: RE" in text
+    assert "account: '2'" in text
+
+
+# --- wildcards --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "keyword,subject,expected",
+    [
+        ("RE*", "Ihre RE-4711", True),
+        ("RE*2026", "RE-4711 vom 03.2026", True),
+        ("RE*2026", "RE-4711 vom 03.2025", False),
+        ("Rechn?ng", "Ihre Rechnung", True),
+        ("Rechn?ng", "Ihre Rechnuung", False),
+        ("*Rechnung*", "Ihre Rechnung 1", True),
+        ("Rechnung", "Ihre RECHNUNG 1", True),
+    ],
+)
+def test_wildcard_and_case_matching(tmp_path, keyword, subject, expected):
+    _write_rules(tmp_path, [(keyword, "treffer")])
+
+    folder, _ = _mapping(tmp_path).resolve(subject)
+
+    assert (folder == "treffer") is expected
+
+
+def test_wildcards_stay_within_substring_search(tmp_path):
+    """A pattern is not anchored, so it may match in the middle of a subject."""
+    _write_rules(tmp_path, [("RE*47", "treffer")])
+
+    assert _mapping(tmp_path).resolve("Betreff: Ihre RE-4711 anbei")[0] == "treffer"
+
+
+def test_a_regex_metacharacter_in_a_keyword_is_literal(tmp_path):
+    """Only * and ? are wildcards - the rest must not be interpreted."""
+    _write_rules(tmp_path, [("RE.*", "treffer")])
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("RE.4711")[0] == "treffer"
+    assert mapping.resolve("REX4711")[0] == "unsorted"
+
+
+def test_keyword_of_only_wildcards_is_rejected():
+    with pytest.raises(MappingError):
+        validate_keyword("***", [])
+
+
+# --- per-account rules --------------------------------------------------------------
+
+
+def test_a_rule_can_be_limited_to_one_account(tmp_path):
+    _write_rules(tmp_path, [("Rechnung", "rechnungen", "2")])
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("Rechnung 1", account_id="2")[0] == "rechnungen"
+    assert mapping.resolve("Rechnung 1", account_id="1")[0] == "unsorted"
+
+
+def test_rules_for_all_accounts_match_every_account(tmp_path):
+    _write_rules(tmp_path, [("Rechnung", "rechnungen")])
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("Rechnung 1", account_id="7")[0] == "rechnungen"
+
+
+def test_an_account_specific_rule_is_skipped_for_other_accounts(tmp_path):
+    _write_rules(tmp_path, [("Rechnung", "nur-konto-2", "2"), ("Rechnung", "alle")])
+
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("Rechnung", account_id="2")[0] == "nur-konto-2"
+    assert mapping.resolve("Rechnung", account_id="1")[0] == "alle"
+
+
+def test_a_pattern_with_too_many_wildcards_is_rejected_in_the_ui():
+    with pytest.raises(MappingError, match="Platzhalter"):
+        validate_keyword("a*b*c*d*e*f*g", [])
+
+
+def test_a_hand_written_pattern_with_too_many_wildcards_degrades_to_literal(tmp_path):
+    """Loaded from the share it must not raise - and must not be run as a regex."""
+    _write_mapping(tmp_path / "mapping.yaml", 'version: 2\nrules:\n- keyword: "a*b*c*d*e*f*g"\n  folder: t\n')
+
+    mapping = _mapping(tmp_path)
+
+    assert mapping.resolve("a" * 200 + "g")[0] == "unsorted"
+    assert mapping.resolve("a*b*c*d*e*f*g")[0] == "t"
+
+
+def test_matching_a_huge_body_stays_bounded(tmp_path):
+    """A wildcard pattern must not be run against an unbounded amount of text."""
+    import time
+
+    _write_rules(tmp_path, [("Rechnung*Ende", "treffer")])
+    mapping = _mapping(tmp_path)
+
+    started = time.monotonic()
+    folder, _ = mapping.resolve("Rechnung " + ("x" * 2_000_000))
+    assert folder == "unsorted"
+    assert time.monotonic() - started < 5
 MAIL2NAS_EOF
 
 # --- tests/test_filenames.py ---
@@ -2565,7 +3753,19 @@ from mail2nas.archiver import Archiver
 from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
+from mail2nas.accounts import Account
 from mail2nas.storage import LocalStorage
+
+TEST_ACCOUNT = Account(
+    id=1, name="Test", host="imap.example.com", port=993, ssl=True,
+    user="u", password="p", folder="INBOX", mode="poll",
+    processed_folder="", oversized_folder="", enabled=True,
+)
+
+
+def _account(**overrides) -> Account:
+    from dataclasses import replace
+    return replace(TEST_ACCOUNT, **overrides)
 
 
 def _make_config(tmp_path, **overrides) -> Config:
@@ -2617,7 +3817,9 @@ def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overrides) -> Archiver:
+def _make_archiver(
+    tmp_path, mapping_content: str | None = None, account: Account | None = None, **config_overrides
+) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
     mapping_path = tmp_path / "mapping.yaml"
     if mapping_content is not None:
@@ -2625,7 +3827,7 @@ def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overri
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage)
+    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT)
 
 
 class FakeIMAPClient:
@@ -3268,8 +4470,10 @@ import re
 
 import pytest
 
-from mail2nas.mapping import load_rules, save_rules
-from mail2nas.state import SettingsStore
+from mail2nas.accounts import AccountStore
+from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
+from mail2nas.runtime import Runtime
+from mail2nas.state import ProcessedStore, SettingsStore
 from mail2nas.storage import LocalStorage
 from mail2nas.web import (
     SETTING_PASSWORD_HASH,
@@ -3288,10 +4492,15 @@ def env(tmp_path):
     config = _make_config(tmp_path, web_enabled=True, web_password=PASSWORD)
     storage = LocalStorage(config.storage_root)
     settings = SettingsStore(config.state_db_path)
+    accounts = AccountStore(config.state_db_path)
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    runtime = Runtime(
+        config, storage, mapping, ProcessedStore(config.state_db_path), settings, accounts
+    )
     ensure_password(settings, config.web_password)
-    app = create_app(config, storage, settings)
+    app = create_app(runtime)
     app.config.update(TESTING=True)
-    return app, storage, settings, config
+    return app, storage, settings, config, runtime
 
 
 @pytest.fixture
@@ -3379,7 +4588,7 @@ def test_security_headers_are_set(client):
 
 
 def test_adding_a_rule_writes_it_to_the_share(client, env):
-    _, storage, _, config = env
+    _, storage, _, config, runtime = env
     _login(client)
 
     client.post(
@@ -3388,7 +4597,9 @@ def test_adding_a_rule_writes_it_to_the_share(client, env):
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"Rechnung": "rechnungen"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("Rechnung", "rechnungen")
+    ]
 
 
 def test_a_new_folder_is_created_on_the_share(client, env, tmp_path):
@@ -3413,8 +4624,8 @@ def test_existing_folders_are_offered_for_selection(client, tmp_path):
 
 
 def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
     _login(client)
 
     response = client.post(
@@ -3425,12 +4636,14 @@ def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
     )
 
     assert "gibt es schon" in response.get_data(as_text=True)
-    assert load_rules(storage, config.mapping_path) == {"RE": "rechnungen"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("RE", "rechnungen")
+    ]
 
 
 @pytest.mark.parametrize("folder", ["../ausbruch", "/etc", ""])
 def test_target_folder_cannot_escape_the_archive_root(client, env, folder, tmp_path):
-    _, storage, _, config = env
+    _, storage, _, config, runtime = env
     _login(client)
 
     client.post(
@@ -3439,39 +4652,42 @@ def test_target_folder_cannot_escape_the_archive_root(client, env, folder, tmp_p
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {}
+    assert load_rules(storage, config.mapping_path) == []
     assert not (tmp_path.parent / "ausbruch").exists()
 
 
 def test_changing_the_folder_of_an_existing_rule(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
     _login(client)
 
     client.post(
         "/mapping/update",
-        data={"keyword": "RE", "folder": "belege", "csrf_token": _csrf(client, "/mapping")},
+        data={"index": "0", "folder": "belege", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"RE": "belege"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("RE", "belege")
+    ]
 
 
 def test_deleting_a_rule_keeps_the_others(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen", "LS": "lieferscheine"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen"), Rule.create("LS", "lieferscheine")])
     _login(client)
 
     client.post(
         "/mapping/delete",
-        data={"keyword": "RE", "csrf_token": _csrf(client, "/mapping")},
+        data={"index": "0", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"LS": "lieferscheine"}
+    assert [r.keyword for r in load_rules(storage, config.mapping_path)] == ["LS"]
 
 
 def test_unreadable_share_does_not_break_the_page(client, env, monkeypatch):
     """A NAS that is briefly away must still render, with an explanation."""
-    _, storage, _, _ = env
+    _, storage, _, _, runtime = env
     _login(client)
     monkeypatch.setattr(
         storage, "list_folders", lambda *a, **k: (_ for _ in ()).throw(OSError("NAS weg"))
@@ -3487,7 +4703,7 @@ def test_unreadable_share_does_not_break_the_page(client, env, monkeypatch):
 
 
 def test_password_can_be_changed_and_the_old_one_stops_working(client, env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     _login(client)
 
     response = client.post(
@@ -3504,7 +4720,7 @@ def test_password_can_be_changed_and_the_old_one_stops_working(client, env):
 
 
 def test_wrong_current_password_does_not_change_anything(client, env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     before = settings.get(SETTING_PASSWORD_HASH)
     _login(client)
 
@@ -3522,7 +4738,7 @@ def test_wrong_current_password_does_not_change_anything(client, env):
     [("kurz", "kurz", "mindestens"), ("langgenug1", "andersrum", "ueberein")],
 )
 def test_weak_or_mistyped_new_password_is_rejected(client, env, new, confirm, expected):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     before = settings.get(SETTING_PASSWORD_HASH)
     _login(client)
 
@@ -3539,7 +4755,7 @@ def test_weak_or_mistyped_new_password_is_rejected(client, env, new, confirm, ex
 
 def test_changing_the_password_logs_other_sessions_out(env):
     """A stolen session cookie must not survive a password change."""
-    app, _, _, _ = env
+    app = env[0]
     # Two plain clients rather than nested `with` blocks: overlapping request
     # contexts confuse Flask's teardown, and no session inspection is needed.
     first, second = app.test_client(), app.test_client()
@@ -3558,7 +4774,7 @@ def test_changing_the_password_logs_other_sessions_out(env):
 
 
 def test_password_is_not_stored_in_clear_text(env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
 
     stored = settings.get(SETTING_PASSWORD_HASH)
 
@@ -3582,7 +4798,7 @@ def test_too_short_initial_password_fails_fast(tmp_path):
 
 def test_stored_password_wins_over_the_configured_one(env):
     """WEB_PASSWORD is the initial value only - a later change must survive restarts."""
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     settings.set(SETTING_PASSWORD_HASH, "scrypt:already-set")
 
     ensure_password(settings, "eineAndere123")
@@ -3624,6 +4840,483 @@ def test_locked_out_client_is_refused_even_with_the_right_password(client, env):
 
     assert response.status_code == 429
     assert client.get("/mapping").status_code == 302
+
+
+# --- rule order ------------------------------------------------------------------
+
+
+def _keywords(storage, config):
+    return [rule.keyword for rule in load_rules(storage, config.mapping_path)]
+
+
+def test_moving_a_rule_up_reorders_the_file(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path,
+               [Rule.create("A", "a"), Rule.create("B", "b"), Rule.create("C", "c")])
+    _login(client)
+
+    client.post("/mapping/up", data={"index": "2", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "C", "B"]
+
+
+def test_moving_a_rule_down_reorders_the_file(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    client.post("/mapping/down", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["B", "A"]
+
+
+def test_moving_the_top_rule_up_is_harmless(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    client.post("/mapping/up", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+@pytest.mark.parametrize("index", ["7", "-1", "keineZahl"])
+def test_a_bogus_row_index_is_refused(client, env, index):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _login(client)
+
+    client.post("/mapping/delete", data={"index": index, "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A"]
+
+
+def test_new_rules_are_appended_at_the_bottom(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _login(client)
+
+    client.post("/mapping/add", data={"keyword": "B", "new_folder": "b",
+                                      "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+# --- accounts ---------------------------------------------------------------------
+
+
+def _add_account(runtime, **fields):
+    defaults = dict(name="Buchhaltung", host="imap.example.com", user="u", password="p")
+    defaults.update(fields)
+    return runtime.accounts.add(**defaults)
+
+
+def test_config_page_lists_the_accounts(client, env):
+    _, _, _, _, runtime = env
+    _add_account(runtime)
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Buchhaltung" in html
+    assert "imap.example.com" in html
+
+
+def test_creating_an_account_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/accounts/new", data={
+        "name": "Zweitpostfach", "host": "imap2.example.com", "port": "143",
+        "user": "zwei", "password": "geheim", "folder": "INBOX", "mode": "poll",
+        "processed_folder": "", "oversized_folder": "", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    accounts = runtime.accounts.all()
+    assert [a.name for a in accounts] == ["Zweitpostfach"]
+    assert accounts[0].port == 143 and accounts[0].ssl is False
+
+
+def test_editing_an_account_keeps_the_password_when_left_empty(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime, password="altesGeheim")
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        "name": "Neuer Name", "host": "imap.example.com", "port": "993",
+        "user": "u", "password": "", "folder": "INBOX", "mode": "idle",
+        "ssl": "1", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    account = runtime.accounts.get(account_id)
+    assert account.password == "altesGeheim"
+    assert account.name == "Neuer Name" and account.mode == "idle"
+
+
+def test_an_invalid_port_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}", data={
+        "name": "A", "host": "h", "port": "keinPort", "user": "u", "password": "",
+        "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")},
+        follow_redirects=True)
+
+    assert "Port" in response.get_data(as_text=True)
+    assert runtime.accounts.get(account_id).host == "imap.example.com"
+
+
+def test_deleting_an_account(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.accounts.all() == []
+
+
+def test_a_rule_can_be_bound_to_an_account(client, env):
+    _, storage, _, config, runtime = env
+    account_id = _add_account(runtime)
+    _add_account(runtime, name="Zweites")
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "account": str(account_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path)[0].account == str(account_id)
+
+
+def test_a_rule_cannot_reference_an_unknown_account(client, env):
+    _, storage, _, config, runtime = env
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "account": "999",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path) == []
+
+
+# --- moving the mapping file --------------------------------------------------------
+
+
+def test_moving_the_mapping_file_takes_the_rules_along(client, env, tmp_path):
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "config/regeln.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.mapping_path == "config/regeln.yaml"
+    assert [r.keyword for r in load_rules(storage, "config/regeln.yaml")] == ["RE"]
+    assert not (tmp_path / "mapping.yaml").exists()
+
+
+def test_the_mapping_path_cannot_escape_the_archive_root(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "../woanders.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.mapping_path == "mapping.yaml"
+
+
+def test_moving_to_the_same_path_is_a_no_op(client, env):
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "mapping.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert [r.keyword for r in load_rules(storage, "mapping.yaml")] == ["RE"]
+
+
+def test_reordering_without_a_csrf_token_is_refused(client, env):
+    """The arrows go through a helper, so their CSRF check needs its own test."""
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    response = client.post("/mapping/up", data={"index": "1"})
+
+    assert response.status_code == 400
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+def test_the_stored_account_password_is_never_sent_to_the_browser(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime, password="streng-geheim")
+    _login(client)
+
+    html = client.get(f"/config/accounts/{account_id}").get_data(as_text=True)
+
+    assert "streng-geheim" not in html
+MAIL2NAS_EOF
+
+# --- tests/test_accounts.py ---
+cat > tests/test_accounts.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.accounts import SETTING_ACCOUNTS_SEEDED, AccountStore, seed_from_config
+from mail2nas.state import SettingsStore
+from tests.test_archiver import _make_config
+
+
+@pytest.fixture
+def store(tmp_path):
+    return AccountStore(str(tmp_path / "state.db"))
+
+
+def test_add_and_read_back_an_account(store):
+    account_id = store.add(name="Buchhaltung", host="imap.example.com", user="u", password="p")
+
+    account = store.get(account_id)
+
+    assert account.name == "Buchhaltung"
+    assert account.port == 993 and account.ssl is True
+    assert account.folder == "INBOX" and account.enabled is True
+    assert account.key == str(account_id)
+
+
+def test_update_changes_only_what_is_passed(store):
+    account_id = store.add(name="A", host="h", user="u", password="p", folder="Archiv")
+
+    store.update(account_id, name="B")
+
+    account = store.get(account_id)
+    assert account.name == "B"
+    assert account.folder == "Archiv" and account.password == "p"
+
+
+def test_disabled_accounts_are_not_watched(store):
+    store.add(name="An", host="h", user="u", password="p")
+    store.add(name="Aus", host="h", user="u", password="p", enabled=False)
+
+    assert [a.name for a in store.enabled()] == ["An"]
+    assert len(store.all()) == 2
+
+
+def test_delete_removes_the_account(store):
+    account_id = store.add(name="A", host="h", user="u", password="p")
+
+    store.delete(account_id)
+
+    assert store.get(account_id) is None
+
+
+def test_an_unknown_mode_falls_back_to_polling(store):
+    account_id = store.add(name="A", host="h", user="u", password="p", mode="bogus")
+
+    assert store.get(account_id).mode == "poll"
+
+
+def test_fingerprint_changes_when_settings_change(store):
+    account_id = store.add(name="A", host="h", user="u", password="p")
+    before = store.get(account_id).fingerprint()
+
+    store.update(account_id, password="neu")
+
+    assert store.get(account_id).fingerprint() != before
+
+
+def test_renaming_does_not_restart_the_worker(store):
+    """The name is cosmetic - changing it must not drop an IMAP connection."""
+    account_id = store.add(name="A", host="h", user="u", password="p")
+    before = store.get(account_id).fingerprint()
+
+    store.update(account_id, name="Anders")
+
+    assert store.get(account_id).fingerprint() == before
+
+
+# --- seeding from the environment ------------------------------------------------
+
+
+def test_the_first_account_is_created_from_the_configuration(tmp_path):
+    config = _make_config(tmp_path)
+    store = AccountStore(config.state_db_path)
+    settings = SettingsStore(config.state_db_path)
+
+    seed_from_config(store, settings, config)
+
+    accounts = store.all()
+    assert len(accounts) == 1
+    assert accounts[0].host == config.imap_host
+    assert accounts[0].user == config.imap_user
+
+
+def test_seeding_happens_only_once(tmp_path):
+    config = _make_config(tmp_path)
+    store = AccountStore(config.state_db_path)
+    settings = SettingsStore(config.state_db_path)
+    seed_from_config(store, settings, config)
+
+    seed_from_config(store, settings, config)
+
+    assert len(store.all()) == 1
+
+
+def test_deleting_the_last_account_does_not_resurrect_it_from_the_env(tmp_path):
+    """Otherwise removing a mailbox in the UI would silently come back."""
+    config = _make_config(tmp_path)
+    store = AccountStore(config.state_db_path)
+    settings = SettingsStore(config.state_db_path)
+    seed_from_config(store, settings, config)
+    store.delete(store.all()[0].id)
+
+    seed_from_config(store, settings, config)
+
+    assert store.all() == []
+    assert settings.get(SETTING_ACCOUNTS_SEEDED) == "1"
+MAIL2NAS_EOF
+
+# --- tests/test_main.py ---
+cat > tests/test_main.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.accounts import AccountStore
+from mail2nas.main import reconcile
+from mail2nas.mapping import Mapping
+from mail2nas.runtime import Runtime
+from mail2nas.state import ProcessedStore, SettingsStore
+from mail2nas.storage import LocalStorage
+from tests.test_archiver import _make_config
+
+
+class FakeWorker:
+    """Stands in for a real IMAP worker thread."""
+
+    def __init__(self, account):
+        self.account = account
+        self.fingerprint = account.fingerprint()
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def is_alive(self):
+        return self.started and not self.stopped
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    config = _make_config(tmp_path)
+    storage = LocalStorage(config.storage_root)
+    return Runtime(
+        config,
+        storage,
+        Mapping(storage, config.mapping_path, config.fallback_folder),
+        ProcessedStore(config.state_db_path),
+        SettingsStore(config.state_db_path),
+        AccountStore(config.state_db_path),
+    )
+
+
+def _add(runtime, **fields):
+    defaults = dict(name="A", host="imap.example.com", user="u", password="p")
+    defaults.update(fields)
+    return runtime.accounts.add(**defaults)
+
+
+def test_one_worker_is_started_per_enabled_account(runtime):
+    _add(runtime, name="Eins")
+    _add(runtime, name="Zwei")
+
+    workers = reconcile(runtime, {}, FakeWorker)
+
+    assert len(workers) == 2
+    assert all(worker.started for worker in workers.values())
+
+
+def test_disabled_accounts_get_no_worker(runtime):
+    _add(runtime, name="Aus", enabled=False)
+
+    assert reconcile(runtime, {}, FakeWorker) == {}
+
+
+def test_an_unchanged_account_keeps_its_worker(runtime):
+    """A reconnect on every pass would mean reconnecting every few seconds."""
+    _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+    first = next(iter(workers.values()))
+
+    reconcile(runtime, workers, FakeWorker)
+
+    assert next(iter(workers.values())) is first
+    assert not first.stopped
+
+
+def test_changing_the_password_restarts_the_worker(runtime):
+    account_id = _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+    first = workers[account_id]
+
+    runtime.accounts.update(account_id, password="neu")
+    reconcile(runtime, workers, FakeWorker)
+
+    assert first.stopped
+    assert workers[account_id] is not first
+
+
+def test_renaming_an_account_does_not_restart_the_worker(runtime):
+    account_id = _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+    first = workers[account_id]
+
+    runtime.accounts.update(account_id, name="Neuer Name")
+    reconcile(runtime, workers, FakeWorker)
+
+    assert not first.stopped
+    assert workers[account_id] is first
+
+
+def test_deleting_an_account_stops_its_worker(runtime):
+    account_id = _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+    first = workers[account_id]
+
+    runtime.accounts.delete(account_id)
+    reconcile(runtime, workers, FakeWorker)
+
+    assert first.stopped
+    assert workers == {}
+
+
+def test_disabling_an_account_stops_its_worker(runtime):
+    account_id = _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+
+    runtime.accounts.update(account_id, enabled=False)
+    reconcile(runtime, workers, FakeWorker)
+
+    assert workers == {}
+
+
+def test_a_dead_worker_is_replaced(runtime):
+    account_id = _add(runtime)
+    workers = reconcile(runtime, {}, FakeWorker)
+    workers[account_id].stopped = True
+
+    reconcile(runtime, workers, FakeWorker)
+
+    assert workers[account_id].is_alive()
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---

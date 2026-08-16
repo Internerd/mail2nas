@@ -4,8 +4,10 @@ import re
 
 import pytest
 
-from mail2nas.mapping import load_rules, save_rules
-from mail2nas.state import SettingsStore
+from mail2nas.accounts import AccountStore
+from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
+from mail2nas.runtime import Runtime
+from mail2nas.state import ProcessedStore, SettingsStore
 from mail2nas.storage import LocalStorage
 from mail2nas.web import (
     SETTING_PASSWORD_HASH,
@@ -24,10 +26,15 @@ def env(tmp_path):
     config = _make_config(tmp_path, web_enabled=True, web_password=PASSWORD)
     storage = LocalStorage(config.storage_root)
     settings = SettingsStore(config.state_db_path)
+    accounts = AccountStore(config.state_db_path)
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    runtime = Runtime(
+        config, storage, mapping, ProcessedStore(config.state_db_path), settings, accounts
+    )
     ensure_password(settings, config.web_password)
-    app = create_app(config, storage, settings)
+    app = create_app(runtime)
     app.config.update(TESTING=True)
-    return app, storage, settings, config
+    return app, storage, settings, config, runtime
 
 
 @pytest.fixture
@@ -115,7 +122,7 @@ def test_security_headers_are_set(client):
 
 
 def test_adding_a_rule_writes_it_to_the_share(client, env):
-    _, storage, _, config = env
+    _, storage, _, config, runtime = env
     _login(client)
 
     client.post(
@@ -124,7 +131,9 @@ def test_adding_a_rule_writes_it_to_the_share(client, env):
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"Rechnung": "rechnungen"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("Rechnung", "rechnungen")
+    ]
 
 
 def test_a_new_folder_is_created_on_the_share(client, env, tmp_path):
@@ -149,8 +158,8 @@ def test_existing_folders_are_offered_for_selection(client, tmp_path):
 
 
 def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
     _login(client)
 
     response = client.post(
@@ -161,12 +170,14 @@ def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
     )
 
     assert "gibt es schon" in response.get_data(as_text=True)
-    assert load_rules(storage, config.mapping_path) == {"RE": "rechnungen"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("RE", "rechnungen")
+    ]
 
 
 @pytest.mark.parametrize("folder", ["../ausbruch", "/etc", ""])
 def test_target_folder_cannot_escape_the_archive_root(client, env, folder, tmp_path):
-    _, storage, _, config = env
+    _, storage, _, config, runtime = env
     _login(client)
 
     client.post(
@@ -175,39 +186,42 @@ def test_target_folder_cannot_escape_the_archive_root(client, env, folder, tmp_p
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {}
+    assert load_rules(storage, config.mapping_path) == []
     assert not (tmp_path.parent / "ausbruch").exists()
 
 
 def test_changing_the_folder_of_an_existing_rule(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
     _login(client)
 
     client.post(
         "/mapping/update",
-        data={"keyword": "RE", "folder": "belege", "csrf_token": _csrf(client, "/mapping")},
+        data={"index": "0", "folder": "belege", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"RE": "belege"}
+    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+        ("RE", "belege")
+    ]
 
 
 def test_deleting_a_rule_keeps_the_others(client, env):
-    _, storage, _, config = env
-    save_rules(storage, config.mapping_path, {"RE": "rechnungen", "LS": "lieferscheine"})
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen"), Rule.create("LS", "lieferscheine")])
     _login(client)
 
     client.post(
         "/mapping/delete",
-        data={"keyword": "RE", "csrf_token": _csrf(client, "/mapping")},
+        data={"index": "0", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == {"LS": "lieferscheine"}
+    assert [r.keyword for r in load_rules(storage, config.mapping_path)] == ["LS"]
 
 
 def test_unreadable_share_does_not_break_the_page(client, env, monkeypatch):
     """A NAS that is briefly away must still render, with an explanation."""
-    _, storage, _, _ = env
+    _, storage, _, _, runtime = env
     _login(client)
     monkeypatch.setattr(
         storage, "list_folders", lambda *a, **k: (_ for _ in ()).throw(OSError("NAS weg"))
@@ -223,7 +237,7 @@ def test_unreadable_share_does_not_break_the_page(client, env, monkeypatch):
 
 
 def test_password_can_be_changed_and_the_old_one_stops_working(client, env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     _login(client)
 
     response = client.post(
@@ -240,7 +254,7 @@ def test_password_can_be_changed_and_the_old_one_stops_working(client, env):
 
 
 def test_wrong_current_password_does_not_change_anything(client, env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     before = settings.get(SETTING_PASSWORD_HASH)
     _login(client)
 
@@ -258,7 +272,7 @@ def test_wrong_current_password_does_not_change_anything(client, env):
     [("kurz", "kurz", "mindestens"), ("langgenug1", "andersrum", "ueberein")],
 )
 def test_weak_or_mistyped_new_password_is_rejected(client, env, new, confirm, expected):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     before = settings.get(SETTING_PASSWORD_HASH)
     _login(client)
 
@@ -275,7 +289,7 @@ def test_weak_or_mistyped_new_password_is_rejected(client, env, new, confirm, ex
 
 def test_changing_the_password_logs_other_sessions_out(env):
     """A stolen session cookie must not survive a password change."""
-    app, _, _, _ = env
+    app = env[0]
     # Two plain clients rather than nested `with` blocks: overlapping request
     # contexts confuse Flask's teardown, and no session inspection is needed.
     first, second = app.test_client(), app.test_client()
@@ -294,7 +308,7 @@ def test_changing_the_password_logs_other_sessions_out(env):
 
 
 def test_password_is_not_stored_in_clear_text(env):
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
 
     stored = settings.get(SETTING_PASSWORD_HASH)
 
@@ -318,7 +332,7 @@ def test_too_short_initial_password_fails_fast(tmp_path):
 
 def test_stored_password_wins_over_the_configured_one(env):
     """WEB_PASSWORD is the initial value only - a later change must survive restarts."""
-    _, _, settings, _ = env
+    _, _, settings, _, runtime = env
     settings.set(SETTING_PASSWORD_HASH, "scrypt:already-set")
 
     ensure_password(settings, "eineAndere123")
@@ -360,3 +374,223 @@ def test_locked_out_client_is_refused_even_with_the_right_password(client, env):
 
     assert response.status_code == 429
     assert client.get("/mapping").status_code == 302
+
+
+# --- rule order ------------------------------------------------------------------
+
+
+def _keywords(storage, config):
+    return [rule.keyword for rule in load_rules(storage, config.mapping_path)]
+
+
+def test_moving_a_rule_up_reorders_the_file(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path,
+               [Rule.create("A", "a"), Rule.create("B", "b"), Rule.create("C", "c")])
+    _login(client)
+
+    client.post("/mapping/up", data={"index": "2", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "C", "B"]
+
+
+def test_moving_a_rule_down_reorders_the_file(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    client.post("/mapping/down", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["B", "A"]
+
+
+def test_moving_the_top_rule_up_is_harmless(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    client.post("/mapping/up", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+@pytest.mark.parametrize("index", ["7", "-1", "keineZahl"])
+def test_a_bogus_row_index_is_refused(client, env, index):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _login(client)
+
+    client.post("/mapping/delete", data={"index": index, "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A"]
+
+
+def test_new_rules_are_appended_at_the_bottom(client, env):
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _login(client)
+
+    client.post("/mapping/add", data={"keyword": "B", "new_folder": "b",
+                                      "csrf_token": _csrf(client, "/mapping")})
+
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+# --- accounts ---------------------------------------------------------------------
+
+
+def _add_account(runtime, **fields):
+    defaults = dict(name="Buchhaltung", host="imap.example.com", user="u", password="p")
+    defaults.update(fields)
+    return runtime.accounts.add(**defaults)
+
+
+def test_config_page_lists_the_accounts(client, env):
+    _, _, _, _, runtime = env
+    _add_account(runtime)
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Buchhaltung" in html
+    assert "imap.example.com" in html
+
+
+def test_creating_an_account_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/accounts/new", data={
+        "name": "Zweitpostfach", "host": "imap2.example.com", "port": "143",
+        "user": "zwei", "password": "geheim", "folder": "INBOX", "mode": "poll",
+        "processed_folder": "", "oversized_folder": "", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    accounts = runtime.accounts.all()
+    assert [a.name for a in accounts] == ["Zweitpostfach"]
+    assert accounts[0].port == 143 and accounts[0].ssl is False
+
+
+def test_editing_an_account_keeps_the_password_when_left_empty(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime, password="altesGeheim")
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        "name": "Neuer Name", "host": "imap.example.com", "port": "993",
+        "user": "u", "password": "", "folder": "INBOX", "mode": "idle",
+        "ssl": "1", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    account = runtime.accounts.get(account_id)
+    assert account.password == "altesGeheim"
+    assert account.name == "Neuer Name" and account.mode == "idle"
+
+
+def test_an_invalid_port_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}", data={
+        "name": "A", "host": "h", "port": "keinPort", "user": "u", "password": "",
+        "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")},
+        follow_redirects=True)
+
+    assert "Port" in response.get_data(as_text=True)
+    assert runtime.accounts.get(account_id).host == "imap.example.com"
+
+
+def test_deleting_an_account(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.accounts.all() == []
+
+
+def test_a_rule_can_be_bound_to_an_account(client, env):
+    _, storage, _, config, runtime = env
+    account_id = _add_account(runtime)
+    _add_account(runtime, name="Zweites")
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "account": str(account_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path)[0].account == str(account_id)
+
+
+def test_a_rule_cannot_reference_an_unknown_account(client, env):
+    _, storage, _, config, runtime = env
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "account": "999",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path) == []
+
+
+# --- moving the mapping file --------------------------------------------------------
+
+
+def test_moving_the_mapping_file_takes_the_rules_along(client, env, tmp_path):
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "config/regeln.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.mapping_path == "config/regeln.yaml"
+    assert [r.keyword for r in load_rules(storage, "config/regeln.yaml")] == ["RE"]
+    assert not (tmp_path / "mapping.yaml").exists()
+
+
+def test_the_mapping_path_cannot_escape_the_archive_root(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "../woanders.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.mapping_path == "mapping.yaml"
+
+
+def test_moving_to_the_same_path_is_a_no_op(client, env):
+    _, storage, _, config, runtime = env
+    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    _login(client)
+
+    client.post("/config/mapping-path",
+                data={"mapping_path": "mapping.yaml", "csrf_token": _csrf(client, "/config")})
+
+    assert [r.keyword for r in load_rules(storage, "mapping.yaml")] == ["RE"]
+
+
+def test_reordering_without_a_csrf_token_is_refused(client, env):
+    """The arrows go through a helper, so their CSRF check needs its own test."""
+    _, storage, _, config, _ = env
+    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _login(client)
+
+    response = client.post("/mapping/up", data={"index": "1"})
+
+    assert response.status_code == 400
+    assert _keywords(storage, config) == ["A", "B"]
+
+
+def test_the_stored_account_password_is_never_sent_to_the_browser(client, env):
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime, password="streng-geheim")
+    _login(client)
+
+    html = client.get(f"/config/accounts/{account_id}").get_data(as_text=True)
+
+    assert "streng-geheim" not in html

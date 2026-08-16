@@ -7,7 +7,19 @@ from mail2nas.archiver import Archiver
 from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
+from mail2nas.accounts import Account
 from mail2nas.storage import LocalStorage
+
+TEST_ACCOUNT = Account(
+    id=1, name="Test", host="imap.example.com", port=993, ssl=True,
+    user="u", password="p", folder="INBOX", mode="poll",
+    processed_folder="", oversized_folder="", enabled=True,
+)
+
+
+def _account(**overrides) -> Account:
+    from dataclasses import replace
+    return replace(TEST_ACCOUNT, **overrides)
 
 
 def _make_config(tmp_path, **overrides) -> Config:
@@ -59,7 +71,9 @@ def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overrides) -> Archiver:
+def _make_archiver(
+    tmp_path, mapping_content: str | None = None, account: Account | None = None, **config_overrides
+) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
     mapping_path = tmp_path / "mapping.yaml"
     if mapping_content is not None:
@@ -67,7 +81,7 @@ def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overri
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage)
+    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT)
 
 
 class FakeIMAPClient:
