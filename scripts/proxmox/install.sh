@@ -43,17 +43,34 @@ if [ -f /root/mail2nas-install.env ]; then
   set +a
 fi
 
-: "${IMAP_HOST:?IMAP_HOST ist nicht gesetzt}"
-: "${IMAP_USER:?IMAP_USER ist nicht gesetzt}"
-: "${IMAP_PASSWORD:?IMAP_PASSWORD ist nicht gesetzt}"
-: "${SMB_HOST:?SMB_HOST ist nicht gesetzt}"
-: "${SMB_SHARE:?SMB_SHARE ist nicht gesetzt}"
-: "${SMB_USER:?SMB_USER ist nicht gesetzt}"
-: "${SMB_PASSWORD:?SMB_PASSWORD ist nicht gesetzt}"
-
 REPO_URL="${MAIL2NAS_REPO_URL:-https://github.com/Internerd/mail2nas.git}"
 REPO_BRANCH="${MAIL2NAS_REPO_BRANCH:-main}"
 TARGET_DIR="${MAIL2NAS_TARGET_DIR:-/opt/mail2nas}"
+
+# Two modes, decided by what is already there:
+#
+#   Erstinstallation - keine .env vorhanden (oder Zugangsdaten wurden
+#     ausdruecklich uebergeben): Zugangsdaten sind Pflicht, .env wird
+#     geschrieben.
+#   Update - eine .env existiert bereits und es wurden KEINE Zugangsdaten
+#     uebergeben: die bestehende Konfiguration bleibt unangetastet, es wird
+#     nur der Code aktualisiert und neu gebaut.
+#
+# Dadurch ist ein erneuter Aufruf gefahrlos: ein Update kostet keine
+# Neukonfiguration und kann die vorhandene .env nicht ueberschreiben.
+if [ -z "${IMAP_HOST:-}" ] && [ -f "$TARGET_DIR/.env" ]; then
+  WRITE_ENV=0
+  echo "==> Update-Modus: bestehende $TARGET_DIR/.env bleibt unveraendert."
+else
+  WRITE_ENV=1
+  : "${IMAP_HOST:?IMAP_HOST ist nicht gesetzt}"
+  : "${IMAP_USER:?IMAP_USER ist nicht gesetzt}"
+  : "${IMAP_PASSWORD:?IMAP_PASSWORD ist nicht gesetzt}"
+  : "${SMB_HOST:?SMB_HOST ist nicht gesetzt}"
+  : "${SMB_SHARE:?SMB_SHARE ist nicht gesetzt}"
+  : "${SMB_USER:?SMB_USER ist nicht gesetzt}"
+  : "${SMB_PASSWORD:?SMB_PASSWORD ist nicht gesetzt}"
+fi
 
 echo "==> Pakete installieren (git, cifs-utils, curl, ca-certificates) ..."
 export DEBIAN_FRONTEND=noninteractive
@@ -67,9 +84,11 @@ fi
 
 echo "==> mail2nas-Code holen (${REPO_URL} @ ${REPO_BRANCH}) ..."
 if [ -d "$TARGET_DIR/.git" ]; then
+  # FETCH_HEAD statt origin/<branch>: funktioniert auch bei einem flachen
+  # Clone zuverlaessig, unabhaengig vom lokalen Branch-Zustand. .env und
+  # andere ignorierte Dateien sind von reset --hard nicht betroffen.
   git -C "$TARGET_DIR" fetch --depth 1 origin "$REPO_BRANCH"
-  git -C "$TARGET_DIR" checkout "$REPO_BRANCH"
-  git -C "$TARGET_DIR" reset --hard "origin/$REPO_BRANCH"
+  git -C "$TARGET_DIR" reset --hard FETCH_HEAD
 else
   mkdir -p "$TARGET_DIR"
   git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR"
@@ -77,6 +96,9 @@ fi
 
 cd "$TARGET_DIR"
 
+if [ "$WRITE_ENV" -eq 0 ]; then
+  echo "==> .env uebernommen (unveraendert)."
+else
 echo "==> .env schreiben ..."
 umask 077
 cat > .env <<ENVEOF
@@ -113,20 +135,27 @@ LOG_LEVEL=$(dq "${LOG_LEVEL:-INFO}")
 DRY_RUN=$(dq "${DRY_RUN:-false}")
 ENVEOF
 chmod 600 .env
+fi
 
 echo "==> docker compose build && up -d ..."
-docker compose build
-docker compose up -d
+docker compose up -d --build
 
 if [ -f /root/mail2nas-install.env ]; then
   shred -u /root/mail2nas-install.env 2>/dev/null || rm -f /root/mail2nas-install.env
 fi
 
 echo
-echo "mail2nas laeuft."
+if [ "$WRITE_ENV" -eq 0 ]; then
+  echo "mail2nas aktualisiert und neu gestartet - Konfiguration unveraendert."
+else
+  echo "mail2nas laeuft."
+fi
 echo "Logs:    cd $TARGET_DIR && docker compose logs -f"
 echo "Config:  $TARGET_DIR/.env (chmod 600)"
-echo
-echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml auf die"
-echo "Wurzel des SMB-Shares (\"$SMB_SHARE\") kopieren und an deine Stichwoerter"
-echo "anpassen - siehe README.md fuer Details."
+
+if [ "$WRITE_ENV" -eq 1 ]; then
+  echo
+  echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml auf die"
+  echo "Wurzel des SMB-Shares (\"${SMB_SHARE:-}\") kopieren und an deine"
+  echo "Stichwoerter anpassen - siehe README.md fuer Details."
+fi

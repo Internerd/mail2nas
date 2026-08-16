@@ -557,23 +557,78 @@ relevante Zwecke eingesetzt wird.
 
 ## Updates einspielen
 
-- **Via Proxmox-Helper-Skript installiert** (Variante 1): einfach erneut
-  `scripts/proxmox/install.sh` in der LXC ausfuehren (macht `git pull` +
-  `docker compose build && up -d`, ohne die bestehende `.env` anzufassen):
+Updates brauchen **keine Neukonfiguration**. Weder Zugangsdaten noch
+Mapping-Regeln muessen erneut eingegeben werden.
+
+### Mit git installiert (Variante 1) - der einfache Weg
+
+Ein Befehl, direkt vom Proxmox-Host aus:
+
+```bash
+pct exec <CTID> -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"
+```
+
+Oder innerhalb der LXC (`pct enter <CTID>`):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"
+```
+
+`update.sh` fragt nichts ab und braucht keine Zugangsdaten. Es legt vor dem
+Update eine datierte Sicherung der `.env` an, holt den aktuellen Code, baut
+das Image mit `--pull` neu (damit auch das Python-Basis-Image aktuelle
+Sicherheitsupdates bekommt), startet den Dienst neu und raeumt alte Images
+auf.
+
+**Unangetastet bleiben dabei:**
+
+| Was | Wo | Warum es das Update ueberlebt |
+|---|---|---|
+| Zugangsdaten & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
+| Stichwort-Mapping | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
+| Bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
+
+Bringt eine neue Version zusaetzliche Konfigurationsvariablen mit, greifen
+dafuer automatisch die dokumentierten Defaults - eine aeltere `.env` bleibt
+also gueltig und muss nicht angefasst werden. Wer die neuen Optionen nutzen
+will, ergaenzt sie einfach in der `.env` und ruft
+`docker compose up -d` auf.
+
+Von Hand geht es genauso:
+
+```bash
+cd /opt/mail2nas
+git fetch --depth 1 origin main && git reset --hard FETCH_HEAD
+docker compose up -d --build
+```
+
+Ein erneuter Aufruf von `scripts/proxmox/install.sh` ist ebenfalls
+gefahrlos: erkennt es eine vorhandene `.env` und bekommt keine Zugangsdaten
+uebergeben, wechselt es automatisch in den Update-Modus und laesst die
+Konfiguration unveraendert.
+
+### Ohne git installiert (Variante 2)
+
+- **Bootstrap-Skript erneut ausfuehren** (Variante A) - ueberschreibt alle
+  Code-Dateien, laesst `.env` und die auf dem SMB-Share liegende
+  `mapping.yaml` unangetastet. Danach:
   ```bash
-  pct exec <CTID> -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/install.sh)"
+  cd /opt/mail2nas && docker compose up -d --build
   ```
-  Achtung: dieser Aufruf ohne vorher gepushte `/root/mail2nas-install.env`
-  erwartet, dass die noetigen `IMAP_*`/`SMB_*`-Variablen in der Shell gesetzt
-  sind, ODER dass bereits eine `.env` in `/opt/mail2nas` existiert - in dem
-  Fall reicht auch einfach `cd /opt/mail2nas && git pull && docker compose up
-  -d --build` von Hand.
-- **Ohne git installiert** (Variante 2): zwei Wege, eine neue Version des
-  Codes einzuspielen:
-  - **Bootstrap-Skript erneut ausfuehren** (Variante A) - ueberschreibt
-    alle Code-Dateien, laesst `.env` und die auf dem SMB-Share liegende
-    `mapping.yaml` unangetastet. Danach `docker compose build && docker
-    compose up -d` (bzw. `systemctl restart mail2nas` im venv-Betrieb).
-  - **Neues Archiv per scp uebertragen** (Variante B) und das alte
-    Verzeichnis ersetzen - `.env` vorher sichern, da sie nicht Teil des
-    Archivs ist.
+  (bzw. `systemctl restart mail2nas` im venv-Betrieb).
+- **Neues Archiv per scp uebertragen** (Variante B) und das alte
+  Verzeichnis ersetzen - `.env` vorher sichern, da sie nicht Teil des
+  Archivs ist.
+
+### Zurueckrollen
+
+`update.sh` legt vor jedem Lauf eine Kopie der `.env` als
+`.env.bak.<Zeitstempel>` an. Auf einen aelteren Codestand zurueck geht es
+mit dem gewuenschten Commit:
+
+```bash
+cd /opt/mail2nas
+git fetch --depth 50 origin main
+git reset --hard <commit-sha>
+docker compose up -d --build
+```
