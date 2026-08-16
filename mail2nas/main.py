@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
+import threading
 from pathlib import Path
 
-from .archiver import Archiver
 from .config import Config
+from .filenames import safe_join
 from .mapping import Mapping
+from .runner import Runner
+from .settings import Settings
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
@@ -34,6 +36,36 @@ def _check_storage_root(config: Config) -> None:
         )
 
 
+def _start_web(config: Config, settings: Settings, mapping: Mapping, runner: Runner) -> None:
+    """Serve the configuration UI in a background thread, if it is configured."""
+    if not config.web_enabled:
+        logger.info("Web UI disabled (WEB_ENABLED=false)")
+        return
+    if not config.web_password:
+        # The page shows and edits IMAP credentials, so refuse to serve it
+        # without authentication rather than defaulting to something weak.
+        logger.warning(
+            "Web UI not started: WEB_PASSWORD is empty. Set it to enable the configuration page."
+        )
+        return
+
+    try:
+        from waitress import serve
+
+        from .web import create_app
+    except ImportError:
+        logger.warning("Web UI not started: Flask/waitress are not installed")
+        return
+
+    app = create_app(config, settings, mapping, runner)
+
+    def _serve() -> None:
+        logger.info("Web UI on http://%s:%s", config.web_host, config.web_port)
+        serve(app, host=config.web_host, port=config.web_port, threads=4, _quiet=True)
+
+    threading.Thread(target=_serve, name="mail2nas-web", daemon=True).start()
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -43,69 +75,31 @@ def main() -> None:
 
     config = Config.from_env()
     _check_storage_root(config)
-    mapping_full_path = os.path.join(config.storage_root, config.mapping_path)
-    mapping = Mapping(mapping_full_path, config.fallback_folder)
+
+    settings = Settings.load(config)
+    try:
+        mapping_full_path = safe_join(config.storage_root, settings.mapping_path)
+    except ValueError as exc:
+        raise SystemExit(f"Configured mapping path is not usable: {exc}") from None
+    mapping = Mapping(str(mapping_full_path), settings.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    archiver = Archiver(config, mapping, store)
 
     logger.info(
-        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s dry_run=%s",
-        config.imap_host,
-        config.imap_folder,
-        config.imap_mode,
+        "Starting mail2nas: %d account(s), storage=%s dry_run=%s",
+        len(settings.enabled_accounts()),
         config.storage_root,
         config.dry_run,
     )
 
+    runner = Runner(config, settings, mapping, store)
+    _start_web(config, settings, mapping, runner)
+    runner.start()
+
     try:
-        while True:
-            try:
-                client = archiver.connect()
-            except Exception:
-                logger.exception("IMAP connection failed, retrying in %ss", config.poll_interval)
-                time.sleep(config.poll_interval)
-                continue
-
-            try:
-                if config.imap_mode == "idle":
-                    _run_idle(archiver, client, config)
-                else:
-                    _run_poll(archiver, client, config)
-            except Exception:
-                logger.exception("IMAP session failed, reconnecting in %ss", config.poll_interval)
-            finally:
-                try:
-                    client.logout()
-                except Exception:
-                    pass
-            time.sleep(config.poll_interval)
+        runner.wait()
     finally:
+        runner.stop()
         store.close()
-
-
-def _run_poll(archiver: Archiver, client, config: Config) -> None:
-    while True:
-        count = archiver.run_once(client)
-        if count:
-            logger.info("Processed %d message(s)", count)
-        time.sleep(config.poll_interval)
-
-
-def _run_idle(archiver: Archiver, client, config: Config) -> None:
-    count = archiver.run_once(client)
-    if count:
-        logger.info("Processed %d message(s)", count)
-
-    idle_timeout = config.poll_interval or 300
-    while True:
-        client.idle()
-        try:
-            client.idle_check(timeout=idle_timeout)
-        finally:
-            client.idle_done()
-        count = archiver.run_once(client)
-        if count:
-            logger.info("Processed %d message(s)", count)
 
 
 if __name__ == "__main__":

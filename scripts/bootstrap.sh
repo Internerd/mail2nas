@@ -19,7 +19,7 @@
 set -euo pipefail
 
 TARGET="${1:-/opt/mail2nas}"
-mkdir -p "$TARGET"/mail2nas "$TARGET"/config "$TARGET"/tests
+mkdir -p "$TARGET"/mail2nas "$TARGET"/mail2nas/templates "$TARGET"/config "$TARGET"/tests
 cd "$TARGET"
 
 echo "Schreibe Projektdateien nach $TARGET ..."
@@ -28,6 +28,8 @@ echo "Schreibe Projektdateien nach $TARGET ..."
 cat > requirements.txt <<'MAIL2NAS_EOF'
 imapclient>=3.0,<4.0
 PyYAML>=6.0,<7.0
+Flask>=3.0,<4.0
+waitress>=3.0,<4.0
 MAIL2NAS_EOF
 
 # --- requirements-dev.txt ---
@@ -110,6 +112,16 @@ MAX_ATTACHMENTS_PER_MESSAGE=20
 BLOCKED_EXTENSIONS=exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk
 QUARANTINE_FOLDER=quarantaene
 
+# --- Weboberflaeche zur Konfiguration ---------------------------------------
+# Erreichbar unter http://<container-ip>:<WEB_PORT>. Ohne gesetztes
+# WEB_PASSWORD startet sie NICHT - die Seite zeigt und aendert IMAP-
+# Zugangsdaten und darf daher nicht ohne Anmeldung laufen.
+# Nur im vertrauenswuerdigen LAN veroeffentlichen, nicht ins Internet.
+WEB_ENABLED=true
+WEB_PORT=8080
+WEB_USER=admin
+WEB_PASSWORD=
+
 # --- Misc ------------------------------------------------------------------
 STATE_DB_PATH=/data/state.db
 LOG_LEVEL=INFO
@@ -168,6 +180,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      # Konfigurationsoberflaeche. Nur im LAN veroeffentlichen - die Seite
+      # zeigt und aendert IMAP-Zugangsdaten.
+      - "${WEB_PORT:-8080}:8080"
     environment:
       STORAGE_ROOT: /mnt/nas
       STATE_DB_PATH: /data/state.db
@@ -191,37 +207,69 @@ MAIL2NAS_EOF
 # --- config/mapping.example.yaml ---
 cat > config/mapping.example.yaml <<'MAIL2NAS_EOF'
 # Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
-# (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
+# (bzw. an den Pfad, der in den Einstellungen hinterlegt ist).
 #
-# Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
-# Aenderungen wirken also ohne Neustart/Redeploy.
+# Bequemer geht es ueber die Weboberflaeche: dort lassen sich Zuordnungen
+# anlegen, mit Pfeilen in der Prioritaet verschieben und einem Mailkonto
+# zuordnen. Diese Datei ist einfach das, was dabei gespeichert wird.
 #
-# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
-#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
-#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
-#                 als Fallback, falls der Dateiname selbst nichts hergibt
-#              Gross-/Kleinschreibung ist egal.
-# Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+# Sie wird bei jedem Verarbeitungszyklus neu eingelesen - Aenderungen von Hand
+# wirken also ohne Neustart.
 #
-# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
-# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
-# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
-# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
-# nicht beide im selben).
+# --- Wie eine Regel geprueft wird -------------------------------------------
 #
-# Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
-# "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
+# REIHENFOLGE = PRIORITAET: Die erste passende Regel gewinnt. Deshalb steht
+# "Rechnungskorrektur" hier vor "RE" - andersherum wuerde bereits "RE" greifen.
+#
+# match   - Stichwort. Gross-/Kleinschreibung ist immer egal.
+#           Enthaelt es * oder ?, wird es als Platzhalter gegen den GANZEN Text
+#           geprueft:  *  = beliebig viele Zeichen,  ? = genau ein Zeichen.
+#             "Rechnung*"  passt auf "rechnung_4711.pdf", nicht auf "meine rechnung"
+#             "*Rechnung*" passt auf beides
+#             "RE-????"    passt auf "RE-2024", nicht auf "RE-24"
+#           Ohne Platzhalter wird als Teilstring gesucht (wie bisher).
+# folder  - Zielordner relativ zur Wurzel des Shares. Unterordner erlaubt
+#           ("rechnungen/2026"), ausserhalb des Shares nicht.
+# account - "all" oder die id eines einzelnen Mailkontos. Die ids stehen in
+#           der Weboberflaeche unter "Mailkonten".
+#
+# Geprueft wird zuerst der Dateiname jedes einzelnen Anhangs, danach Betreff
+# (und Mailtext, falls MATCH_BODY aktiviert ist). Dadurch koennen mehrere
+# unterschiedlich benannte Anhaenge derselben Mail in verschiedenen Ordnern
+# landen.
 
-RE: rechnungen
-Rechnung: rechnungen
-Invoice: rechnungen
-LS: lieferscheine
-Lieferschein: lieferscheine
-Lieferung: lieferscheine
-AB: auftragsbestaetigungen
-Auftragsbestaetigung: auftragsbestaetigungen
-Mahnung: mahnungen
-Gutschrift: gutschriften
+version: 2
+rules:
+  - match: Rechnungskorrektur
+    folder: korrekturen
+    account: all
+  - match: Gutschrift
+    folder: gutschriften
+    account: all
+  - match: Mahnung
+    folder: mahnungen
+    account: all
+  - match: Lieferschein
+    folder: lieferscheine
+    account: all
+  - match: Auftragsbestaetigung
+    folder: auftragsbestaetigungen
+    account: all
+  - match: Rechnung
+    folder: rechnungen
+    account: all
+  - match: Invoice
+    folder: rechnungen
+    account: all
+  - match: RE
+    folder: rechnungen
+    account: all
+  - match: LS
+    folder: lieferscheine
+    account: all
+  - match: AB
+    folder: auftragsbestaetigungen
+    account: all
 MAIL2NAS_EOF
 
 # --- mail2nas/config.py ---
@@ -305,6 +353,18 @@ class Config:
     state_db_path: str
     dry_run: bool
 
+    # Which configured mail account this instance archives for. Rules in
+    # mapping.yaml can be limited to a single account by this id.
+    account_id: str = "default"
+
+    # Web configuration UI. Disabled unless a password is set, because the
+    # page can read and change IMAP credentials.
+    web_enabled: bool = False
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    web_user: str = "admin"
+    web_password: str = ""
+
     @classmethod
     def from_env(cls) -> "Config":
         try:
@@ -333,6 +393,11 @@ class Config:
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
+                web_enabled=_bool("WEB_ENABLED", True),
+                web_host=os.environ.get("WEB_HOST", "0.0.0.0"),
+                web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
+                web_user=os.environ.get("WEB_USER", "admin"),
+                web_password=os.environ.get("WEB_PASSWORD", ""),
             )
         except KeyError as exc:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
@@ -342,16 +407,117 @@ MAIL2NAS_EOF
 cat > mail2nas/mapping.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
+import fnmatch
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
+ALL_ACCOUNTS = "all"
+
+
+@dataclass(frozen=True)
+class Rule:
+    """One keyword -> folder rule.
+
+    `account` is either ALL_ACCOUNTS or the id of a single mail account, so a
+    rule can be limited to one mailbox when several are configured.
+    """
+
+    match: str
+    folder: str
+    account: str = ALL_ACCOUNTS
+
+    @property
+    def is_wildcard(self) -> bool:
+        return any(ch in self.match for ch in "*?")
+
+    def applies_to(self, account: str | None) -> bool:
+        return self.account == ALL_ACCOUNTS or account is None or self.account == account
+
+    def matches(self, haystack: str) -> bool:
+        """Case-insensitive test against already-lowercased `haystack`.
+
+        A pattern containing * or ? is treated as a wildcard matched against
+        the whole text; anything else keeps the original substring behaviour,
+        so existing mapping files behave exactly as before.
+        """
+        pattern = self.match.lower()
+        if self.is_wildcard:
+            return fnmatch.fnmatchcase(haystack, pattern)
+        return pattern in haystack
+
+
+def _coerce_rules(raw: object) -> list[Rule]:
+    """Build the rule list from either mapping-file format.
+
+    v2 (ordered, explicit priority - first match wins):
+        version: 2
+        rules:
+          - match: "Rechnung*"
+            folder: rechnungen
+            account: all
+
+    v1 (legacy plain dict, no ordering information):
+        RE: rechnungen
+    Sorted longest-keyword-first, which is what v1 always did implicitly so
+    that "Rechnungskorrektur" is checked before "RE".
+    """
+    if isinstance(raw, dict) and "rules" in raw:
+        entries = raw.get("rules") or []
+        if not isinstance(entries, list):
+            raise ValueError("'rules' must be a list")
+        rules = []
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict):
+                raise ValueError(f"rule #{index} must be a mapping")
+            match = str(entry.get("match", "")).strip()
+            folder = str(entry.get("folder", "")).strip()
+            if not match or not folder:
+                raise ValueError(f"rule #{index} needs both 'match' and 'folder'")
+            rules.append(
+                Rule(match=match, folder=folder, account=str(entry.get("account") or ALL_ACCOUNTS))
+            )
+        return rules
+
+    if isinstance(raw, dict):
+        return [
+            Rule(match=str(keyword), folder=str(folder))
+            for keyword, folder in sorted(raw.items(), key=lambda kv: len(str(kv[0])), reverse=True)
+        ]
+
+    raise ValueError("file must contain a mapping of keyword -> folder, or a 'rules' list")
+
+
+def dump_rules(rules: list[Rule]) -> str:
+    """Serialize rules back to the v2 format, preserving their order."""
+    payload = {
+        "version": 2,
+        "rules": [{"match": r.match, "folder": r.folder, "account": r.account} for r in rules],
+    }
+    header = (
+        "# mail2nas Zuordnungen\n"
+        "#\n"
+        "# Die REIHENFOLGE bestimmt die Prioritaet: die erste passende Regel\n"
+        "# gewinnt. Ueber die Weboberflaeche laesst sie sich mit den Pfeilen\n"
+        "# verschieben.\n"
+        "#\n"
+        "# match   - Stichwort, Gross-/Kleinschreibung egal. Enthaelt es * oder ?,\n"
+        "#           wird es als Platzhalter gegen den ganzen Text geprueft\n"
+        "#           (z. B. \"Rechnung*\"), sonst als Teilstring gesucht.\n"
+        "# folder  - Zielordner relativ zur Wurzel des Shares.\n"
+        "# account - 'all' oder die id eines einzelnen Mailkontos.\n"
+        "#\n"
+        "# Geprueft wird zuerst der Dateiname jedes Anhangs, dann Betreff/Text.\n"
+    )
+    return header + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+
 
 class Mapping:
-    """Keyword -> target-subfolder mapping, reloaded from disk on demand.
+    """Keyword -> target-subfolder rules, reloaded from disk on demand.
 
     The mapping file is expected to live on the same SMB share the
     attachments are archived to, so it can be edited by anyone with
@@ -361,8 +527,22 @@ class Mapping:
     def __init__(self, path: str, fallback_folder: str):
         self._path = Path(path)
         self._fallback_folder = fallback_folder
-        self._rules: list[tuple[str, str]] = []
+        self._rules: list[Rule] = []
         self._mtime: float | None = None
+        self.reload(force=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def rules(self) -> list[Rule]:
+        return list(self._rules)
+
+    def set_path(self, path: str) -> None:
+        """Point at a different mapping file and load it immediately."""
+        self._path = Path(path)
+        self._mtime = None
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -388,14 +568,7 @@ class Mapping:
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 raw = yaml.safe_load(fh) or {}
-            if not isinstance(raw, dict):
-                raise ValueError("file must contain a mapping of keyword -> folder")
-            rules = sorted(
-                ((str(keyword), str(folder)) for keyword, folder in raw.items()),
-                # Longest keyword first, so "Rechnungskorrektur" beats "RE".
-                key=lambda kv: len(kv[0]),
-                reverse=True,
-            )
+            rules = _coerce_rules(raw)
         except Exception as exc:
             # Remember the mtime anyway, so a persistently broken file is
             # reported once rather than on every single cycle.
@@ -412,12 +585,23 @@ class Mapping:
         self._mtime = mtime
         logger.info("Loaded %d mapping rule(s) from %s", len(self._rules), self._path)
 
-    def resolve(self, *texts: str) -> tuple[str, str | None]:
-        """Return (target_folder, matched_keyword). Falls back if nothing matches."""
+    def save(self, rules: list[Rule]) -> None:
+        """Persist a new rule list (used by the web UI) and adopt it."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(dump_rules(rules), encoding="utf-8")
+        self._rules = list(rules)
+        try:
+            self._mtime = self._path.stat().st_mtime
+        except OSError:
+            self._mtime = None
+        logger.info("Saved %d mapping rule(s) to %s", len(rules), self._path)
+
+    def resolve(self, *texts: str, account: str | None = None) -> tuple[str, str | None]:
+        """Return (target_folder, matched_pattern). Falls back if nothing matches."""
         haystack = " ".join(t for t in texts if t).lower()
-        for keyword, folder in self._rules:
-            if keyword.lower() in haystack:
-                return folder, keyword
+        for rule in self._rules:
+            if rule.applies_to(account) and rule.matches(haystack):
+                return rule.folder, rule.match
         return self._fallback_folder, None
 MAIL2NAS_EOF
 
@@ -552,6 +736,7 @@ cat > mail2nas/state.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 
@@ -561,32 +746,40 @@ class ProcessedStore:
     IMAP's \\Seen flag alone is not a safe idempotency marker (it can be
     reset by another client, or the folder can be re-synced), so we keep a
     small local record of what has actually been written to the share.
+
+    One instance is shared by all account workers, so every access is
+    serialized by a lock and the connection is opened for cross-thread use.
     """
 
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS processed_messages ("
-            "message_id TEXT PRIMARY KEY, "
-            "processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        )
-        self._conn.commit()
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS processed_messages ("
+                "message_id TEXT PRIMARY KEY, "
+                "processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            self._conn.commit()
 
     def is_processed(self, message_id: str) -> bool:
-        cur = self._conn.execute(
-            "SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,)
-        )
-        return cur.fetchone() is not None
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,)
+            )
+            return cur.fetchone() is not None
 
     def mark_processed(self, message_id: str) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)", (message_id,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)", (message_id,)
+            )
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 MAIL2NAS_EOF
 
 # --- mail2nas/archiver.py ---
@@ -690,7 +883,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
+        mail_folder, mail_keyword = self.mapping.resolve(subject, body, account=self.config.account_id)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -787,7 +980,7 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self.mapping.resolve(filename)
+        folder_name, matched_keyword = self.mapping.resolve(filename, account=self.config.account_id)
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 
@@ -853,6 +1046,689 @@ class Archiver:
             return ""
 MAIL2NAS_EOF
 
+# --- mail2nas/settings.py ---
+cat > mail2nas/settings.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+import re
+import secrets
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+_ID_SAFE = re.compile(r"[^a-z0-9_-]+")
+
+
+def make_account_id(name: str) -> str:
+    ident = _ID_SAFE.sub("-", name.strip().lower()).strip("-")
+    return ident or f"konto-{secrets.token_hex(3)}"
+
+
+@dataclass
+class Account:
+    """One IMAP mailbox to archive from."""
+
+    id: str
+    host: str
+    user: str
+    password: str
+    label: str = ""
+    port: int = 993
+    ssl: bool = True
+    folder: str = "INBOX"
+    processed_folder: str = ""
+    oversized_folder: str = ""
+    mode: str = "poll"  # "idle" or "poll"
+    enabled: bool = True
+
+    def display_name(self) -> str:
+        return self.label or self.user or self.id
+
+
+@dataclass
+class Settings:
+    """Everything the web UI can change, persisted next to the state database.
+
+    Deliberately NOT on the SMB share: it holds IMAP passwords, and the share
+    is readable by everyone who can reach it.
+    """
+
+    accounts: list[Account] = field(default_factory=list)
+    mapping_path: str = "mapping.yaml"
+    fallback_folder: str = "unsorted"
+    quarantine_folder: str = "quarantaene"
+    match_body: bool = False
+    filename_prefix: str = "date_sender"
+    poll_interval: int = 300
+    max_attachment_size_mb: int = 25
+    max_message_size_mb: int = 50
+    max_attachments_per_message: int = 20
+
+    # --- persistence ---------------------------------------------------
+
+    @staticmethod
+    def path_for(config: Config) -> Path:
+        return Path(config.state_db_path).parent / "config.yaml"
+
+    @classmethod
+    def load(cls, config: Config) -> "Settings":
+        path = cls.path_for(config)
+        if not path.exists():
+            settings = cls.from_env_config(config)
+            settings.save(config)
+            logger.info("Created %s from the environment configuration", path)
+            return settings
+
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                raise ValueError("config file must contain a mapping")
+            accounts = [
+                Account(**{k: v for k, v in entry.items() if k in {f.name for f in dataclasses.fields(Account)}})
+                for entry in raw.get("accounts", [])
+                if isinstance(entry, dict)
+            ]
+            known = {f.name for f in dataclasses.fields(cls)} - {"accounts"}
+            values = {k: v for k, v in raw.items() if k in known}
+            return cls(accounts=accounts, **values)
+        except Exception as exc:
+            # Falling back to the environment keeps the archiver running rather
+            # than leaving it dead because a hand-edited config file broke.
+            logger.error("Could not read %s (%s) - falling back to the environment", path, exc)
+            return cls.from_env_config(config)
+
+    @classmethod
+    def from_env_config(cls, config: Config) -> "Settings":
+        """Seed the file-backed settings from the classic environment variables."""
+        return cls(
+            accounts=[
+                Account(
+                    id="default",
+                    label="Hauptpostfach",
+                    host=config.imap_host,
+                    port=config.imap_port,
+                    ssl=config.imap_ssl,
+                    user=config.imap_user,
+                    password=config.imap_password,
+                    folder=config.imap_folder,
+                    processed_folder=config.imap_processed_folder or "",
+                    oversized_folder=config.imap_oversized_folder or "",
+                    mode=config.imap_mode,
+                )
+            ],
+            mapping_path=config.mapping_path,
+            fallback_folder=config.fallback_folder,
+            quarantine_folder=config.quarantine_folder,
+            match_body=config.match_body,
+            filename_prefix=config.filename_prefix,
+            poll_interval=config.poll_interval,
+            max_attachment_size_mb=config.max_attachment_size_mb,
+            max_message_size_mb=config.max_message_size_mb,
+            max_attachments_per_message=config.max_attachments_per_message,
+        )
+
+    def save(self, config: Config) -> None:
+        path = self.path_for(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dataclasses.asdict(self)
+        tmp = path.with_suffix(".yaml.tmp")
+        tmp.write_text(
+            "# mail2nas - von der Weboberflaeche verwaltet.\n"
+            "# Enthaelt IMAP-Passwoerter im Klartext: Dateirechte 0600 beibehalten.\n"
+            + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    # --- lookups --------------------------------------------------------
+
+    def account(self, account_id: str) -> Account | None:
+        return next((a for a in self.accounts if a.id == account_id), None)
+
+    def enabled_accounts(self) -> list[Account]:
+        return [a for a in self.accounts if a.enabled and a.host and a.user]
+
+    def unique_id(self, desired: str, ignore: str | None = None) -> str:
+        """Return `desired`, suffixed if another account already uses it."""
+        taken = {a.id for a in self.accounts if a.id != ignore}
+        if desired not in taken:
+            return desired
+        for n in range(2, 1000):
+            candidate = f"{desired}-{n}"
+            if candidate not in taken:
+                return candidate
+        return f"{desired}-{secrets.token_hex(3)}"
+
+    # --- bridging to the archiver ---------------------------------------
+
+    def config_for(self, config: Config, account: Account) -> Config:
+        """Build the per-account Config the Archiver works with."""
+        return dataclasses.replace(
+            config,
+            imap_host=account.host,
+            imap_port=account.port,
+            imap_ssl=account.ssl,
+            imap_user=account.user,
+            imap_password=account.password,
+            imap_folder=account.folder,
+            imap_processed_folder=account.processed_folder or None,
+            imap_oversized_folder=account.oversized_folder or None,
+            imap_mode=account.mode,
+            poll_interval=self.poll_interval,
+            mapping_path=self.mapping_path,
+            fallback_folder=self.fallback_folder,
+            quarantine_folder=self.quarantine_folder,
+            match_body=self.match_body,
+            filename_prefix=self.filename_prefix,
+            max_attachment_size_mb=self.max_attachment_size_mb,
+            max_message_size_mb=self.max_message_size_mb,
+            max_attachments_per_message=self.max_attachments_per_message,
+            account_id=account.id,
+        )
+MAIL2NAS_EOF
+
+# --- mail2nas/runner.py ---
+cat > mail2nas/runner.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+from .archiver import Archiver
+from .config import Config
+from .mapping import Mapping
+from .settings import Account, Settings
+from .state import ProcessedStore
+
+logger = logging.getLogger(__name__)
+
+
+class AccountWorker(threading.Thread):
+    """Runs one mail account's connect/process loop until asked to stop."""
+
+    def __init__(self, config: Config, account: Account, mapping: Mapping, store: ProcessedStore):
+        super().__init__(name=f"mail2nas-{account.id}", daemon=True)
+        self.config = config
+        self.account = account
+        self.archiver = Archiver(config, mapping, store)
+        self._stop = threading.Event()
+        self.last_error: str | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        logger.info(
+            "[%s] starting: imap=%s folder=%s mode=%s",
+            self.account.id,
+            self.account.host,
+            self.account.folder,
+            self.account.mode,
+        )
+        while not self._stop.is_set():
+            client = None
+            try:
+                client = self.archiver.connect()
+                self.last_error = None
+                if self.config.imap_mode == "idle":
+                    self._loop_idle(client)
+                else:
+                    self._loop_poll(client)
+            except Exception as exc:
+                self.last_error = str(exc)
+                logger.exception(
+                    "[%s] session failed, retrying in %ss", self.account.id, self.config.poll_interval
+                )
+            finally:
+                if client is not None:
+                    try:
+                        client.logout()
+                    except Exception:
+                        pass
+            # Interruptible sleep, so a reload/shutdown does not wait it out.
+            self._stop.wait(self.config.poll_interval)
+        logger.info("[%s] stopped", self.account.id)
+
+    def _process(self, client) -> None:
+        count = self.archiver.run_once(client)
+        if count:
+            logger.info("[%s] processed %d message(s)", self.account.id, count)
+
+    def _loop_poll(self, client) -> None:
+        while not self._stop.is_set():
+            self._process(client)
+            self._stop.wait(self.config.poll_interval)
+
+    def _loop_idle(self, client) -> None:
+        self._process(client)
+        timeout = self.config.poll_interval or 300
+        while not self._stop.is_set():
+            client.idle()
+            try:
+                client.idle_check(timeout=timeout)
+            finally:
+                client.idle_done()
+            self._process(client)
+
+
+class Runner:
+    """Owns one worker per enabled account and can restart them on changes."""
+
+    def __init__(self, config: Config, settings: Settings, mapping: Mapping, store: ProcessedStore):
+        self.config = config
+        self.settings = settings
+        self.mapping = mapping
+        self.store = store
+        self._workers: list[AccountWorker] = []
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        accounts = self.settings.enabled_accounts()
+        if not accounts:
+            logger.warning("No enabled mail accounts configured - nothing to archive yet")
+        for account in accounts:
+            worker = AccountWorker(
+                self.settings.config_for(self.config, account), account, self.mapping, self.store
+            )
+            worker.start()
+            self._workers.append(worker)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        for worker in self._workers:
+            worker.stop()
+        for worker in self._workers:
+            worker.join(timeout=10)
+        self._workers = []
+
+    def reload(self, settings: Settings) -> None:
+        """Apply changed settings by restarting the account workers."""
+        with self._lock:
+            logger.info("Applying changed settings - restarting account workers")
+            self._stop_locked()
+            self.settings = settings
+            self.mapping.set_path(str(self.mapping_full_path(settings)))
+            self._start_locked()
+
+    def mapping_full_path(self, settings: Settings):
+        from .filenames import safe_join
+
+        return safe_join(self.config.storage_root, settings.mapping_path)
+
+    def status(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "id": w.account.id,
+                    "label": w.account.display_name(),
+                    "alive": w.is_alive(),
+                    "error": w.last_error,
+                }
+                for w in self._workers
+            ]
+
+    def wait(self) -> None:
+        """Block the main thread while the workers do their thing."""
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            self.stop()
+MAIL2NAS_EOF
+
+# --- mail2nas/web.py ---
+cat > mail2nas/web.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import hmac
+import logging
+import secrets
+from functools import wraps
+from pathlib import Path
+
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+
+from .config import Config
+from .filenames import safe_join
+from .mapping import ALL_ACCOUNTS, Mapping, Rule
+from .settings import Account, Settings, make_account_id
+
+logger = logging.getLogger(__name__)
+
+
+def _check_login(config: Config, user: str, password: str) -> bool:
+    # compare_digest on both fields so a wrong username is not distinguishable
+    # from a wrong password by timing.
+    return hmac.compare_digest(user, config.web_user) and hmac.compare_digest(
+        password, config.web_password
+    )
+
+
+def create_app(config: Config, settings: Settings, mapping: Mapping, runner=None) -> Flask:
+    app = Flask(__name__, template_folder="templates")
+    app.secret_key = secrets.token_bytes(32)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+        MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+    )
+
+    state = {"settings": settings}
+
+    def current() -> Settings:
+        return state["settings"]
+
+    def persist(new_settings: Settings) -> None:
+        new_settings.save(config)
+        state["settings"] = new_settings
+        if runner is not None:
+            runner.reload(new_settings)
+
+    # --- auth + CSRF ----------------------------------------------------
+
+    def login_required(view):
+        @wraps(view)
+        def wrapper(*args, **kwargs):
+            if not session.get("authenticated"):
+                return redirect(url_for("login", next=request.path))
+            return view(*args, **kwargs)
+
+        return wrapper
+
+    def csrf_token() -> str:
+        if "csrf" not in session:
+            session["csrf"] = secrets.token_urlsafe(32)
+        return session["csrf"]
+
+    @app.before_request
+    def verify_csrf():
+        if request.method == "POST" and request.endpoint != "login":
+            sent = request.form.get("csrf_token", "")
+            if not sent or not hmac.compare_digest(sent, session.get("csrf", "")):
+                abort(400, "CSRF-Token ungueltig - bitte die Seite neu laden.")
+
+    @app.context_processor
+    def inject():
+        return {
+            "csrf_token": csrf_token,
+            "accounts": current().accounts,
+            "ALL_ACCOUNTS": ALL_ACCOUNTS,
+        }
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            if _check_login(config, request.form.get("user", ""), request.form.get("password", "")):
+                session.clear()
+                session["authenticated"] = True
+                return redirect(request.args.get("next") or url_for("index"))
+            flash("Anmeldung fehlgeschlagen.", "error")
+        return render_template("login.html")
+
+    @app.route("/logout", methods=["POST"])
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
+    # --- mapping rules --------------------------------------------------
+
+    @app.route("/")
+    @login_required
+    def index():
+        mapping.reload()
+        return render_template(
+            "rules.html",
+            rules=mapping.rules,
+            mapping_path=str(mapping.path),
+            status=runner.status() if runner else [],
+        )
+
+    @app.route("/rules/add", methods=["POST"])
+    @login_required
+    def rule_add():
+        match = request.form.get("match", "").strip()
+        folder = request.form.get("folder", "").strip()
+        account = request.form.get("account", ALL_ACCOUNTS).strip() or ALL_ACCOUNTS
+        if not match or not folder:
+            flash("Stichwort und Zielordner sind beide erforderlich.", "error")
+            return redirect(url_for("index"))
+        try:
+            safe_join(config.storage_root, folder)
+        except ValueError as exc:
+            flash(f"Zielordner nicht zulaessig: {exc}", "error")
+            return redirect(url_for("index"))
+
+        rules = mapping.rules + [Rule(match=match, folder=folder, account=account)]
+        mapping.save(rules)
+        flash(f"Zuordnung '{match}' angelegt.", "ok")
+        return redirect(url_for("index"))
+
+    @app.route("/rules/<int:index>/move/<direction>", methods=["POST"])
+    @login_required
+    def rule_move(index: int, direction: str):
+        rules = mapping.rules
+        if not 0 <= index < len(rules):
+            abort(404)
+        target = index - 1 if direction == "up" else index + 1
+        if 0 <= target < len(rules):
+            rules[index], rules[target] = rules[target], rules[index]
+            mapping.save(rules)
+        return redirect(url_for("index"))
+
+    @app.route("/rules/<int:index>/delete", methods=["POST"])
+    @login_required
+    def rule_delete(index: int):
+        rules = mapping.rules
+        if not 0 <= index < len(rules):
+            abort(404)
+        removed = rules.pop(index)
+        mapping.save(rules)
+        flash(f"Zuordnung '{removed.match}' geloescht.", "ok")
+        return redirect(url_for("index"))
+
+    @app.route("/rules/<int:index>/update", methods=["POST"])
+    @login_required
+    def rule_update(index: int):
+        rules = mapping.rules
+        if not 0 <= index < len(rules):
+            abort(404)
+        match = request.form.get("match", "").strip()
+        folder = request.form.get("folder", "").strip()
+        account = request.form.get("account", ALL_ACCOUNTS).strip() or ALL_ACCOUNTS
+        if not match or not folder:
+            flash("Stichwort und Zielordner sind beide erforderlich.", "error")
+            return redirect(url_for("index"))
+        try:
+            safe_join(config.storage_root, folder)
+        except ValueError as exc:
+            flash(f"Zielordner nicht zulaessig: {exc}", "error")
+            return redirect(url_for("index"))
+        rules[index] = Rule(match=match, folder=folder, account=account)
+        mapping.save(rules)
+        flash("Zuordnung gespeichert.", "ok")
+        return redirect(url_for("index"))
+
+    # --- mail accounts ---------------------------------------------------
+
+    @app.route("/accounts")
+    @login_required
+    def accounts_page():
+        return render_template("accounts.html", status=runner.status() if runner else [])
+
+    @app.route("/accounts/save", methods=["POST"])
+    @login_required
+    def account_save():
+        settings_now = current()
+        existing_id = request.form.get("id", "").strip()
+        account = settings_now.account(existing_id) if existing_id else None
+
+        label = request.form.get("label", "").strip()
+        host = request.form.get("host", "").strip()
+        user = request.form.get("user", "").strip()
+        if not host or not user:
+            flash("Server und Benutzer sind erforderlich.", "error")
+            return redirect(url_for("accounts_page"))
+
+        password = request.form.get("password", "")
+        if account is not None and not password:
+            password = account.password  # empty field means "keep current"
+
+        try:
+            port = int(request.form.get("port", "993"))
+        except ValueError:
+            flash("Port muss eine Zahl sein.", "error")
+            return redirect(url_for("accounts_page"))
+
+        values = dict(
+            label=label,
+            host=host,
+            port=port,
+            ssl=request.form.get("ssl") == "on",
+            user=user,
+            password=password,
+            folder=request.form.get("folder", "INBOX").strip() or "INBOX",
+            processed_folder=request.form.get("processed_folder", "").strip(),
+            oversized_folder=request.form.get("oversized_folder", "").strip(),
+            mode="idle" if request.form.get("mode") == "idle" else "poll",
+            enabled=request.form.get("enabled") == "on",
+        )
+
+        accounts = list(settings_now.accounts)
+        if account is None:
+            new_id = settings_now.unique_id(make_account_id(label or user))
+            accounts.append(Account(id=new_id, **values))
+            message = f"Konto '{label or user}' angelegt."
+        else:
+            accounts = [
+                Account(id=a.id, **values) if a.id == account.id else a for a in accounts
+            ]
+            message = f"Konto '{label or user}' gespeichert."
+
+        import dataclasses
+
+        persist(dataclasses.replace(settings_now, accounts=accounts))
+        flash(message, "ok")
+        return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/<account_id>/delete", methods=["POST"])
+    @login_required
+    def account_delete(account_id: str):
+        import dataclasses
+
+        settings_now = current()
+        remaining = [a for a in settings_now.accounts if a.id != account_id]
+        if len(remaining) == len(settings_now.accounts):
+            abort(404)
+        persist(dataclasses.replace(settings_now, accounts=remaining))
+
+        # Rules pinned to the removed account would silently never match again.
+        orphaned = [r for r in mapping.rules if r.account == account_id]
+        if orphaned:
+            mapping.save(
+                [
+                    Rule(match=r.match, folder=r.folder, account=ALL_ACCOUNTS)
+                    if r.account == account_id
+                    else r
+                    for r in mapping.rules
+                ]
+            )
+            flash(
+                f"Konto geloescht. {len(orphaned)} Zuordnung(en) waren daran gebunden "
+                "und gelten jetzt fuer alle Konten.",
+                "ok",
+            )
+        else:
+            flash("Konto geloescht.", "ok")
+        return redirect(url_for("accounts_page"))
+
+    # --- general settings -------------------------------------------------
+
+    @app.route("/settings", methods=["GET", "POST"])
+    @login_required
+    def settings_page():
+        import dataclasses
+
+        settings_now = current()
+        if request.method == "POST":
+            new_mapping_path = request.form.get("mapping_path", "").strip() or "mapping.yaml"
+            try:
+                # The mapping file must stay inside the share: the path comes
+                # from a form field and would otherwise be a way to read/write
+                # an arbitrary file on the host.
+                resolved = safe_join(config.storage_root, new_mapping_path)
+            except ValueError as exc:
+                flash(f"Pfad nicht zulaessig: {exc}", "error")
+                return redirect(url_for("settings_page"))
+
+            def as_int(name: str, fallback: int) -> int:
+                try:
+                    return max(1, int(request.form.get(name, fallback)))
+                except ValueError:
+                    return fallback
+
+            updated = dataclasses.replace(
+                settings_now,
+                mapping_path=new_mapping_path,
+                fallback_folder=request.form.get("fallback_folder", "").strip() or "unsorted",
+                quarantine_folder=request.form.get("quarantine_folder", "").strip() or "quarantaene",
+                match_body=request.form.get("match_body") == "on",
+                filename_prefix=request.form.get("filename_prefix", "date_sender"),
+                poll_interval=as_int("poll_interval", settings_now.poll_interval),
+                max_attachment_size_mb=as_int(
+                    "max_attachment_size_mb", settings_now.max_attachment_size_mb
+                ),
+                max_message_size_mb=as_int("max_message_size_mb", settings_now.max_message_size_mb),
+                max_attachments_per_message=as_int(
+                    "max_attachments_per_message", settings_now.max_attachments_per_message
+                ),
+            )
+
+            moved = False
+            old_path = Path(mapping.path)
+            if resolved != old_path:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                if old_path.exists() and not resolved.exists():
+                    # Move the existing rules along rather than silently
+                    # starting from an empty file at the new location.
+                    resolved.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    old_path.unlink()
+                    moved = True
+                mapping.set_path(str(resolved))
+
+            persist(updated)
+            flash(
+                "Einstellungen gespeichert." + (" Mapping-Datei verschoben." if moved else ""),
+                "ok",
+            )
+            return redirect(url_for("settings_page"))
+
+        return render_template(
+            "settings.html",
+            settings=settings_now,
+            storage_root=config.storage_root,
+            mapping_full_path=str(mapping.path),
+        )
+
+    return app
+MAIL2NAS_EOF
+
 # --- mail2nas/main.py ---
 cat > mail2nas/main.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
@@ -860,12 +1736,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
+import threading
 from pathlib import Path
 
-from .archiver import Archiver
 from .config import Config
+from .filenames import safe_join
 from .mapping import Mapping
+from .runner import Runner
+from .settings import Settings
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
@@ -891,6 +1769,36 @@ def _check_storage_root(config: Config) -> None:
         )
 
 
+def _start_web(config: Config, settings: Settings, mapping: Mapping, runner: Runner) -> None:
+    """Serve the configuration UI in a background thread, if it is configured."""
+    if not config.web_enabled:
+        logger.info("Web UI disabled (WEB_ENABLED=false)")
+        return
+    if not config.web_password:
+        # The page shows and edits IMAP credentials, so refuse to serve it
+        # without authentication rather than defaulting to something weak.
+        logger.warning(
+            "Web UI not started: WEB_PASSWORD is empty. Set it to enable the configuration page."
+        )
+        return
+
+    try:
+        from waitress import serve
+
+        from .web import create_app
+    except ImportError:
+        logger.warning("Web UI not started: Flask/waitress are not installed")
+        return
+
+    app = create_app(config, settings, mapping, runner)
+
+    def _serve() -> None:
+        logger.info("Web UI on http://%s:%s", config.web_host, config.web_port)
+        serve(app, host=config.web_host, port=config.web_port, threads=4, _quiet=True)
+
+    threading.Thread(target=_serve, name="mail2nas-web", daemon=True).start()
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -900,73 +1808,442 @@ def main() -> None:
 
     config = Config.from_env()
     _check_storage_root(config)
-    mapping_full_path = os.path.join(config.storage_root, config.mapping_path)
-    mapping = Mapping(mapping_full_path, config.fallback_folder)
+
+    settings = Settings.load(config)
+    try:
+        mapping_full_path = safe_join(config.storage_root, settings.mapping_path)
+    except ValueError as exc:
+        raise SystemExit(f"Configured mapping path is not usable: {exc}") from None
+    mapping = Mapping(str(mapping_full_path), settings.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    archiver = Archiver(config, mapping, store)
 
     logger.info(
-        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s dry_run=%s",
-        config.imap_host,
-        config.imap_folder,
-        config.imap_mode,
+        "Starting mail2nas: %d account(s), storage=%s dry_run=%s",
+        len(settings.enabled_accounts()),
         config.storage_root,
         config.dry_run,
     )
 
+    runner = Runner(config, settings, mapping, store)
+    _start_web(config, settings, mapping, runner)
+    runner.start()
+
     try:
-        while True:
-            try:
-                client = archiver.connect()
-            except Exception:
-                logger.exception("IMAP connection failed, retrying in %ss", config.poll_interval)
-                time.sleep(config.poll_interval)
-                continue
-
-            try:
-                if config.imap_mode == "idle":
-                    _run_idle(archiver, client, config)
-                else:
-                    _run_poll(archiver, client, config)
-            except Exception:
-                logger.exception("IMAP session failed, reconnecting in %ss", config.poll_interval)
-            finally:
-                try:
-                    client.logout()
-                except Exception:
-                    pass
-            time.sleep(config.poll_interval)
+        runner.wait()
     finally:
+        runner.stop()
         store.close()
-
-
-def _run_poll(archiver: Archiver, client, config: Config) -> None:
-    while True:
-        count = archiver.run_once(client)
-        if count:
-            logger.info("Processed %d message(s)", count)
-        time.sleep(config.poll_interval)
-
-
-def _run_idle(archiver: Archiver, client, config: Config) -> None:
-    count = archiver.run_once(client)
-    if count:
-        logger.info("Processed %d message(s)", count)
-
-    idle_timeout = config.poll_interval or 300
-    while True:
-        client.idle()
-        try:
-            client.idle_check(timeout=idle_timeout)
-        finally:
-            client.idle_done()
-        count = archiver.run_once(client)
-        if count:
-            logger.info("Processed %d message(s)", count)
 
 
 if __name__ == "__main__":
     main()
+MAIL2NAS_EOF
+
+# --- mail2nas/templates/base.html ---
+cat > mail2nas/templates/base.html <<'MAIL2NAS_EOF'
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mail2nas</title>
+<style>
+  :root { --bg:#f5f6f8; --fg:#1d2129; --muted:#6b7280; --line:#d8dbe0;
+          --card:#fff; --accent:#2d6cdf; --err:#b3261e; --ok:#1b6b3a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0a6; --line:#333840;
+            --card:#1e2126; --accent:#6ea3ff; --err:#f2a9a2; --ok:#7bd3a0; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:0 16px;
+           display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:14px 0; }
+  nav a { color:var(--fg); text-decoration:none; padding:16px 4px; display:inline-block;
+          border-bottom:2px solid transparent; }
+  nav a.active { border-bottom-color:var(--accent); }
+  main { max-width:960px; margin:0 auto; padding:20px 16px 60px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:16px; margin-bottom:18px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line);
+          vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  input[type=text],input[type=password],input[type=number],select {
+    width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:5px;
+    background:var(--bg); color:var(--fg); font:inherit; }
+  button { font:inherit; padding:6px 12px; border-radius:5px; border:1px solid var(--line);
+           background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.icon { padding:4px 9px; line-height:1.1; }
+  button.danger { color:var(--err); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1 1 160px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:3px; }
+  .flash { padding:9px 12px; border-radius:6px; margin-bottom:12px; }
+  .flash.error { background:rgba(179,38,30,.12); color:var(--err); }
+  .flash.ok { background:rgba(27,107,58,.12); color:var(--ok); }
+  .hint { color:var(--muted); font-size:13px; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; font-size:13px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .dot.up { background:var(--ok); } .dot.down { background:var(--err); }
+  .inline { display:inline; }
+  .prio { color:var(--muted); font-variant-numeric:tabular-nums; width:2em; }
+  @media (max-width:640px) { table, thead, tbody, th, td, tr { display:block; }
+    thead { display:none; } td { border:none; padding:4px 0; }
+    tr { border-bottom:1px solid var(--line); padding:10px 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>mail2nas</h1>
+  <nav>
+    <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint=='index' }}">Zuordnungen</a>
+    <a href="{{ url_for('accounts_page') }}" class="{{ 'active' if request.endpoint=='accounts_page' }}">Mailkonten</a>
+    <a href="{{ url_for('settings_page') }}" class="{{ 'active' if request.endpoint=='settings_page' }}">Einstellungen</a>
+  </nav>
+  <form method="post" action="{{ url_for('logout') }}" style="margin-left:auto">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button>Abmelden</button>
+  </form>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
+MAIL2NAS_EOF
+
+# --- mail2nas/templates/login.html ---
+cat > mail2nas/templates/login.html <<'MAIL2NAS_EOF'
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mail2nas - Anmeldung</title>
+<style>
+  :root { --bg:#f5f6f8; --fg:#1d2129; --muted:#6b7280; --line:#d8dbe0; --card:#fff;
+          --accent:#2d6cdf; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0a6; --line:#333840; --card:#1e2126;
+            --accent:#6ea3ff; --err:#f2a9a2; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; padding:20px; }
+  form { background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:24px; width:100%; max-width:340px; }
+  h1 { font-size:17px; margin:0 0 18px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 3px; }
+  input { width:100%; padding:8px; border:1px solid var(--line); border-radius:5px;
+          background:var(--bg); color:var(--fg); font:inherit; }
+  button { width:100%; margin-top:18px; padding:9px; border-radius:5px; border:none;
+           background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  .flash { margin-top:14px; padding:8px 10px; border-radius:6px;
+           background:rgba(179,38,30,.12); color:var(--err); font-size:14px; }
+</style>
+</head>
+<body>
+<form method="post">
+  <h1>mail2nas</h1>
+  <label for="user">Benutzer</label>
+  <input id="user" type="text" name="user" autocomplete="username" autofocus required>
+  <label for="password">Passwort</label>
+  <input id="password" type="password" name="password" autocomplete="current-password" required>
+  <button>Anmelden</button>
+  {% with messages = get_flashed_messages() %}
+    {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
+  {% endwith %}
+</form>
+</body>
+</html>
+MAIL2NAS_EOF
+
+# --- mail2nas/templates/rules.html ---
+cat > mail2nas/templates/rules.html <<'MAIL2NAS_EOF'
+{% extends "base.html" %}
+{% block content %}
+
+{% if status %}
+<div class="card">
+  <h2>Status</h2>
+  {% for s in status %}
+    <div><span class="dot {{ 'up' if s.alive else 'down' }}"></span>{{ s.label }}
+      {% if s.error %}<span class="hint">- letzter Fehler: {{ s.error }}</span>{% endif %}
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Zuordnungen</h2>
+  <p class="hint">
+    Die <strong>Reihenfolge bestimmt die Prioritaet</strong>: die erste passende Regel gewinnt.
+    Mit den Pfeilen verschieben. Gross-/Kleinschreibung ist egal.
+    Platzhalter moeglich: <code>*</code> (beliebig viele Zeichen), <code>?</code> (ein Zeichen) -
+    z. B. <code>Rechnung*</code>. Ohne Platzhalter wird als Teilstring gesucht.
+    Geprueft wird zuerst der Dateiname jedes Anhangs, dann Betreff (und Mailtext, falls aktiviert).
+  </p>
+  <p class="hint">Datei: <code>{{ mapping_path }}</code></p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Stichwort / Muster</th><th>Zielordner</th><th>Konto</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for rule in rules %}
+      <tr>
+        <td class="prio">{{ loop.index }}</td>
+        <td colspan="3">
+          <form method="post" action="{{ url_for('rule_update', index=loop.index0) }}" class="row">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div><input type="text" name="match" value="{{ rule.match }}" required></div>
+            <div><input type="text" name="folder" value="{{ rule.folder }}" required></div>
+            <div>
+              <select name="account">
+                <option value="{{ ALL_ACCOUNTS }}" {{ 'selected' if rule.account == ALL_ACCOUNTS }}>Alle Konten</option>
+                {% for a in accounts %}
+                  <option value="{{ a.id }}" {{ 'selected' if rule.account == a.id }}>{{ a.display_name() }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+          </form>
+        </td>
+        <td style="white-space:nowrap">
+          <form method="post" action="{{ url_for('rule_move', index=loop.index0, direction='up') }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon" title="Nach oben" {{ 'disabled' if loop.first }}>&uarr;</button>
+          </form>
+          <form method="post" action="{{ url_for('rule_move', index=loop.index0, direction='down') }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon" title="Nach unten" {{ 'disabled' if loop.last }}>&darr;</button>
+          </form>
+          <form method="post" action="{{ url_for('rule_delete', index=loop.index0) }}" class="inline"
+                onsubmit="return confirm('Zuordnung „{{ rule.match }}“ wirklich loeschen?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon danger" title="Loeschen">&times;</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="hint">Noch keine Zuordnungen. Alle Anhaenge landen im Fallback-Ordner.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Neue Zuordnung</h2>
+  <form method="post" action="{{ url_for('rule_add') }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div>
+      <label>Stichwort / Muster</label>
+      <input type="text" name="match" placeholder="z. B. Rechnung*" required>
+    </div>
+    <div>
+      <label>Zielordner</label>
+      <input type="text" name="folder" placeholder="z. B. rechnungen" required>
+    </div>
+    <div>
+      <label>Gilt fuer</label>
+      <select name="account">
+        <option value="{{ ALL_ACCOUNTS }}">Alle Konten</option>
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.display_name() }}</option>{% endfor %}
+      </select>
+    </div>
+    <div style="flex:0 0 auto"><button class="primary">Hinzufuegen</button></div>
+  </form>
+  <p class="hint">Neue Zuordnungen landen am Ende der Liste, also mit der niedrigsten Prioritaet.</p>
+</div>
+
+{% endblock %}
+MAIL2NAS_EOF
+
+# --- mail2nas/templates/accounts.html ---
+cat > mail2nas/templates/accounts.html <<'MAIL2NAS_EOF'
+{% extends "base.html" %}
+{% macro account_form(a=None, title='Neues Mailkonto') %}
+  <form method="post" action="{{ url_for('account_save') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="id" value="{{ a.id if a else '' }}">
+    <div class="row">
+      <div>
+        <label>Bezeichnung</label>
+        <input type="text" name="label" value="{{ a.label if a else '' }}" placeholder="z. B. Buchhaltung">
+      </div>
+      <div>
+        <label>IMAP-Server</label>
+        <input type="text" name="host" value="{{ a.host if a else '' }}" placeholder="imap.example.com" required>
+      </div>
+      <div style="flex:0 0 90px">
+        <label>Port</label>
+        <input type="number" name="port" value="{{ a.port if a else 993 }}" min="1" max="65535">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Benutzer</label>
+        <input type="text" name="user" value="{{ a.user if a else '' }}" required>
+      </div>
+      <div>
+        <label>Passwort {% if a %}<span class="hint">(leer = unveraendert)</span>{% endif %}</label>
+        <input type="password" name="password" autocomplete="new-password" {{ 'required' if not a }}>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Zu ueberwachender Ordner</label>
+        <input type="text" name="folder" value="{{ a.folder if a else 'INBOX' }}">
+      </div>
+      <div>
+        <label>Verarbeitete Mails verschieben nach</label>
+        <input type="text" name="processed_folder" value="{{ a.processed_folder if a else '' }}" placeholder="leer = nur als gelesen markieren">
+      </div>
+      <div>
+        <label>Zu grosse Mails verschieben nach</label>
+        <input type="text" name="oversized_folder" value="{{ a.oversized_folder if a else '' }}" placeholder="optional">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 150px">
+        <label>Abrufmodus</label>
+        <select name="mode">
+          <option value="poll" {{ 'selected' if not a or a.mode == 'poll' }}>Polling</option>
+          <option value="idle" {{ 'selected' if a and a.mode == 'idle' }}>IDLE (Push)</option>
+        </select>
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:6px">
+        <label>&nbsp;</label>
+        <label class="hint"><input type="checkbox" name="ssl" {{ 'checked' if not a or a.ssl }}> TLS/SSL</label>
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:6px">
+        <label>&nbsp;</label>
+        <label class="hint"><input type="checkbox" name="enabled" {{ 'checked' if not a or a.enabled }}> Aktiv</label>
+      </div>
+      <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+    </div>
+  </form>
+{% endmacro %}
+
+{% block content %}
+
+{% for a in accounts %}
+  <div class="card">
+    <h2>
+      {% for s in status %}{% if s.id == a.id %}<span class="dot {{ 'up' if s.alive else 'down' }}"></span>{% endif %}{% endfor %}
+      {{ a.display_name() }}
+      <span class="hint">- id: <code>{{ a.id }}</code></span>
+    </h2>
+    {{ account_form(a) }}
+    <form method="post" action="{{ url_for('account_delete', account_id=a.id) }}" style="margin-top:10px"
+          onsubmit="return confirm('Konto „{{ a.display_name() }}“ wirklich loeschen? Daran gebundene Zuordnungen gelten danach fuer alle Konten.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger">Konto loeschen</button>
+    </form>
+  </div>
+{% endfor %}
+
+<div class="card">
+  <h2>Neues Mailkonto</h2>
+  {{ account_form() }}
+  <p class="hint">
+    Nach dem Speichern kannst du jede Zuordnung ueber das Dropdown auf ein einzelnes
+    Konto begrenzen - oder auf „Alle Konten“ stehen lassen.
+  </p>
+</div>
+
+{% endblock %}
+MAIL2NAS_EOF
+
+# --- mail2nas/templates/settings.html ---
+cat > mail2nas/templates/settings.html <<'MAIL2NAS_EOF'
+{% extends "base.html" %}
+{% block content %}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <div class="card">
+    <h2>Mapping-Datei</h2>
+    <div class="row">
+      <div>
+        <label>Pfad, relativ zur Wurzel des Shares</label>
+        <input type="text" name="mapping_path" value="{{ settings.mapping_path }}">
+      </div>
+    </div>
+    <p class="hint">
+      Aktuell: <code>{{ mapping_full_path }}</code><br>
+      Wurzel des Shares: <code>{{ storage_root }}</code>. Unterordner wie
+      <code>config/mapping.yaml</code> sind erlaubt; die Datei muss innerhalb des Shares
+      bleiben. Beim Aendern wird eine vorhandene Datei an den neuen Ort verschoben.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Ablage</h2>
+    <div class="row">
+      <div>
+        <label>Fallback-Ordner (kein Treffer)</label>
+        <input type="text" name="fallback_folder" value="{{ settings.fallback_folder }}">
+      </div>
+      <div>
+        <label>Quarantaene-Ordner (gesperrte Dateitypen)</label>
+        <input type="text" name="quarantine_folder" value="{{ settings.quarantine_folder }}">
+      </div>
+      <div>
+        <label>Praefix im Dateinamen</label>
+        <select name="filename_prefix">
+          {% for value, text in [('date_sender','Datum + Absender'),('date','Nur Datum'),('sender','Nur Absender'),('none','Kein Praefix')] %}
+            <option value="{{ value }}" {{ 'selected' if settings.filename_prefix == value }}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p style="margin-top:10px">
+      <label class="hint">
+        <input type="checkbox" name="match_body" {{ 'checked' if settings.match_body }}>
+        Auch den Mailtext nach Stichwoertern durchsuchen (sonst nur Dateiname und Betreff)
+      </label>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Abruf und Grenzwerte</h2>
+    <div class="row">
+      <div>
+        <label>Abrufintervall (Sekunden)</label>
+        <input type="number" name="poll_interval" value="{{ settings.poll_interval }}" min="1">
+      </div>
+      <div>
+        <label>Max. Groesse je Anhang (MB)</label>
+        <input type="number" name="max_attachment_size_mb" value="{{ settings.max_attachment_size_mb }}" min="1">
+      </div>
+      <div>
+        <label>Max. Groesse je Mail (MB)</label>
+        <input type="number" name="max_message_size_mb" value="{{ settings.max_message_size_mb }}" min="1">
+      </div>
+      <div>
+        <label>Max. Anhaenge je Mail</label>
+        <input type="number" name="max_attachments_per_message" value="{{ settings.max_attachments_per_message }}" min="1">
+      </div>
+    </div>
+    <p class="hint">
+      Die Grenzwerte begrenzen, was eine einzelne Mail an Speicher und Plattenplatz
+      verursachen kann. Die Liste gesperrter Dateiendungen wird ueber die
+      Umgebungsvariable <code>BLOCKED_EXTENSIONS</code> gesetzt.
+    </p>
+  </div>
+
+  <button class="primary">Einstellungen speichern</button>
+</form>
+{% endblock %}
 MAIL2NAS_EOF
 
 # --- tests/test_mapping.py ---
@@ -975,6 +2252,8 @@ from __future__ import annotations
 
 import os
 import textwrap
+
+import pytest
 
 from mail2nas.mapping import Mapping
 
@@ -1092,6 +2371,159 @@ def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
         mapping.reload()
 
     assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+# --- v2 format: explicit order, wildcards, per-account rules -----------------
+
+from mail2nas.mapping import ALL_ACCOUNTS, Rule, dump_rules  # noqa: E402
+
+
+def test_v2_order_defines_priority_not_keyword_length(tmp_path):
+    """The first matching rule wins, even if a longer keyword matches later."""
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        version: 2
+        rules:
+          - match: RE
+            folder: rechnungen
+          - match: Rechnungskorrektur
+            folder: korrekturen
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "rechnungen"
+
+
+def test_v2_reordering_changes_the_winner(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        version: 2
+        rules:
+          - match: Rechnungskorrektur
+            folder: korrekturen
+          - match: RE
+            folder: rechnungen
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+
+
+def test_v1_dict_format_still_works_with_length_priority(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        RE: rechnungen
+        Rechnungskorrektur: korrekturen
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+
+
+@pytest.mark.parametrize(
+    "pattern,text,expected",
+    [
+        ("Rechnung*", "rechnung_4711.pdf", True),
+        ("Rechnung*", "meine rechnung", False),   # anchored at the start
+        ("*Rechnung*", "meine rechnung 1", True),
+        ("RE-????", "re-2024", True),
+        ("RE-????", "re-24", False),
+        ("*.pdf", "beleg.pdf", True),
+        ("*.pdf", "beleg.exe", False),
+    ],
+)
+def test_wildcards(tmp_path, pattern, text, expected):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, f"""
+        version: 2
+        rules:
+          - match: "{pattern}"
+            folder: treffer
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert (mapping.resolve(text)[0] == "treffer") is expected
+
+
+def test_plain_keyword_stays_a_substring_match(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        version: 2
+        rules:
+          - match: Rechnung
+            folder: rechnungen
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("Ihre Rechnung 4711")[0] == "rechnungen"
+
+
+def test_wildcards_are_case_insensitive(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        version: 2
+        rules:
+          - match: "RECHNUNG*"
+            folder: rechnungen
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("rechnung_1.pdf")[0] == "rechnungen"
+
+
+def test_rule_limited_to_one_account_is_skipped_for_others(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, """
+        version: 2
+        rules:
+          - match: Rechnung
+            folder: privat
+            account: privatkonto
+          - match: Rechnung
+            folder: firma
+            account: all
+    """)
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.resolve("Rechnung 1", account="privatkonto")[0] == "privat"
+    assert mapping.resolve("Rechnung 1", account="firmenkonto")[0] == "firma"
+
+
+def test_dump_rules_roundtrips_through_the_loader(tmp_path):
+    rules = [
+        Rule(match="Rechnung*", folder="rechnungen", account=ALL_ACCOUNTS),
+        Rule(match="LS", folder="lieferscheine", account="konto2"),
+    ]
+    mapping_path = tmp_path / "mapping.yaml"
+    mapping_path.write_text(dump_rules(rules), encoding="utf-8")
+
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    assert mapping.rules == rules
+
+
+def test_save_persists_order_and_is_reloaded(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "version: 2\nrules: []\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping.save([Rule(match="LS", folder="lieferscheine"), Rule(match="RE", folder="rechnungen")])
+
+    assert Mapping(str(mapping_path), "unsorted").rules == mapping.rules
+    assert mapping.resolve("RE und LS")[0] == "lieferscheine"
+
+
+def test_rule_missing_folder_is_rejected_and_previous_rules_kept(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping_path.write_text("version: 2\nrules:\n  - match: RE\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+    mapping.reload()
+
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
 MAIL2NAS_EOF
 
 # --- tests/test_filenames.py ---
@@ -1720,6 +3152,429 @@ def test_read_only_storage_root_fails_fast(tmp_path):
             _check_storage_root(_make_config(tmp_path, storage_root=str(readonly)))
     finally:
         readonly.chmod(0o700)
+MAIL2NAS_EOF
+
+# --- tests/test_settings.py ---
+cat > tests/test_settings.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import dataclasses
+
+from mail2nas.settings import Account, Settings, make_account_id
+from tests.test_archiver import _make_config
+
+
+def _config(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    return _make_config(tmp_path, storage_root=str(tmp_path), state_db_path=str(data / "state.db"))
+
+
+def test_first_start_migrates_the_environment_configuration(tmp_path):
+    """An existing single-account .env deployment must keep working."""
+    config = dataclasses.replace(
+        _config(tmp_path), imap_host="imap.example.com", imap_user="archiv@x", imap_password="pw"
+    )
+
+    settings = Settings.load(config)
+
+    assert len(settings.accounts) == 1
+    account = settings.accounts[0]
+    assert (account.id, account.host, account.user) == ("default", "imap.example.com", "archiv@x")
+    assert Settings.path_for(config).exists()
+
+
+def test_settings_roundtrip_through_the_file(tmp_path):
+    config = _config(tmp_path)
+    settings = Settings(
+        accounts=[Account(id="a", host="h", user="u", password="p")],
+        fallback_folder="sonstiges",
+        match_body=True,
+    )
+    settings.save(config)
+
+    loaded = Settings.load(config)
+
+    assert loaded.fallback_folder == "sonstiges"
+    assert loaded.match_body is True
+    assert loaded.accounts[0].password == "p"
+
+
+def test_unreadable_config_falls_back_to_the_environment(tmp_path):
+    config = dataclasses.replace(_config(tmp_path), imap_host="fallback.example.com")
+    Settings.path_for(config).write_text("this: [is not: valid", encoding="utf-8")
+
+    settings = Settings.load(config)
+
+    assert settings.accounts[0].host == "fallback.example.com"
+
+
+def test_enabled_accounts_skips_disabled_and_incomplete_ones(tmp_path):
+    settings = Settings(
+        accounts=[
+            Account(id="ok", host="h", user="u", password="p"),
+            Account(id="off", host="h", user="u", password="p", enabled=False),
+            Account(id="incomplete", host="", user="", password=""),
+        ]
+    )
+
+    assert [a.id for a in settings.enabled_accounts()] == ["ok"]
+
+
+def test_unique_id_avoids_collisions(tmp_path):
+    settings = Settings(accounts=[Account(id="buchhaltung", host="h", user="u", password="p")])
+
+    assert settings.unique_id("buchhaltung") == "buchhaltung-2"
+    assert settings.unique_id("buchhaltung", ignore="buchhaltung") == "buchhaltung"
+    assert settings.unique_id("anderes") == "anderes"
+
+
+def test_make_account_id_is_filesystem_and_yaml_safe():
+    assert make_account_id("Buchhaltung Müller & Co.") == "buchhaltung-m-ller-co"
+    assert make_account_id("   ") .startswith("konto-")
+
+
+def test_config_for_maps_account_fields_onto_the_archiver_config(tmp_path):
+    config = _config(tmp_path)
+    settings = Settings(
+        accounts=[],
+        fallback_folder="sonstiges",
+        max_attachment_size_mb=7,
+    )
+    account = Account(
+        id="zweit", host="imap.z", user="u@z", password="pw", port=143, ssl=False,
+        folder="Archiv", processed_folder="Erledigt", mode="idle",
+    )
+
+    per_account = settings.config_for(config, account)
+
+    assert per_account.imap_host == "imap.z"
+    assert per_account.imap_port == 143
+    assert per_account.imap_ssl is False
+    assert per_account.imap_folder == "Archiv"
+    assert per_account.imap_processed_folder == "Erledigt"
+    assert per_account.imap_mode == "idle"
+    assert per_account.account_id == "zweit"
+    # general settings come from Settings, not from the environment defaults
+    assert per_account.fallback_folder == "sonstiges"
+    assert per_account.max_attachment_size_mb == 7
+    # infrastructure settings stay untouched
+    assert per_account.storage_root == config.storage_root
+
+
+def test_empty_processed_folder_becomes_none(tmp_path):
+    config = _config(tmp_path)
+    account = Account(id="a", host="h", user="u", password="p", processed_folder="")
+
+    assert Settings().config_for(config, account).imap_processed_folder is None
+MAIL2NAS_EOF
+
+# --- tests/test_web.py ---
+cat > tests/test_web.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from mail2nas.mapping import ALL_ACCOUNTS, Mapping, Rule
+from mail2nas.settings import Account, Settings
+from mail2nas.web import create_app
+from tests.test_archiver import _make_config
+
+PASSWORD = "s3cret"
+
+
+@pytest.fixture
+def env(tmp_path):
+    share = tmp_path / "share"
+    share.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+
+    config = dataclasses.replace(
+        _make_config(share, storage_root=str(share), state_db_path=str(data / "state.db")),
+        web_enabled=True,
+        web_user="admin",
+        web_password=PASSWORD,
+    )
+    settings = Settings(
+        accounts=[
+            Account(id="haupt", label="Hauptpostfach", host="imap.x", user="a@x", password="pw"),
+            Account(id="zweit", label="Zweitkonto", host="imap.y", user="b@y", password="pw"),
+        ]
+    )
+    settings.save(config)
+    mapping = Mapping(str(share / "mapping.yaml"), "unsorted")
+    mapping.save([Rule("RE", "rechnungen"), Rule("LS", "lieferscheine")])
+
+    app = create_app(config, settings, mapping)
+    app.config.update(TESTING=True)
+    return {"app": app, "config": config, "settings": settings, "mapping": mapping, "share": share}
+
+
+@pytest.fixture
+def client(env):
+    return env["app"].test_client()
+
+
+def login(client):
+    client.post("/login", data={"user": "admin", "password": PASSWORD})
+    with client.session_transaction() as sess:
+        sess["csrf"] = "test-token"
+    return "test-token"
+
+
+# --- authentication ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/", "/accounts", "/settings"])
+def test_pages_require_login(client, path):
+    response = client.get(path)
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_login_rejects_wrong_password(client):
+    client.post("/login", data={"user": "admin", "password": "wrong"})
+
+    assert client.get("/").status_code == 302
+
+
+def test_login_accepts_correct_password(client):
+    login(client)
+
+    assert client.get("/").status_code == 200
+
+
+def test_logout_ends_the_session(client):
+    token = login(client)
+    client.post("/logout", data={"csrf_token": token})
+
+    assert client.get("/").status_code == 302
+
+
+# --- CSRF --------------------------------------------------------------------
+
+
+def test_post_without_csrf_token_is_rejected(client):
+    login(client)
+
+    response = client.post("/rules/add", data={"match": "AB", "folder": "ab"})
+
+    assert response.status_code == 400
+
+
+def test_post_with_wrong_csrf_token_is_rejected(client):
+    login(client)
+
+    response = client.post("/rules/add", data={"csrf_token": "nope", "match": "AB", "folder": "ab"})
+
+    assert response.status_code == 400
+
+
+# --- rule ordering (the arrows) ---------------------------------------------
+
+
+def test_move_rule_down_changes_priority(client, env):
+    token = login(client)
+
+    client.post("/rules/0/move/down", data={"csrf_token": token})
+
+    assert [r.match for r in env["mapping"].rules] == ["LS", "RE"]
+
+
+def test_move_rule_up_changes_priority(client, env):
+    token = login(client)
+
+    client.post("/rules/1/move/up", data={"csrf_token": token})
+
+    assert [r.match for r in env["mapping"].rules] == ["LS", "RE"]
+
+
+def test_move_beyond_the_ends_is_a_no_op(client, env):
+    token = login(client)
+
+    client.post("/rules/0/move/up", data={"csrf_token": token})
+    client.post("/rules/1/move/down", data={"csrf_token": token})
+
+    assert [r.match for r in env["mapping"].rules] == ["RE", "LS"]
+
+
+def test_reordering_survives_a_reload_from_disk(client, env):
+    token = login(client)
+    client.post("/rules/0/move/down", data={"csrf_token": token})
+
+    reloaded = Mapping(str(env["mapping"].path), "unsorted")
+
+    assert [r.match for r in reloaded.rules] == ["LS", "RE"]
+
+
+# --- rule CRUD ---------------------------------------------------------------
+
+
+def test_add_rule_with_wildcard_and_account(client, env):
+    token = login(client)
+
+    client.post(
+        "/rules/add",
+        data={"csrf_token": token, "match": "Mahnung*", "folder": "mahnungen", "account": "zweit"},
+    )
+
+    added = env["mapping"].rules[-1]
+    assert (added.match, added.folder, added.account) == ("Mahnung*", "mahnungen", "zweit")
+
+
+def test_add_rule_rejects_folder_escaping_the_share(client, env):
+    token = login(client)
+
+    client.post(
+        "/rules/add", data={"csrf_token": token, "match": "X", "folder": "../../etc"}
+    )
+
+    assert all(r.folder != "../../etc" for r in env["mapping"].rules)
+
+
+def test_update_rule_changes_pattern_and_account(client, env):
+    token = login(client)
+
+    client.post(
+        "/rules/0/update",
+        data={"csrf_token": token, "match": "RE-*", "folder": "rechnungen", "account": "haupt"},
+    )
+
+    assert env["mapping"].rules[0] == Rule("RE-*", "rechnungen", "haupt")
+
+
+def test_delete_rule(client, env):
+    token = login(client)
+
+    client.post("/rules/0/delete", data={"csrf_token": token})
+
+    assert [r.match for r in env["mapping"].rules] == ["LS"]
+
+
+# --- accounts ----------------------------------------------------------------
+
+
+def test_add_account(client, env):
+    token = login(client)
+
+    client.post(
+        "/accounts/save",
+        data={
+            "csrf_token": token, "id": "", "label": "Drittkonto", "host": "imap.z",
+            "user": "c@z", "password": "geheim", "port": "993", "ssl": "on",
+            "folder": "INBOX", "mode": "poll", "enabled": "on",
+        },
+    )
+
+    saved = Settings.load(env["config"])
+    assert any(a.label == "Drittkonto" and a.password == "geheim" for a in saved.accounts)
+
+
+def test_editing_an_account_with_empty_password_keeps_the_old_one(client, env):
+    token = login(client)
+
+    client.post(
+        "/accounts/save",
+        data={
+            "csrf_token": token, "id": "haupt", "label": "Umbenannt", "host": "imap.x",
+            "user": "a@x", "password": "", "port": "993", "folder": "INBOX",
+            "mode": "poll", "enabled": "on",
+        },
+    )
+
+    saved = Settings.load(env["config"])
+    account = saved.account("haupt")
+    assert account.label == "Umbenannt"
+    assert account.password == "pw"
+
+
+def test_deleting_an_account_unpins_its_rules(client, env):
+    token = login(client)
+    client.post(
+        "/rules/0/update",
+        data={"csrf_token": token, "match": "RE", "folder": "rechnungen", "account": "zweit"},
+    )
+
+    client.post("/accounts/zweit/delete", data={"csrf_token": token})
+
+    saved = Settings.load(env["config"])
+    assert saved.account("zweit") is None
+    # the rule must not silently stop matching for ever
+    assert all(r.account == ALL_ACCOUNTS for r in env["mapping"].rules)
+
+
+# --- settings, including moving the mapping file -----------------------------
+
+
+def test_moving_the_mapping_file_carries_the_rules_along(client, env):
+    token = login(client)
+
+    client.post(
+        "/settings",
+        data={
+            "csrf_token": token, "mapping_path": "config/mapping.yaml",
+            "fallback_folder": "unsorted", "quarantine_folder": "quarantaene",
+            "filename_prefix": "date_sender", "poll_interval": "300",
+            "max_attachment_size_mb": "25", "max_message_size_mb": "50",
+            "max_attachments_per_message": "20",
+        },
+    )
+
+    new_path = env["share"] / "config" / "mapping.yaml"
+    assert new_path.exists()
+    assert not (env["share"] / "mapping.yaml").exists()
+    assert [r.match for r in Mapping(str(new_path), "unsorted").rules] == ["RE", "LS"]
+
+
+@pytest.mark.parametrize("hostile", ["../../etc/passwd", "/etc/passwd"])
+def test_mapping_path_cannot_escape_the_share(client, env, hostile):
+    token = login(client)
+    before = str(env["mapping"].path)
+
+    client.post(
+        "/settings",
+        data={
+            "csrf_token": token, "mapping_path": hostile,
+            "fallback_folder": "unsorted", "quarantine_folder": "quarantaene",
+            "filename_prefix": "date_sender", "poll_interval": "300",
+            "max_attachment_size_mb": "25", "max_message_size_mb": "50",
+            "max_attachments_per_message": "20",
+        },
+    )
+
+    assert str(env["mapping"].path) == before
+    assert Settings.load(env["config"]).mapping_path == "mapping.yaml"
+
+
+def test_settings_are_persisted(client, env):
+    token = login(client)
+
+    client.post(
+        "/settings",
+        data={
+            "csrf_token": token, "mapping_path": "mapping.yaml",
+            "fallback_folder": "sonstiges", "quarantine_folder": "quarantaene",
+            "match_body": "on", "filename_prefix": "date", "poll_interval": "60",
+            "max_attachment_size_mb": "10", "max_message_size_mb": "20",
+            "max_attachments_per_message": "5",
+        },
+    )
+
+    saved = Settings.load(env["config"])
+    assert saved.fallback_folder == "sonstiges"
+    assert saved.match_body is True
+    assert saved.filename_prefix == "date"
+    assert saved.max_attachment_size_mb == 10
+
+
+def test_config_file_is_written_with_restrictive_permissions(env):
+    path = Settings.path_for(env["config"])
+
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---

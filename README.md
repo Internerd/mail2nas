@@ -9,13 +9,15 @@ kann aber genauso als einfacher systemd-Service laufen.
 
 - [Funktionsweise](#funktionsweise)
 - [Voraussetzungen](#voraussetzungen)
+- [Weboberflaeche](#weboberflaeche)
 - [Installation, Variante 1: Proxmox-Helper-Skript (automatisch)](#installation-variante-1-proxmox-helper-skript-automatisch)
 - [Installation, Variante 2: Proxmox ohne Git (manuelles Kopieren)](#installation-variante-2-proxmox-ohne-git-manuelles-kopieren)
 - [Weiter mit Docker Compose](#weiter-mit-docker-compose)
 - [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
 - [Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
-- [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
+- [Zuordnungen: Prioritaet, Platzhalter, Mailkonten](#zuordnungen-prioritaet-platzhalter-mailkonten)
+- [Mehrere Mailkonten](#mehrere-mailkonten)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
 - [Betrieb & Troubleshooting](#betrieb--troubleshooting)
 - [Tests](#tests)
@@ -28,21 +30,22 @@ kann aber genauso als einfacher systemd-Service laufen.
 
 ## Funktionsweise
 
-1. Verbindet sich per IMAP mit dem Postfach (IDLE-Push oder Polling).
-2. Liest ungelesene Mails, sucht im Betreff (optional auch im Mailtext)
-   nach den Stichwoertern aus `mapping.yaml`.
-3. Der erste Treffer bestimmt den Zielordner unterhalb des SMB-Shares
-   (z. B. `RE`/`Rechnung` -> `rechnungen/`, `LS`/`Lieferschein` ->
-   `lieferscheine/`). Ohne Treffer landen Anhaenge im `FALLBACK_FOLDER`
-   (Default: `unsorted/`).
-4. Anhaenge werden mit Datums-/Absender-Praefix gespeichert, Namenskollisionen
-   werden automatisch durch einen Zaehler-Suffix vermieden.
-5. Die Mail wird als gelesen markiert (und optional in einen
-   `IMAP_PROCESSED_FOLDER` verschoben). Zusaetzlich wird die Message-ID in
-   einer lokalen SQLite-Datenbank vermerkt, damit nichts doppelt verarbeitet
-   wird, selbst wenn das `\Seen`-Flag von woanders zurueckgesetzt wird.
-6. `mapping.yaml` liegt selbst auf dem SMB-Share und wird bei jedem Zyklus
-   neu eingelesen - Anpassungen wirken ohne Neustart/Redeploy.
+1. Verbindet sich per IMAP mit einem oder mehreren Postfaechern (IDLE-Push
+   oder Polling, je Konto einstellbar).
+2. Liest ungelesene Mails und prueft die Zuordnungen aus `mapping.yaml` -
+   zuerst gegen den Dateinamen jedes einzelnen Anhangs, dann gegen Betreff
+   (und optional den Mailtext).
+3. Die **erste passende Zuordnung** bestimmt den Zielordner unterhalb des
+   Shares. Die Reihenfolge der Zuordnungen ist die Prioritaet und laesst sich
+   in der Weboberflaeche mit Pfeilen verschieben. Ohne Treffer landen Anhaenge
+   im Fallback-Ordner (Default: `unsorted/`).
+4. Anhaenge werden mit Datums-/Absender-Praefix atomar gespeichert,
+   Namenskollisionen durch einen Zaehler-Suffix vermieden.
+5. Die Mail wird als gelesen markiert (und optional in einen anderen
+   IMAP-Ordner verschoben). Zusaetzlich wird die Message-ID lokal in SQLite
+   vermerkt, damit nichts doppelt verarbeitet wird.
+6. Konfiguriert wird ueber die **Weboberflaeche**; `mapping.yaml` liegt auf
+   dem Share und wird bei jedem Zyklus neu eingelesen.
 
 ## Voraussetzungen
 
@@ -82,6 +85,14 @@ Das Skript:
 5. Zeigt am Ende die Container-IP sowie die Befehle zum Log-Ansehen und fuer
    einen Testlauf.
 
+Setze anschliessend `WEB_PASSWORD` in `/opt/mail2nas/.env` und starte den
+Dienst neu, um die [Weboberflaeche](#weboberflaeche) zu nutzen - dort laesst
+sich alles Weitere (Zuordnungen, weitere Mailkonten) ohne Shell erledigen:
+
+```bash
+pct exec <CTID> -- bash -c "cd /opt/mail2nas && sed -i 's/^WEB_PASSWORD=.*/WEB_PASSWORD=dein-passwort/' .env && docker compose up -d"
+```
+
 Alle eingegebenen Passwoerter landen ausschliesslich in der `.env` innerhalb
 der neuen LXC (Rechte `600`) - nicht im Bash-Verlauf des Proxmox-Hosts: die
 temporaere Uebergabedatei auf dem Host wird per `shred` entfernt, sobald sie
@@ -95,7 +106,7 @@ der Installation einfach in `/opt/mail2nas/.env` in der LXC anpassen und
 
 Danach fehlt nur noch `config/mapping.example.yaml` (liegt im Container unter
 `/opt/mail2nas/config/`) als `mapping.yaml` auf die Wurzel des SMB-Shares zu
-kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge).
+kopieren, siehe [Zuordnungen](#zuordnungen-prioritaet-platzhalter-mailkonten).
 
 **Voraussetzung**: Der Proxmox-Host selbst braucht dafuer Internetzugriff auf
 GitHub (fuer den `curl`-Aufruf und den `git clone` in der LXC) sowie auf die
@@ -314,6 +325,52 @@ journalctl -u mail2nas -f
 `mapping.yaml` wie im Docker-Abschnitt beschrieben auf `/mnt/nas` (bzw. den
 konfigurierten `MAPPING_PATH`) kopieren.
 
+## Weboberflaeche
+
+Unter `http://<container-ip>:8080` gibt es eine Konfigurationsseite mit drei
+Bereichen:
+
+- **Zuordnungen** - Regeln anlegen, bearbeiten, loeschen und mit den Pfeilen
+  `↑`/`↓` in der Prioritaet verschieben. Je Regel ein Dropdown, ob sie fuer
+  *alle* Konten oder nur fuer ein bestimmtes gilt. Oben steht der
+  Verbindungsstatus je Konto.
+- **Mailkonten** - beliebig viele IMAP-Postfaecher anlegen und bearbeiten
+  (Server, Port, TLS, Benutzer, Passwort, Ordner, Abrufmodus, aktiv/inaktiv).
+- **Einstellungen** - Speicherort der `mapping.yaml`, Fallback- und
+  Quarantaene-Ordner, Dateinamens-Praefix, Abrufintervall und die Grenzwerte.
+
+Aenderungen werden sofort gespeichert; die Konten-Worker starten automatisch
+neu, ein Container-Neustart ist nicht noetig.
+
+### Zugang einrichten
+
+```bash
+# in der .env:
+WEB_PASSWORD=ein-langes-passwort
+```
+
+**Ohne gesetztes `WEB_PASSWORD` startet die Oberflaeche nicht.** Das ist
+Absicht: die Seite zeigt und aendert IMAP-Zugangsdaten und darf nicht
+unauthentifiziert erreichbar sein. Mit `WEB_ENABLED=false` laesst sie sich
+ganz abschalten, dann bleibt es beim reinen Hintergrunddienst.
+
+Die Oberflaeche gehoert ins vertrauenswuerdige LAN, **nicht ins Internet**.
+Sie spricht HTTP; wer sie ueber unsichere Netze erreichbar machen will, sollte
+einen Reverse-Proxy mit TLS davorsetzen.
+
+### Wo die Konfiguration liegt
+
+| Was | Wo | Warum dort |
+|---|---|---|
+| Mailkonten, Grenzwerte, Ablage-Einstellungen | `/data/config.yaml` im Container (`0600`) | enthaelt IMAP-Passwoerter - liegt daher im Docker-Volume, **nicht** auf dem Share |
+| Zuordnungen | `mapping.yaml` auf dem Share | soll ohne Weboberflaeche editier- und sicherbar sein |
+
+Beim ersten Start wird `config.yaml` automatisch aus den bestehenden
+`IMAP_*`-Variablen der `.env` erzeugt - vorhandene Installationen laufen also
+unveraendert weiter und bekommen ihr bisheriges Postfach als erstes Konto.
+Danach ist die Weboberflaeche die Quelle der Wahrheit; die `IMAP_*`-Variablen
+werden nur noch fuer diese einmalige Uebernahme gelesen.
+
 ## Warum der SMB-Mount auf dem Host passiert
 
 Das SMB-Share wird **nicht von Docker** gemountet, sondern vom Betriebssystem
@@ -390,8 +447,20 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
 | `NAS_PATH` | Pfad des bereits gemounteten Shares auf dem Docker-Host, wird nach `/mnt/nas` im Container gebunden | `/mnt/nas` |
+| `WEB_ENABLED` | Weboberflaeche starten | `true` |
+| `WEB_PORT` / `WEB_HOST` | Port/Bind-Adresse der Oberflaeche | `8080` / `0.0.0.0` |
+| `WEB_USER` / `WEB_PASSWORD` | Anmeldung. **Ohne Passwort startet die Oberflaeche nicht.** | `admin` / leer |
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
+
+Die mit **(UI)** nutzbaren Werte - Mailkonten, Mapping-Pfad, Fallback- und
+Quarantaene-Ordner, `MATCH_BODY`, `FILENAME_PREFIX`, Abrufintervall und die
+Grenzwerte - werden nach dem ersten Start aus `/data/config.yaml` gelesen und
+in der [Weboberflaeche](#weboberflaeche) gepflegt. Die Variablen hier dienen
+dann nur noch als Startwerte fuer die einmalige Uebernahme. Rein
+infrastrukturelle Variablen (`STORAGE_ROOT`, `NAS_PATH`, `STATE_DB_PATH`,
+`BLOCKED_EXTENSIONS`, `WEB_*`, `LOG_LEVEL`, `DRY_RUN`) kommen weiterhin
+ausschliesslich aus der `.env`.
 
 **Keine SMB-Zugangsdaten in der `.env`.** Das Share wird vom Betriebssystem
 gemountet, nicht von Docker - die Zugangsdaten liegen daher in einer
@@ -401,29 +470,73 @@ Credentials-Datei mit `chmod 600` (beim Helper-Skript
 `NAS_PATH` sagt Docker nur, welches bereits gemountete Verzeichnis es
 durchreichen soll.
 
-## Mapping-Datei und Mehrfach-Anhaenge
+## Zuordnungen: Prioritaet, Platzhalter, Mailkonten
 
-Siehe `config/mapping.example.yaml`. Format:
+Am bequemsten ueber die [Weboberflaeche](#weboberflaeche); die Datei dahinter
+(`mapping.yaml` auf dem Share) laesst sich aber genauso von Hand pflegen:
 
 ```yaml
-RE: rechnungen
-Rechnung: rechnungen
-LS: lieferscheine
-Lieferschein: lieferscheine
+version: 2
+rules:
+  - match: Rechnungskorrektur      # steht VOR "RE" - sonst wuerde "RE" greifen
+    folder: korrekturen
+    account: all
+  - match: "Rechnung*"
+    folder: rechnungen
+    account: all
+  - match: LS
+    folder: lieferscheine
+    account: privatkonto           # nur fuer dieses eine Konto
 ```
 
-Laengere Stichwoerter werden vor kuerzeren geprueft (verhindert, dass z. B.
-"Rechnungskorrektur" bereits durch "RE" gematcht wird).
+**Prioritaet = Reihenfolge.** Die erste passende Regel gewinnt. In der
+Weboberflaeche verschiebst du Regeln mit `↑`/`↓`; die Nummer links ist die
+Prioritaet. Das ersetzt die frueher automatische Sortierung nach
+Stichwortlaenge, mit der sich Sonderfaelle nicht sauber abbilden liessen.
+
+**Gross-/Kleinschreibung ist immer egal.** `RE`, `re` und `Re` verhalten sich
+identisch - auch bei Platzhaltern.
+
+**Platzhalter** sind moeglich, sobald `*` oder `?` im Stichwort vorkommt:
+
+| Muster | passt auf | passt nicht auf |
+|---|---|---|
+| `Rechnung*` | `rechnung_4711.pdf` | `meine rechnung` |
+| `*Rechnung*` | `meine rechnung 1` | `beleg.pdf` |
+| `RE-????` | `RE-2024` | `RE-24` |
+| `*.pdf` | `beleg.pdf` | `beleg.exe` |
+
+Ohne `*`/`?` wird wie bisher als **Teilstring** gesucht - bestehende
+Zuordnungen verhalten sich also unveraendert.
+
+**Konto-Zuordnung**: `account: all` (Standard) gilt fuer alle Postfaecher,
+sonst die id eines einzelnen Kontos. So kann dieselbe Mail-Art aus zwei
+Postfaechern in unterschiedlichen Ordnern landen.
 
 **Mehrere Anhaenge pro Mail werden einzeln behandelt.** Jeder Anhang wird
-zuerst anhand seines EIGENEN Dateinamens gegen das Mapping geprueft; erst
-wenn der Dateiname selbst keinen Treffer liefert, greift der Treffer aus
-Betreff (bzw. Mailtext, siehe `MATCH_BODY`) als Fallback fuer diesen Anhang.
-Dadurch landet z. B. eine Mail mit `Rechnung_4711.pdf` UND
-`Lieferschein_4711.pdf` im Anhang korrekt aufgeteilt in `rechnungen/` bzw.
-`lieferscheine/` - nicht beide im selben Ordner. Anhaenge, deren Name keinen
-Hinweis gibt (z. B. `scan0001.pdf`), folgen weiterhin dem Mail-weiten Treffer
-bzw. landen im `FALLBACK_FOLDER`.
+zuerst anhand seines EIGENEN Dateinamens geprueft; erst wenn der Dateiname
+nichts hergibt, greift der Treffer aus Betreff/Mailtext. Eine Mail mit
+`Rechnung_4711.pdf` UND `Lieferschein_4711.pdf` landet dadurch korrekt
+aufgeteilt in `rechnungen/` bzw. `lieferscheine/`.
+
+Das alte Format (`RE: rechnungen` als einfaches Dictionary) wird weiterhin
+gelesen - dann gilt wie frueher "laengeres Stichwort zuerst". Sobald du in der
+Weboberflaeche speicherst, wird die Datei ins neue Format ueberfuehrt.
+
+## Mehrere Mailkonten
+
+Unter **Mailkonten** lassen sich beliebig viele IMAP-Postfaecher anlegen.
+Jedes bekommt einen eigenen Worker-Thread mit eigener Verbindung und eigenem
+Abrufmodus (IDLE oder Polling), teilt sich aber die Zuordnungen und die
+Datenbank bereits verarbeiteter Mails.
+
+Jede Zuordnung kann per Dropdown auf ein Konto begrenzt werden oder auf
+"Alle Konten" stehen bleiben. Wird ein Konto geloescht, werden daran
+gebundene Zuordnungen automatisch auf "Alle Konten" zurueckgesetzt - sonst
+wuerden sie stillschweigend nie wieder greifen.
+
+Deaktivierte Konten (Haken "Aktiv" entfernt) bleiben gespeichert, werden aber
+nicht abgerufen.
 
 ## Sicherheit: Angriffsflaeche ueber Mail/Anhaenge
 
@@ -483,6 +596,18 @@ damit um:
   IMAP-Schleife durchschlagen zu lassen (was in einer Reconnect-Endlosschleife
   endete, in der gar nichts mehr archiviert wurde), wird der Fehler einmal
   geloggt und mit dem letzten funktionierenden Regelsatz weitergearbeitet.
+- **Weboberflaeche nur mit Anmeldung**: Sie startet nicht ohne gesetztes
+  `WEB_PASSWORD`. Alle aendernden Aktionen sind POST-Requests mit
+  CSRF-Token; das Session-Cookie ist `HttpOnly` und `SameSite=Strict`.
+  Benutzername und Passwort werden mit `compare_digest` geprueft, damit sich
+  ein falscher Benutzername nicht per Laufzeitmessung von einem falschen
+  Passwort unterscheiden laesst.
+- **Auch Formulareingaben sind nicht vertrauenswuerdig**: Zielordner und der
+  Speicherort der `mapping.yaml` laufen durch dieselbe `safe_join()`-Pruefung
+  wie die Werte aus der Mapping-Datei - ueber die Oberflaeche laesst sich also
+  ebenfalls nichts ausserhalb des Shares schreiben.
+- **IMAP-Passwoerter liegen nicht auf dem Share**: `config.yaml` wird mit
+  `0600` im Docker-Volume abgelegt, nicht im fuer alle lesbaren SMB-Share.
 - **Fail-fast beim Start**: Ist `STORAGE_ROOT` nicht vorhanden oder nicht
   beschreibbar, bricht der Dienst mit einer klaren Meldung ab, statt Anhaenge
   in das Dateisystem des Containers zu schreiben, wo sie mit dem naechsten
@@ -690,10 +815,14 @@ auf.
 | Zugangsdaten & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
 | Stichwort-Mapping | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
 | Bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
+| Mailkonten & Einstellungen | `/data/config.yaml` im selben Volume | wird nie ueberschrieben, nur ergaenzt |
 
 Bringt eine neue Version zusaetzliche Konfigurationsvariablen mit, greifen
 dafuer automatisch die dokumentierten Defaults - eine aeltere `.env` bleibt
-also gueltig und muss nicht angefasst werden. Wer die neuen Optionen nutzen
+also gueltig und muss nicht angefasst werden. Dasselbe gilt fuer
+`config.yaml`: neue Felder bekommen ihren Default, bestehende bleiben stehen.
+`update.sh` baut das Image ohnehin neu, neue Python-Abhaengigkeiten (etwa
+Flask fuer die Weboberflaeche) kommen dabei automatisch mit. Wer die neuen Optionen nutzen
 will, ergaenzt sie einfach in der `.env` und ruft
 `docker compose up -d` auf.
 

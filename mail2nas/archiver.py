@@ -97,7 +97,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self.mapping.resolve(subject, body)
+        mail_folder, mail_keyword = self.mapping.resolve(subject, body, account=self.config.account_id)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -194,7 +194,7 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self.mapping.resolve(filename)
+        folder_name, matched_keyword = self.mapping.resolve(filename, account=self.config.account_id)
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 

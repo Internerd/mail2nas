@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <div class="card">
+    <h2>Mapping-Datei</h2>
+    <div class="row">
+      <div>
+        <label>Pfad, relativ zur Wurzel des Shares</label>
+        <input type="text" name="mapping_path" value="{{ settings.mapping_path }}">
+      </div>
+    </div>
+    <p class="hint">
+      Aktuell: <code>{{ mapping_full_path }}</code><br>
+      Wurzel des Shares: <code>{{ storage_root }}</code>. Unterordner wie
+      <code>config/mapping.yaml</code> sind erlaubt; die Datei muss innerhalb des Shares
+      bleiben. Beim Aendern wird eine vorhandene Datei an den neuen Ort verschoben.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Ablage</h2>
+    <div class="row">
+      <div>
+        <label>Fallback-Ordner (kein Treffer)</label>
+        <input type="text" name="fallback_folder" value="{{ settings.fallback_folder }}">
+      </div>
+      <div>
+        <label>Quarantaene-Ordner (gesperrte Dateitypen)</label>
+        <input type="text" name="quarantine_folder" value="{{ settings.quarantine_folder }}">
+      </div>
+      <div>
+        <label>Praefix im Dateinamen</label>
+        <select name="filename_prefix">
+          {% for value, text in [('date_sender','Datum + Absender'),('date','Nur Datum'),('sender','Nur Absender'),('none','Kein Praefix')] %}
+            <option value="{{ value }}" {{ 'selected' if settings.filename_prefix == value }}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p style="margin-top:10px">
+      <label class="hint">
+        <input type="checkbox" name="match_body" {{ 'checked' if settings.match_body }}>
+        Auch den Mailtext nach Stichwoertern durchsuchen (sonst nur Dateiname und Betreff)
+      </label>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Abruf und Grenzwerte</h2>
+    <div class="row">
+      <div>
+        <label>Abrufintervall (Sekunden)</label>
+        <input type="number" name="poll_interval" value="{{ settings.poll_interval }}" min="1">
+      </div>
+      <div>
+        <label>Max. Groesse je Anhang (MB)</label>
+        <input type="number" name="max_attachment_size_mb" value="{{ settings.max_attachment_size_mb }}" min="1">
+      </div>
+      <div>
+        <label>Max. Groesse je Mail (MB)</label>
+        <input type="number" name="max_message_size_mb" value="{{ settings.max_message_size_mb }}" min="1">
+      </div>
+      <div>
+        <label>Max. Anhaenge je Mail</label>
+        <input type="number" name="max_attachments_per_message" value="{{ settings.max_attachments_per_message }}" min="1">
+      </div>
+    </div>
+    <p class="hint">
+      Die Grenzwerte begrenzen, was eine einzelne Mail an Speicher und Plattenplatz
+      verursachen kann. Die Liste gesperrter Dateiendungen wird ueber die
+      Umgebungsvariable <code>BLOCKED_EXTENSIONS</code> gesetzt.
+    </p>
+  </div>
+
+  <button class="primary">Einstellungen speichern</button>
+</form>
+{% endblock %}

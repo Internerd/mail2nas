@@ -77,6 +77,18 @@ class Config:
     state_db_path: str
     dry_run: bool
 
+    # Which configured mail account this instance archives for. Rules in
+    # mapping.yaml can be limited to a single account by this id.
+    account_id: str = "default"
+
+    # Web configuration UI. Disabled unless a password is set, because the
+    # page can read and change IMAP credentials.
+    web_enabled: bool = False
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    web_user: str = "admin"
+    web_password: str = ""
+
     @classmethod
     def from_env(cls) -> "Config":
         try:
@@ -105,6 +117,11 @@ class Config:
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
+                web_enabled=_bool("WEB_ENABLED", True),
+                web_host=os.environ.get("WEB_HOST", "0.0.0.0"),
+                web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
+                web_user=os.environ.get("WEB_USER", "admin"),
+                web_password=os.environ.get("WEB_PASSWORD", ""),
             )
         except KeyError as exc:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc

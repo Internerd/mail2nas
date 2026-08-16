@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mail2nas - Anmeldung</title>
+<style>
+  :root { --bg:#f5f6f8; --fg:#1d2129; --muted:#6b7280; --line:#d8dbe0; --card:#fff;
+          --accent:#2d6cdf; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0a6; --line:#333840; --card:#1e2126;
+            --accent:#6ea3ff; --err:#f2a9a2; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; padding:20px; }
+  form { background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:24px; width:100%; max-width:340px; }
+  h1 { font-size:17px; margin:0 0 18px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 3px; }
+  input { width:100%; padding:8px; border:1px solid var(--line); border-radius:5px;
+          background:var(--bg); color:var(--fg); font:inherit; }
+  button { width:100%; margin-top:18px; padding:9px; border-radius:5px; border:none;
+           background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  .flash { margin-top:14px; padding:8px 10px; border-radius:6px;
+           background:rgba(179,38,30,.12); color:var(--err); font-size:14px; }
+</style>
+</head>
+<body>
+<form method="post">
+  <h1>mail2nas</h1>
+  <label for="user">Benutzer</label>
+  <input id="user" type="text" name="user" autocomplete="username" autofocus required>
+  <label for="password">Passwort</label>
+  <input id="password" type="password" name="password" autocomplete="current-password" required>
+  <button>Anmelden</button>
+  {% with messages = get_flashed_messages() %}
+    {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
+  {% endwith %}
+</form>
+</body>
+</html>

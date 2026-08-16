@@ -19,7 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DELIMITER = "MAIL2NAS_EOF"
 
-DIRECTORIES = ("mail2nas", "config", "tests")
+DIRECTORIES = ("mail2nas", "mail2nas/templates", "config", "tests")
 
 # Empty marker files - written with `touch` rather than an empty heredoc.
 TOUCH_FILES = ("mail2nas/__init__.py", "tests/__init__.py")
@@ -37,12 +37,22 @@ EMBEDDED_FILES = (
     "mail2nas/filenames.py",
     "mail2nas/state.py",
     "mail2nas/archiver.py",
+    "mail2nas/settings.py",
+    "mail2nas/runner.py",
+    "mail2nas/web.py",
     "mail2nas/main.py",
+    "mail2nas/templates/base.html",
+    "mail2nas/templates/login.html",
+    "mail2nas/templates/rules.html",
+    "mail2nas/templates/accounts.html",
+    "mail2nas/templates/settings.html",
     "tests/test_mapping.py",
     "tests/test_filenames.py",
     "tests/test_archiver.py",
     "tests/test_config.py",
     "tests/test_main.py",
+    "tests/test_settings.py",
+    "tests/test_web.py",
 )
 
 HEADER = """\

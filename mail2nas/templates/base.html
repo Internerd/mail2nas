@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mail2nas</title>
+<style>
+  :root { --bg:#f5f6f8; --fg:#1d2129; --muted:#6b7280; --line:#d8dbe0;
+          --card:#fff; --accent:#2d6cdf; --err:#b3261e; --ok:#1b6b3a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0a6; --line:#333840;
+            --card:#1e2126; --accent:#6ea3ff; --err:#f2a9a2; --ok:#7bd3a0; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:0 16px;
+           display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:14px 0; }
+  nav a { color:var(--fg); text-decoration:none; padding:16px 4px; display:inline-block;
+          border-bottom:2px solid transparent; }
+  nav a.active { border-bottom-color:var(--accent); }
+  main { max-width:960px; margin:0 auto; padding:20px 16px 60px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:16px; margin-bottom:18px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line);
+          vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  input[type=text],input[type=password],input[type=number],select {
+    width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:5px;
+    background:var(--bg); color:var(--fg); font:inherit; }
+  button { font:inherit; padding:6px 12px; border-radius:5px; border:1px solid var(--line);
+           background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.icon { padding:4px 9px; line-height:1.1; }
+  button.danger { color:var(--err); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1 1 160px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:3px; }
+  .flash { padding:9px 12px; border-radius:6px; margin-bottom:12px; }
+  .flash.error { background:rgba(179,38,30,.12); color:var(--err); }
+  .flash.ok { background:rgba(27,107,58,.12); color:var(--ok); }
+  .hint { color:var(--muted); font-size:13px; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; font-size:13px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .dot.up { background:var(--ok); } .dot.down { background:var(--err); }
+  .inline { display:inline; }
+  .prio { color:var(--muted); font-variant-numeric:tabular-nums; width:2em; }
+  @media (max-width:640px) { table, thead, tbody, th, td, tr { display:block; }
+    thead { display:none; } td { border:none; padding:4px 0; }
+    tr { border-bottom:1px solid var(--line); padding:10px 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>mail2nas</h1>
+  <nav>
+    <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint=='index' }}">Zuordnungen</a>
+    <a href="{{ url_for('accounts_page') }}" class="{{ 'active' if request.endpoint=='accounts_page' }}">Mailkonten</a>
+    <a href="{{ url_for('settings_page') }}" class="{{ 'active' if request.endpoint=='settings_page' }}">Einstellungen</a>
+  </nav>
+  <form method="post" action="{{ url_for('logout') }}" style="margin-left:auto">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button>Abmelden</button>
+  </form>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

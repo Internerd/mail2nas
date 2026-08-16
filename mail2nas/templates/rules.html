@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% if status %}
+<div class="card">
+  <h2>Status</h2>
+  {% for s in status %}
+    <div><span class="dot {{ 'up' if s.alive else 'down' }}"></span>{{ s.label }}
+      {% if s.error %}<span class="hint">- letzter Fehler: {{ s.error }}</span>{% endif %}
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Zuordnungen</h2>
+  <p class="hint">
+    Die <strong>Reihenfolge bestimmt die Prioritaet</strong>: die erste passende Regel gewinnt.
+    Mit den Pfeilen verschieben. Gross-/Kleinschreibung ist egal.
+    Platzhalter moeglich: <code>*</code> (beliebig viele Zeichen), <code>?</code> (ein Zeichen) -
+    z. B. <code>Rechnung*</code>. Ohne Platzhalter wird als Teilstring gesucht.
+    Geprueft wird zuerst der Dateiname jedes Anhangs, dann Betreff (und Mailtext, falls aktiviert).
+  </p>
+  <p class="hint">Datei: <code>{{ mapping_path }}</code></p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Stichwort / Muster</th><th>Zielordner</th><th>Konto</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for rule in rules %}
+      <tr>
+        <td class="prio">{{ loop.index }}</td>
+        <td colspan="3">
+          <form method="post" action="{{ url_for('rule_update', index=loop.index0) }}" class="row">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div><input type="text" name="match" value="{{ rule.match }}" required></div>
+            <div><input type="text" name="folder" value="{{ rule.folder }}" required></div>
+            <div>
+              <select name="account">
+                <option value="{{ ALL_ACCOUNTS }}" {{ 'selected' if rule.account == ALL_ACCOUNTS }}>Alle Konten</option>
+                {% for a in accounts %}
+                  <option value="{{ a.id }}" {{ 'selected' if rule.account == a.id }}>{{ a.display_name() }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+          </form>
+        </td>
+        <td style="white-space:nowrap">
+          <form method="post" action="{{ url_for('rule_move', index=loop.index0, direction='up') }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon" title="Nach oben" {{ 'disabled' if loop.first }}>&uarr;</button>
+          </form>
+          <form method="post" action="{{ url_for('rule_move', index=loop.index0, direction='down') }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon" title="Nach unten" {{ 'disabled' if loop.last }}>&darr;</button>
+          </form>
+          <form method="post" action="{{ url_for('rule_delete', index=loop.index0) }}" class="inline"
+                onsubmit="return confirm('Zuordnung „{{ rule.match }}“ wirklich loeschen?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="icon danger" title="Loeschen">&times;</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="hint">Noch keine Zuordnungen. Alle Anhaenge landen im Fallback-Ordner.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Neue Zuordnung</h2>
+  <form method="post" action="{{ url_for('rule_add') }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div>
+      <label>Stichwort / Muster</label>
+      <input type="text" name="match" placeholder="z. B. Rechnung*" required>
+    </div>
+    <div>
+      <label>Zielordner</label>
+      <input type="text" name="folder" placeholder="z. B. rechnungen" required>
+    </div>
+    <div>
+      <label>Gilt fuer</label>
+      <select name="account">
+        <option value="{{ ALL_ACCOUNTS }}">Alle Konten</option>
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.display_name() }}</option>{% endfor %}
+      </select>
+    </div>
+    <div style="flex:0 0 auto"><button class="primary">Hinzufuegen</button></div>
+  </form>
+  <p class="hint">Neue Zuordnungen landen am Ende der Liste, also mit der niedrigsten Prioritaet.</p>
+</div>
+
+{% endblock %}

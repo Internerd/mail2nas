@@ -1,32 +1,64 @@
 # Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
-# (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
+# (bzw. an den Pfad, der in den Einstellungen hinterlegt ist).
 #
-# Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
-# Aenderungen wirken also ohne Neustart/Redeploy.
+# Bequemer geht es ueber die Weboberflaeche: dort lassen sich Zuordnungen
+# anlegen, mit Pfeilen in der Prioritaet verschieben und einem Mailkonto
+# zuordnen. Diese Datei ist einfach das, was dabei gespeichert wird.
 #
-# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
-#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
-#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
-#                 als Fallback, falls der Dateiname selbst nichts hergibt
-#              Gross-/Kleinschreibung ist egal.
-# Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+# Sie wird bei jedem Verarbeitungszyklus neu eingelesen - Aenderungen von Hand
+# wirken also ohne Neustart.
 #
-# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
-# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
-# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
-# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
-# nicht beide im selben).
+# --- Wie eine Regel geprueft wird -------------------------------------------
 #
-# Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
-# "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
+# REIHENFOLGE = PRIORITAET: Die erste passende Regel gewinnt. Deshalb steht
+# "Rechnungskorrektur" hier vor "RE" - andersherum wuerde bereits "RE" greifen.
+#
+# match   - Stichwort. Gross-/Kleinschreibung ist immer egal.
+#           Enthaelt es * oder ?, wird es als Platzhalter gegen den GANZEN Text
+#           geprueft:  *  = beliebig viele Zeichen,  ? = genau ein Zeichen.
+#             "Rechnung*"  passt auf "rechnung_4711.pdf", nicht auf "meine rechnung"
+#             "*Rechnung*" passt auf beides
+#             "RE-????"    passt auf "RE-2024", nicht auf "RE-24"
+#           Ohne Platzhalter wird als Teilstring gesucht (wie bisher).
+# folder  - Zielordner relativ zur Wurzel des Shares. Unterordner erlaubt
+#           ("rechnungen/2026"), ausserhalb des Shares nicht.
+# account - "all" oder die id eines einzelnen Mailkontos. Die ids stehen in
+#           der Weboberflaeche unter "Mailkonten".
+#
+# Geprueft wird zuerst der Dateiname jedes einzelnen Anhangs, danach Betreff
+# (und Mailtext, falls MATCH_BODY aktiviert ist). Dadurch koennen mehrere
+# unterschiedlich benannte Anhaenge derselben Mail in verschiedenen Ordnern
+# landen.
 
-RE: rechnungen
-Rechnung: rechnungen
-Invoice: rechnungen
-LS: lieferscheine
-Lieferschein: lieferscheine
-Lieferung: lieferscheine
-AB: auftragsbestaetigungen
-Auftragsbestaetigung: auftragsbestaetigungen
-Mahnung: mahnungen
-Gutschrift: gutschriften
+version: 2
+rules:
+  - match: Rechnungskorrektur
+    folder: korrekturen
+    account: all
+  - match: Gutschrift
+    folder: gutschriften
+    account: all
+  - match: Mahnung
+    folder: mahnungen
+    account: all
+  - match: Lieferschein
+    folder: lieferscheine
+    account: all
+  - match: Auftragsbestaetigung
+    folder: auftragsbestaetigungen
+    account: all
+  - match: Rechnung
+    folder: rechnungen
+    account: all
+  - match: Invoice
+    folder: rechnungen
+    account: all
+  - match: RE
+    folder: rechnungen
+    account: all
+  - match: LS
+    folder: lieferscheine
+    account: all
+  - match: AB
+    folder: auftragsbestaetigungen
+    account: all

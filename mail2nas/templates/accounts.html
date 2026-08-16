@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% macro account_form(a=None, title='Neues Mailkonto') %}
+  <form method="post" action="{{ url_for('account_save') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="id" value="{{ a.id if a else '' }}">
+    <div class="row">
+      <div>
+        <label>Bezeichnung</label>
+        <input type="text" name="label" value="{{ a.label if a else '' }}" placeholder="z. B. Buchhaltung">
+      </div>
+      <div>
+        <label>IMAP-Server</label>
+        <input type="text" name="host" value="{{ a.host if a else '' }}" placeholder="imap.example.com" required>
+      </div>
+      <div style="flex:0 0 90px">
+        <label>Port</label>
+        <input type="number" name="port" value="{{ a.port if a else 993 }}" min="1" max="65535">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Benutzer</label>
+        <input type="text" name="user" value="{{ a.user if a else '' }}" required>
+      </div>
+      <div>
+        <label>Passwort {% if a %}<span class="hint">(leer = unveraendert)</span>{% endif %}</label>
+        <input type="password" name="password" autocomplete="new-password" {{ 'required' if not a }}>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Zu ueberwachender Ordner</label>
+        <input type="text" name="folder" value="{{ a.folder if a else 'INBOX' }}">
+      </div>
+      <div>
+        <label>Verarbeitete Mails verschieben nach</label>
+        <input type="text" name="processed_folder" value="{{ a.processed_folder if a else '' }}" placeholder="leer = nur als gelesen markieren">
+      </div>
+      <div>
+        <label>Zu grosse Mails verschieben nach</label>
+        <input type="text" name="oversized_folder" value="{{ a.oversized_folder if a else '' }}" placeholder="optional">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 150px">
+        <label>Abrufmodus</label>
+        <select name="mode">
+          <option value="poll" {{ 'selected' if not a or a.mode == 'poll' }}>Polling</option>
+          <option value="idle" {{ 'selected' if a and a.mode == 'idle' }}>IDLE (Push)</option>
+        </select>
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:6px">
+        <label>&nbsp;</label>
+        <label class="hint"><input type="checkbox" name="ssl" {{ 'checked' if not a or a.ssl }}> TLS/SSL</label>
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:6px">
+        <label>&nbsp;</label>
+        <label class="hint"><input type="checkbox" name="enabled" {{ 'checked' if not a or a.enabled }}> Aktiv</label>
+      </div>
+      <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+    </div>
+  </form>
+{% endmacro %}
+
+{% block content %}
+
+{% for a in accounts %}
+  <div class="card">
+    <h2>
+      {% for s in status %}{% if s.id == a.id %}<span class="dot {{ 'up' if s.alive else 'down' }}"></span>{% endif %}{% endfor %}
+      {{ a.display_name() }}
+      <span class="hint">- id: <code>{{ a.id }}</code></span>
+    </h2>
+    {{ account_form(a) }}
+    <form method="post" action="{{ url_for('account_delete', account_id=a.id) }}" style="margin-top:10px"
+          onsubmit="return confirm('Konto „{{ a.display_name() }}“ wirklich loeschen? Daran gebundene Zuordnungen gelten danach fuer alle Konten.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger">Konto loeschen</button>
+    </form>
+  </div>
+{% endfor %}
+
+<div class="card">
+  <h2>Neues Mailkonto</h2>
+  {{ account_form() }}
+  <p class="hint">
+    Nach dem Speichern kannst du jede Zuordnung ueber das Dropdown auf ein einzelnes
+    Konto begrenzen - oder auf „Alle Konten“ stehen lassen.
+  </p>
+</div>
+
+{% endblock %}
