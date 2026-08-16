@@ -1,0 +1,17 @@
+# Override for STORAGE_BACKEND=local: bind an already-mounted share into the
+# container. Use it only if the share is mounted by the OS anyway (host fstab,
+# or a Proxmox bind mount into the LXC) - with the default SMB backend no
+# mount, and therefore no override, is needed.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Note this is a plain bind mount of an already-mounted directory, never
+# Docker's cifs volume driver: that driver issues the mount() syscall itself,
+# which the kernel refuses from inside an unprivileged LXC.
+services:
+  mail2nas:
+    environment:
+      STORAGE_BACKEND: local
+      STORAGE_ROOT: /mnt/nas
+    volumes:
+      - ${NAS_PATH:-/mnt/nas}:/mnt/nas

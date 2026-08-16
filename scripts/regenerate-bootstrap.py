@@ -31,8 +31,10 @@ EMBEDDED_FILES = (
     ".dockerignore",
     "Dockerfile",
     "docker-compose.yml",
+    "docker-compose.local.yml",
     "config/mapping.example.yaml",
     "mail2nas/config.py",
+    "mail2nas/storage.py",
     "mail2nas/mapping.py",
     "mail2nas/filenames.py",
     "mail2nas/state.py",
@@ -42,7 +44,7 @@ EMBEDDED_FILES = (
     "tests/test_filenames.py",
     "tests/test_archiver.py",
     "tests/test_config.py",
-    "tests/test_main.py",
+    "tests/test_storage.py",
 )
 
 HEADER = """\

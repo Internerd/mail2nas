@@ -137,69 +137,24 @@ SMB_SHARE="$(input 'SMB-Freigabename' 'Belege')"
 SMB_USER="$(input 'SMB-Benutzer (mit Schreibrechten auf die Zielordner)' 'mail2nas')"
 SMB_PASSWORD="$(password 'SMB-Passwort')"
 SMB_DOMAIN="$(input 'SMB-Domain/Workgroup (leer lassen falls keine)' 'WORKGROUP')"
+SMB_ROOT="$(input 'Unterordner innerhalb der Freigabe (leer = Wurzel der Freigabe)' '')"
 
-MAPPING_PATH="$(input 'Pfad zur mapping.yaml relativ zur Freigabe' 'mapping.yaml')"
+MAPPING_PATH="$(input 'Pfad zur mapping.yaml relativ zur Archiv-Wurzel' 'mapping.yaml')"
 FALLBACK_FOLDER="$(input 'Fallback-Ordner ohne Mapping-Treffer' 'unsorted')"
 
-# --- SMB-Share auf dem HOST einbinden -------------------------------------
+# --- Hinweis: kein Mount, weder auf dem Host noch im Container -------------
 #
-# Bewusst nicht im Container: Dockers cifs-Volume-Treiber setzt den
-# mount()-Syscall selbst ab, und den verweigert der Kernel innerhalb einer
-# unprivilegierten LXC ("invalid argument"). Ausserdem blieben die
-# SMB-Zugangsdaten so in den Volume-Metadaten des Docker-Daemons stehen.
-# Stattdessen: Host mountet das Share, die LXC bekommt es per Bind-Mount.
-
-HOST_MOUNT="/mnt/mail2nas-${CTID}"
-CRED_FILE="/etc/mail2nas-smb-credentials-${CTID}"
-
-# uid/gid, unter der die Dateien im Container erscheinen sollen. Das Image
-# laeuft als uid 1000; in einer unprivilegierten LXC ist das auf dem Host
-# uid 100000+1000, weil Proxmox den Namespace ab 100000 abbildet.
-if [ "$UNPRIVILEGED" -eq 1 ]; then
-  MOUNT_UID=101000
-else
-  MOUNT_UID=1000
-fi
-
-echo "==> SMB-Share auf dem Host einbinden ($HOST_MOUNT) ..."
-if ! command -v mount.cifs >/dev/null 2>&1; then
-  apt-get update -qq && apt-get install -y cifs-utils
-fi
-
-umask 077
-cat > "$CRED_FILE" <<CREDEOF
-username=${SMB_USER}
-password=${SMB_PASSWORD}
-CREDEOF
-# Eine leere domain=-Zeile lassen manche Server/Kernel-Versionen scheitern,
-# daher nur schreiben, wenn tatsaechlich eine gesetzt ist.
-[ -n "$SMB_DOMAIN" ] && echo "domain=${SMB_DOMAIN}" >> "$CRED_FILE"
-chmod 600 "$CRED_FILE"
-
-mkdir -p "$HOST_MOUNT"
-
-FSTAB_LINE="//${SMB_HOST}/${SMB_SHARE} ${HOST_MOUNT} cifs credentials=${CRED_FILE},uid=${MOUNT_UID},gid=${MOUNT_UID},file_mode=0660,dir_mode=0770,vers=3.0,_netdev,nofail 0 0"
-if ! grep -qF " ${HOST_MOUNT} cifs " /etc/fstab 2>/dev/null; then
-  cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)"
-  echo "$FSTAB_LINE" >> /etc/fstab
-  echo "    fstab-Eintrag ergaenzt (Sicherung unter /etc/fstab.bak.*)"
-else
-  echo "    fstab-Eintrag fuer $HOST_MOUNT existiert bereits - unveraendert"
-fi
-
-mountpoint -q "$HOST_MOUNT" || mount "$HOST_MOUNT"
-
-if ! mountpoint -q "$HOST_MOUNT"; then
-  echo >&2
-  echo "FEHLER: //${SMB_HOST}/${SMB_SHARE} konnte nicht auf $HOST_MOUNT gemountet werden." >&2
-  echo "Haeufige Ursachen: falsche Zugangsdaten, Share-Name mit anderer Gross-/" >&2
-  echo "Kleinschreibung, oder der Server verlangt eine andere SMB-Version." >&2
-  echo "Manuell testen (andere Version probieren):" >&2
-  echo "  mount -t cifs //${SMB_HOST}/${SMB_SHARE} $HOST_MOUNT -o credentials=$CRED_FILE,vers=2.1" >&2
-  echo "Danach ggf. vers= in /etc/fstab anpassen und dieses Skript erneut starten." >&2
-  exit 1
-fi
-echo "    Mount erfolgreich."
+# mail2nas spricht SMB direkt aus der Anwendung heraus. Damit entfaellt der
+# frueher noetige Umweg ueber /etc/fstab auf dem Proxmox-Host:
+#
+#   - In einer unprivilegierten LXC verweigert der Kernel CIFS-Mounts
+#     grundsaetzlich (CIFS ist nicht als FS_USERNS_MOUNT markiert), egal ob
+#     per mount.cifs oder per Docker-Volume-Treiber.
+#   - Ein Host-Mount waere dagegen fuer jeden mit Root-Shell auf dem Node
+#     sichtbar gewesen, und die SMB-Zugangsdaten haetten in einer Datei auf
+#     dem Host liegen muessen.
+#
+# Die Zugangsdaten landen jetzt ausschliesslich in der .env der Ziel-LXC.
 
 msg "Alle Eingaben erfasst.
 
@@ -217,7 +172,6 @@ pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
   --unprivileged "$UNPRIVILEGED" \
   --features "nesting=1,keyctl=1" \
-  --mp0 "${HOST_MOUNT},mp=/mnt/nas" \
   --onboot 1 \
   --start 1
 
@@ -247,7 +201,13 @@ IMAP_PASSWORD=$(sq "$IMAP_PASSWORD")
 IMAP_FOLDER=$(sq "$IMAP_FOLDER")
 IMAP_MODE=$(sq "$IMAP_MODE")
 POLL_INTERVAL_SECONDS=$(sq "$POLL_INTERVAL_SECONDS")
-NAS_PATH='/mnt/nas'
+STORAGE_BACKEND='smb'
+SMB_HOST=$(sq "$SMB_HOST")
+SMB_SHARE=$(sq "$SMB_SHARE")
+SMB_USER=$(sq "$SMB_USER")
+SMB_PASSWORD=$(sq "$SMB_PASSWORD")
+SMB_DOMAIN=$(sq "$SMB_DOMAIN")
+SMB_ROOT=$(sq "$SMB_ROOT")
 MAPPING_PATH=$(sq "$MAPPING_PATH")
 FALLBACK_FOLDER=$(sq "$FALLBACK_FOLDER")
 MAIL2NAS_REPO_URL=$(sq "$REPO_URL")
@@ -272,11 +232,9 @@ FINAL_MSG="Fertig!
 
 Container $CTID ($CT_HOSTNAME) laeuft unter ${CT_IP:-<unbekannt>}.
 
-Das Share //${SMB_HOST}/${SMB_SHARE} ist auf dem Host unter $HOST_MOUNT eingebunden (Eintrag in /etc/fstab) und als /mnt/nas in den Container durchgereicht. Die SMB-Zugangsdaten liegen nur auf dem Host in $CRED_FILE (chmod 600), nicht im Container.
+mail2nas schreibt direkt per SMB auf //${SMB_HOST}/${SMB_SHARE} - es ist nichts gemountet, weder auf dem Proxmox-Host noch im Container. Die SMB-Zugangsdaten stehen ausschliesslich in /opt/mail2nas/.env innerhalb der LXC (chmod 600).
 
-Naechster Schritt - Mapping-Datei anlegen, direkt vom Host aus:
-  cp /var/lib/lxc/$CTID/rootfs/opt/mail2nas/config/mapping.example.yaml $HOST_MOUNT/mapping.yaml 2>/dev/null || pct exec $CTID -- cp /opt/mail2nas/config/mapping.example.yaml /mnt/nas/mapping.yaml
-  nano $HOST_MOUNT/mapping.yaml
+Naechster Schritt - Mapping-Datei auf der Freigabe anlegen (vom NAS oder einem Windows-Rechner aus): config/mapping.example.yaml aus dem Repo als mapping.yaml in die Wurzel der Freigabe kopieren und an die eigenen Stichwoerter anpassen. Ohne diese Datei landet alles im Fallback-Ordner '${FALLBACK_FOLDER}'.
 
 Logs pruefen:
   pct exec $CTID -- bash -c 'cd /opt/mail2nas && docker compose logs -f'

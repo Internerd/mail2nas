@@ -7,6 +7,7 @@ from mail2nas.archiver import Archiver
 from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
+from mail2nas.storage import LocalStorage
 
 
 def _make_config(tmp_path, **overrides) -> Config:
@@ -21,7 +22,16 @@ def _make_config(tmp_path, **overrides) -> Config:
         imap_oversized_folder=None,
         imap_mode="poll",
         poll_interval=60,
+        storage_backend="local",
         storage_root=str(tmp_path),
+        smb_host="",
+        smb_share="",
+        smb_user="",
+        smb_password="",
+        smb_domain="",
+        smb_port=445,
+        smb_root="",
+        smb_encrypt=True,
         mapping_path="mapping.yaml",
         fallback_folder="unsorted",
         match_body=False,
@@ -49,9 +59,10 @@ def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overri
     mapping_path = tmp_path / "mapping.yaml"
     if mapping_content is not None:
         _write_mapping(mapping_path, mapping_content)
-    mapping = Mapping(str(mapping_path), config.fallback_folder)
+    storage = LocalStorage(config.storage_root)
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store)
+    return Archiver(config, mapping, store, storage)
 
 
 class FakeIMAPClient:
@@ -313,11 +324,12 @@ def test_process_message_confines_absolute_traversal_target(tmp_path):
     assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
 
 
-def test_target_dir_rejects_escape_and_uses_fallback(tmp_path):
+def test_target_parts_reject_escape_and_use_fallback(tmp_path):
     archiver = _make_archiver(tmp_path)
 
-    assert archiver._target_dir("../evil") == tmp_path / "unsorted"
-    assert archiver._target_dir("rechnungen") == tmp_path / "rechnungen"
+    assert archiver._target_parts("../evil") == ("unsorted",)
+    assert archiver._target_parts("rechnungen") == ("rechnungen",)
+    assert archiver._target_parts("rechnungen/2026") == ("rechnungen", "2026")
 
 
 def test_nested_mapping_target_is_supported(tmp_path):

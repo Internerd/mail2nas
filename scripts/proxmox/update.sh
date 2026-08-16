@@ -72,9 +72,21 @@ else
   echo "==> Aktualisiert: $BEFORE -> $AFTER"
 fi
 
+# Das Backend steht in der .env. Fehlt der Eintrag, stammt die Installation
+# aus einer Version vor dem SMB-Backend und schreibt in ein gemountetes
+# Verzeichnis - dann muss der Bind-Mount aus docker-compose.local.yml erhalten
+# bleiben, sonst landen die Anhaenge nach dem Update im Container-Dateisystem.
+ENV_BACKEND="$(sed -n 's/^STORAGE_BACKEND=//p' .env | tail -1 | tr -d "\"' ")"
+STORAGE_BACKEND="${ENV_BACKEND:-local}"
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ "$STORAGE_BACKEND" = "local" ]; then
+  COMPOSE_FILES+=(-f docker-compose.local.yml)
+fi
+echo "==> Storage-Backend laut .env: $STORAGE_BACKEND"
+
 echo "==> Neu bauen und starten (--pull, damit auch das Basis-Image aktualisiert wird) ..."
-docker compose build --pull
-docker compose up -d
+docker compose "${COMPOSE_FILES[@]}" build --pull
+docker compose "${COMPOSE_FILES[@]}" up -d
 
 echo "==> Aufraeumen alter, nicht mehr referenzierter Images ..."
 docker image prune -f >/dev/null 2>&1 || true

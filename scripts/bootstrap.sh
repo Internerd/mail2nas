@@ -28,6 +28,7 @@ echo "Schreibe Projektdateien nach $TARGET ..."
 cat > requirements.txt <<'MAIL2NAS_EOF'
 imapclient>=3.0,<4.0
 PyYAML>=6.0,<7.0
+smbprotocol>=1.15,<2.0
 MAIL2NAS_EOF
 
 # --- requirements-dev.txt ---
@@ -67,25 +68,43 @@ IMAP_MODE=idle
 POLL_INTERVAL_SECONDS=300
 
 # --- Target SMB share ----------------------------------------------------
-# Das SMB-Share wird NICHT von Docker gemountet, sondern vom Betriebssystem:
-# auf dem Proxmox-Host per /etc/fstab und dann per Bind-Mount in die LXC
-# (so macht es scripts/proxmox/mail2nas.sh), oder bei einer VM/Bare-Metal
-# direkt per /etc/fstab in diesem System.
-#
-# Grund: Dockers cifs-Volume-Treiber setzt den mount()-Syscall selbst ab. Der
-# ist in einer unprivilegierten LXC kernelseitig gesperrt ("invalid argument"),
-# und die SMB-Zugangsdaten landen dabei in den Volume-Metadaten des Docker-
-# Daemons. Beides entfaellt, wenn das Share eine Ebene hoeher gemountet wird.
-#
-# Hier steht daher nur noch, WO das bereits gemountete Share liegt:
+# smb   = mail2nas spricht SMB direkt (empfohlen). Nichts wird gemountet,
+#         weder im Container noch auf dem Host - deshalb funktioniert es in
+#         einer unprivilegierten LXC, in der der Kernel CIFS-Mounts verweigert,
+#         und die Zugangsdaten bleiben in dieser .env statt auf dem Host.
+# local  = in ein bereits gemountetes Verzeichnis schreiben (STORAGE_ROOT).
+#         Nur noetig, wenn das Share ohnehin schon vom Betriebssystem
+#         eingebunden ist. Siehe docker-compose.local.yml.
+STORAGE_BACKEND=smb
+
+# Nur bei STORAGE_BACKEND=smb:
+SMB_HOST=nas.local
+SMB_SHARE=Belege
+SMB_USER=mail2nas
+SMB_PASSWORD=changeme
+# Domain/Workgroup - leer lassen, wenn der Server keine braucht.
+SMB_DOMAIN=
+SMB_PORT=445
+# Optionaler Unterordner innerhalb der Freigabe, unterhalb dessen alles
+# abgelegt wird. Leer = Wurzel der Freigabe.
+SMB_ROOT=
+# SMB3-Verschluesselung erzwingen. Auf false setzen, wenn der Server sie
+# ablehnt (aeltere NAS-Firmware, SMB 2.x).
+SMB_ENCRYPT=true
+
+# Nur bei STORAGE_BACKEND=local: Pfad des bereits gemounteten Shares im
+# Container. NAS_PATH sagt docker-compose.local.yml, welches Verzeichnis des
+# Docker-Hosts dorthin gebunden wird.
+STORAGE_ROOT=/mnt/nas
 NAS_PATH=/mnt/nas
 
 # --- Mapping & filing behaviour -------------------------------------------
-# Path to the mapping file, relative to the SMB share root (/mnt/nas).
+# Pfad zur Mapping-Datei, relativ zur Wurzel des Archivs (Freigabe bzw.
+# SMB_ROOT, oder STORAGE_ROOT beim local-Backend).
 # See config/mapping.example.yaml - copy it onto the share as mapping.yaml.
 # It is reloaded on every processing cycle, so edits apply without a restart.
 MAPPING_PATH=mapping.yaml
-# Subfolder (under /mnt/nas) used when no keyword in mapping.yaml matches.
+# Unterordner, der genutzt wird, wenn kein Stichwort aus mapping.yaml passt.
 FALLBACK_FOLDER=unsorted
 # Also search the mail body for keywords, not just the subject.
 MATCH_BODY=false
@@ -169,23 +188,38 @@ services:
     env_file:
       - .env
     environment:
-      STORAGE_ROOT: /mnt/nas
       STATE_DB_PATH: /data/state.db
     volumes:
-      # Plain bind mount of an already-mounted directory - the SMB share is
-      # mounted by the OS (host fstab, or the Proxmox host bind-mounted into
-      # the LXC), NOT by Docker.
-      #
-      # Docker's local volume driver with type=cifs issues the mount() syscall
-      # itself, which the kernel refuses from inside an unprivileged LXC
-      # ("invalid argument"), and it would also put the SMB password into the
-      # daemon's volume metadata. Mounting one level up avoids both.
-      - ${NAS_PATH:-/mnt/nas}:/mnt/nas
+      # Only local state (processed-message tracking) - the archive itself is
+      # reached over SMB by the application, so there is nothing to mount here.
+      # For STORAGE_BACKEND=local, add docker-compose.local.yml:
+      #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
       - state:/data
 
 volumes:
-  # Local state (processed-message tracking), no need for this to live on the share.
+  # Local state, no need for this to live on the share.
   state:
+MAIL2NAS_EOF
+
+# --- docker-compose.local.yml ---
+cat > docker-compose.local.yml <<'MAIL2NAS_EOF'
+# Override for STORAGE_BACKEND=local: bind an already-mounted share into the
+# container. Use it only if the share is mounted by the OS anyway (host fstab,
+# or a Proxmox bind mount into the LXC) - with the default SMB backend no
+# mount, and therefore no override, is needed.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Note this is a plain bind mount of an already-mounted directory, never
+# Docker's cifs volume driver: that driver issues the mount() syscall itself,
+# which the kernel refuses from inside an unprivileged LXC.
+services:
+  mail2nas:
+    environment:
+      STORAGE_BACKEND: local
+      STORAGE_ROOT: /mnt/nas
+    volumes:
+      - ${NAS_PATH:-/mnt/nas}:/mnt/nas
 MAIL2NAS_EOF
 
 # --- config/mapping.example.yaml ---
@@ -230,6 +264,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+from .filenames import safe_relative_parts
 
 # Executable/script types that are quarantined instead of filed normally,
 # even if their filename happens to match a mapping keyword. This is a
@@ -276,6 +312,25 @@ def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
     return value
 
 
+def _relative(name: str, default: str, allow_empty: bool = False) -> str:
+    """Read a setting that must stay inside the archive root."""
+    value = os.environ.get(name, default).strip()
+    if allow_empty and value in ("", "."):
+        return ""
+    try:
+        safe_relative_parts(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a path relative to the archive root: {exc}") from None
+    return value
+
+
+def _required(name: str, because: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(f"{name} is required {because}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     imap_host: str
@@ -289,7 +344,19 @@ class Config:
     imap_mode: str  # "idle" or "poll"
     poll_interval: int
 
+    # "smb" talks to the NAS directly (nothing mounted anywhere), "local"
+    # archives into an already-mounted directory at storage_root.
+    storage_backend: str
     storage_root: str
+    smb_host: str
+    smb_share: str
+    smb_user: str
+    smb_password: str
+    smb_domain: str
+    smb_port: int
+    smb_root: str
+    smb_encrypt: bool
+
     mapping_path: str
     fallback_folder: str
     match_body: bool
@@ -307,6 +374,12 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Defaults to "local" so an existing install whose .env predates this
+        # setting keeps working against its mounted share after an update;
+        # every install path writes the value explicitly.
+        backend = _choice("STORAGE_BACKEND", "local", ("smb", "local"))
+        smb = backend == "smb"
+        because = "when STORAGE_BACKEND=smb"
         try:
             return cls(
                 imap_host=os.environ["IMAP_HOST"],
@@ -319,8 +392,17 @@ class Config:
                 imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
                 imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
                 poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
+                storage_backend=backend,
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
-                mapping_path=os.environ.get("MAPPING_PATH", "mapping.yaml"),
+                smb_host=_required("SMB_HOST", because) if smb else "",
+                smb_share=_required("SMB_SHARE", because) if smb else "",
+                smb_user=_required("SMB_USER", because) if smb else "",
+                smb_password=_required("SMB_PASSWORD", because) if smb else "",
+                smb_domain=os.environ.get("SMB_DOMAIN", "").strip(),
+                smb_port=_int("SMB_PORT", "445", minimum=1, maximum=65535),
+                smb_root=_relative("SMB_ROOT", "", allow_empty=True),
+                smb_encrypt=_bool("SMB_ENCRYPT", True),
+                mapping_path=_relative("MAPPING_PATH", "mapping.yaml"),
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
                 filename_prefix=_choice(
@@ -338,28 +420,386 @@ class Config:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
 MAIL2NAS_EOF
 
+# --- mail2nas/storage.py ---
+cat > mail2nas/storage.py <<'MAIL2NAS_EOF'
+"""Where archived attachments end up.
+
+Two backends, same interface:
+
+* `LocalStorage` writes into a directory. Something else (host fstab, a
+  bind mount from the Proxmox host) has to have mounted the share there.
+* `SmbStorage` speaks SMB directly from this process. Nothing is mounted
+  anywhere, so it needs no mount privileges - which is what makes it work
+  inside an unprivileged LXC, where the kernel refuses to mount CIFS at all.
+
+The interface deliberately works on *path components* rather than on
+strings: the target folders come from `mapping.yaml` on the share and are
+untrusted, so they are validated once (`safe_relative_parts`) and then joined
+by the backend onto its own root - a local path or a UNC path.
+"""
+from __future__ import annotations
+
+import errno
+import logging
+import os
+import secrets
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from pathlib import Path
+
+from .filenames import safe_relative_parts, unique_path, write_atomic
+
+logger = logging.getLogger(__name__)
+
+TEMP_PREFIX = ".mail2nas-tmp-"
+
+
+class Storage(ABC):
+    """Backend-independent view of the archive target."""
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Human-readable location, for log lines and error messages."""
+
+    @abstractmethod
+    def check_writable(self) -> None:
+        """Verify archiving can actually work, or raise SystemExit.
+
+        Called once at startup. Without it, a share that is unreachable or
+        read-only is indistinguishable from an empty one, and attachments
+        would be written somewhere they silently disappear from.
+        """
+
+    @abstractmethod
+    def save_unique(self, parts: Sequence[str], filename: str, data: bytes) -> str:
+        """Write `data` to `<root>/<parts>/<filename>`, creating directories.
+
+        Never overwrites an existing file (a counter is appended instead) and
+        never leaves a partially written file under the final name. Returns
+        the full path that was written, for logging.
+        """
+
+    @abstractmethod
+    def read_text(self, relative: str) -> str:
+        """Read a UTF-8 text file relative to the root. Raises FileNotFoundError."""
+
+    @abstractmethod
+    def modified_time(self, relative: str) -> float:
+        """Modification time of a file relative to the root. Raises FileNotFoundError."""
+
+    @abstractmethod
+    def display(self, parts: Sequence[str], filename: str | None = None) -> str:
+        """Full path as it would be written, without touching the target."""
+
+    def close(self) -> None:
+        """Release connections, if the backend holds any."""
+
+
+class LocalStorage(Storage):
+    """Archive into an already-mounted directory."""
+
+    def __init__(self, root: str):
+        self._root = Path(root)
+
+    @property
+    def description(self) -> str:
+        return str(self._root)
+
+    def check_writable(self) -> None:
+        if not self._root.is_dir():
+            raise SystemExit(
+                f"STORAGE_ROOT {self._root} does not exist or is not a directory - "
+                "is the share mounted? (With STORAGE_BACKEND=smb no mount is needed.)"
+            )
+        if not os.access(self._root, os.W_OK | os.X_OK):
+            raise SystemExit(
+                f"STORAGE_ROOT {self._root} is not writable by uid {os.getuid()} - "
+                "check the mount options (uid/gid/file_mode) and the share permissions."
+            )
+
+    def save_unique(self, parts: Sequence[str], filename: str, data: bytes) -> str:
+        directory = self._root.joinpath(*parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        out_path = unique_path(directory, filename)
+        write_atomic(out_path, data)
+        return str(out_path)
+
+    def read_text(self, relative: str) -> str:
+        return self._resolve(relative).read_text(encoding="utf-8")
+
+    def modified_time(self, relative: str) -> float:
+        return self._resolve(relative).stat().st_mtime
+
+    def display(self, parts: Sequence[str], filename: str | None = None) -> str:
+        path = self._root.joinpath(*parts)
+        return str(path / filename) if filename else str(path)
+
+    def _resolve(self, relative: str) -> Path:
+        return self._root.joinpath(*safe_relative_parts(relative))
+
+
+class SmbStorage(Storage):
+    """Archive over SMB, without mounting the share anywhere.
+
+    Every operation goes through `_with_reconnect`: a NAS that reboots, drops
+    idle sessions or gets restarted mid-archive is normal in this deployment,
+    and the archiver is a long-running process. A failed call therefore gets
+    one retry on a fresh session before it is reported.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        share: str,
+        user: str,
+        password: str,
+        domain: str | None = None,
+        port: int = 445,
+        root: str = "",
+        encrypt: bool = True,
+    ):
+        self._host = host
+        self._share = share
+        self._user = user
+        self._password = password
+        self._domain = domain or None
+        self._port = port
+        self._encrypt = encrypt
+        self._root_parts = safe_relative_parts(root) if root.strip() else ()
+        self._connected = False
+        # smbclient keys its connection pool by "server:port" and defaults to
+        # 445 on every single call, so a non-default port has to be passed to
+        # each operation - not just to register_session, which would otherwise
+        # open a second (failing) connection on 445.
+        self._kwargs = {"port": self._port}
+
+    @property
+    def description(self) -> str:
+        # _unc() already prepends the root, so pass no extra components.
+        return self._display_unc(())
+
+    # --- session handling ---------------------------------------------------
+
+    def _connect(self) -> None:
+        if self._connected:
+            return
+        import smbclient
+
+        # smbprotocol wants the domain in the username, not as a separate
+        # argument. An empty domain must stay absent rather than become
+        # "\\user", which some servers reject outright.
+        username = f"{self._domain}\\{self._user}" if self._domain else self._user
+        smbclient.register_session(
+            self._host,
+            username=username,
+            password=self._password,
+            port=self._port,
+            encrypt=self._encrypt,
+        )
+        self._connected = True
+
+    def _reset(self) -> None:
+        self._connected = False
+        try:
+            import smbclient
+
+            # Short timeout: the usual reason for resetting is that the server
+            # stopped answering, and the default 60s wait for the logoff reply
+            # would stall the retry that is the whole point of resetting.
+            smbclient.delete_session(self._host, port=self._port, timeout=5)
+        except Exception:  # noqa: BLE001 - tearing down a broken session must not raise
+            logger.debug("Could not cleanly close the SMB session to %s", self._host, exc_info=True)
+
+    def _with_reconnect(self, operation: str, func):
+        """Run `func`, retrying once on a fresh session if it fails.
+
+        A missing file is a legitimate answer (the mapping file may not exist
+        yet), not a broken connection - those propagate without a reconnect,
+        so callers can still catch FileNotFoundError.
+        """
+        self._connect()
+        try:
+            return func()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ENOENT:
+                raise FileNotFoundError(str(exc)) from exc
+            logger.warning("SMB %s failed (%s) - reconnecting and retrying once", operation, exc)
+        except Exception as exc:  # noqa: BLE001 - smbprotocol raises non-OSError types too
+            logger.warning("SMB %s failed (%s) - reconnecting and retrying once", operation, exc)
+
+        self._reset()
+        self._connect()
+        try:
+            return func()
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ENOENT:
+                raise FileNotFoundError(str(exc)) from exc
+            raise
+
+    # --- paths ---------------------------------------------------------------
+
+    def _unc(self, parts: Sequence[str], filename: str | None = None) -> str:
+        segments = [*self._root_parts, *parts]
+        if filename:
+            segments.append(filename)
+        return "\\".join([f"\\\\{self._host}\\{self._share}", *segments])
+
+    def _display_unc(self, parts: Sequence[str], filename: str | None = None) -> str:
+        # Forward slashes in messages, matching how shares are written
+        # everywhere else in this project (//nas/Belege/rechnungen).
+        return self._unc(parts, filename).replace("\\", "/")
+
+    def display(self, parts: Sequence[str], filename: str | None = None) -> str:
+        return self._display_unc(parts, filename)
+
+    # --- operations ----------------------------------------------------------
+
+    def check_writable(self) -> None:
+        """Connect and write a probe file, so a broken setup fails at startup.
+
+        Deliberately a single combined check rather than a reachability test
+        followed by a write test: Samba refuses `stat` on a bare share root
+        even for users who may write to it, so the write is the only probe
+        that answers the question we actually care about.
+        """
+        probe = f"{TEMP_PREFIX}writetest-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            self._with_reconnect("write test", lambda: self._write_probe(probe))
+        except Exception as exc:  # noqa: BLE001 - turn any failure into an actionable message
+            where = " (below SMB_ROOT)" if self._root_parts else ""
+            raise SystemExit(
+                f"Cannot archive to {self.description} over SMB: {exc}\n"
+                "Check SMB_HOST/SMB_SHARE/SMB_USER/SMB_PASSWORD (and SMB_DOMAIN if your "
+                f"server needs one), and that this user may write to the share{where}. "
+                "If the server refuses encryption, set SMB_ENCRYPT=false."
+            ) from exc
+
+    def _write_probe(self, name: str) -> None:
+        import smbclient
+
+        self._ensure_dir(())
+        path = self._unc((), name)
+        with smbclient.open_file(path, mode="wb", **self._kwargs) as fh:
+            fh.write(b"mail2nas write test")
+        smbclient.remove(path, **self._kwargs)
+
+    def _ensure_dir(self, parts: Sequence[str]) -> None:
+        import smbclient
+
+        if not parts and not self._root_parts:
+            # The share root itself always exists - nothing to create.
+            return
+        smbclient.makedirs(self._unc(parts), exist_ok=True, **self._kwargs)
+
+    def save_unique(self, parts: Sequence[str], filename: str, data: bytes) -> str:
+        return self._with_reconnect("write", lambda: self._save_unique(parts, filename, data))
+
+    def _save_unique(self, parts: Sequence[str], filename: str, data: bytes) -> str:
+        import smbclient
+        import smbclient.path
+
+        self._ensure_dir(parts)
+
+        # Pick a free name. Single-writer assumption, same as the local
+        # backend: mail2nas is one process per share path.
+        target_name = filename
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        counter = 0
+        while smbclient.path.exists(self._unc(parts, target_name), **self._kwargs):
+            counter += 1
+            target_name = f"{stem}_{counter}{suffix}"
+
+        # Write to a temporary name and rename into place, so an interrupted
+        # transfer can never leave a truncated file under a name that looks
+        # like a complete invoice.
+        tmp_name = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
+        tmp_path = self._unc(parts, tmp_name)
+        target_path = self._unc(parts, target_name)
+        try:
+            with smbclient.open_file(tmp_path, mode="xb", **self._kwargs) as fh:
+                fh.write(data)
+            smbclient.replace(tmp_path, target_path, **self._kwargs)
+        except BaseException:
+            try:
+                smbclient.remove(tmp_path, **self._kwargs)
+            except Exception:  # noqa: BLE001 - cleanup of a failed write is best effort
+                logger.debug("Could not remove temporary file %s", tmp_path, exc_info=True)
+            raise
+
+        return self._display_unc(parts, target_name)
+
+    def read_text(self, relative: str) -> str:
+        parts = safe_relative_parts(relative)
+        return self._with_reconnect("read", lambda: self._read_text(parts))
+
+    def _read_text(self, parts: Sequence[str]) -> str:
+        import smbclient
+
+        with smbclient.open_file(
+            self._unc(parts[:-1], parts[-1]), mode="r", encoding="utf-8", **self._kwargs
+        ) as fh:
+            return fh.read()
+
+    def modified_time(self, relative: str) -> float:
+        parts = safe_relative_parts(relative)
+        return self._with_reconnect("stat", lambda: self._modified_time(parts))
+
+    def _modified_time(self, parts: Sequence[str]) -> float:
+        import smbclient
+
+        return smbclient.stat(self._unc(parts[:-1], parts[-1]), **self._kwargs).st_mtime
+
+    def close(self) -> None:
+        self._reset()
+
+
+def from_config(config) -> Storage:
+    """Build the storage backend described by the configuration."""
+    if config.storage_backend == "smb":
+        return SmbStorage(
+            host=config.smb_host,
+            share=config.smb_share,
+            user=config.smb_user,
+            password=config.smb_password,
+            domain=config.smb_domain,
+            port=config.smb_port,
+            root=config.smb_root,
+            encrypt=config.smb_encrypt,
+        )
+    return LocalStorage(config.storage_root)
+MAIL2NAS_EOF
+
 # --- mail2nas/mapping.py ---
 cat > mail2nas/mapping.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import yaml
+
+from .filenames import safe_relative_parts
+from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
 
 class Mapping:
-    """Keyword -> target-subfolder mapping, reloaded from disk on demand.
+    """Keyword -> target-subfolder mapping, reloaded on demand.
 
-    The mapping file is expected to live on the same SMB share the
-    attachments are archived to, so it can be edited by anyone with
-    access to the share without touching the container/deployment.
+    The mapping file lives on the same share the attachments are archived
+    to, so it can be edited by anyone with access to the share without
+    touching the container/deployment. It is read through the storage
+    backend, so it works the same whether the share is mounted or reached
+    over SMB directly.
     """
 
-    def __init__(self, path: str, fallback_folder: str):
-        self._path = Path(path)
+    def __init__(self, storage: Storage, relative_path: str, fallback_folder: str):
+        self._storage = storage
+        self._path = storage.display(safe_relative_parts(relative_path))
+        self._relative_path = relative_path
         self._fallback_folder = fallback_folder
         self._rules: list[tuple[str, str]] = []
         self._mtime: float | None = None
@@ -367,7 +807,7 @@ class Mapping:
 
     def reload(self, force: bool = False) -> None:
         try:
-            mtime = self._path.stat().st_mtime
+            mtime = self._storage.modified_time(self._relative_path)
         except FileNotFoundError:
             if force:
                 logger.warning(
@@ -375,6 +815,17 @@ class Mapping:
                 )
                 self._rules = []
                 self._mtime = None
+            return
+        except Exception as exc:  # noqa: BLE001 - a dropped share must not kill the loop
+            # With the SMB backend this is a network call, so it can fail for
+            # reasons that have nothing to do with the file itself. Keep the
+            # rules we already have; the next cycle tries again.
+            logger.warning(
+                "Could not check mapping file %s (%s) - keeping the previous %d rule(s)",
+                self._path,
+                exc,
+                len(self._rules),
+            )
             return
 
         if not force and self._mtime == mtime:
@@ -386,8 +837,7 @@ class Mapping:
         # propagate out of the IMAP loop and leave the service reconnecting in
         # a tight loop, archiving nothing at all until someone noticed.
         try:
-            with self._path.open("r", encoding="utf-8") as fh:
-                raw = yaml.safe_load(fh) or {}
+            raw = yaml.safe_load(self._storage.read_text(self._relative_path)) or {}
             if not isinstance(raw, dict):
                 raise ValueError("file must contain a mapping of keyword -> folder")
             rules = sorted(
@@ -456,21 +906,23 @@ def sanitize_path_segment(segment: str) -> str:
     return segment.strip().rstrip(". ").strip()
 
 
-def safe_join(root: str | Path, relative: str) -> Path:
-    """Join `relative` onto `root`, guaranteeing the result stays under `root`.
+def safe_relative_parts(relative: str) -> tuple[str, ...]:
+    """Split `relative` into validated, sanitized path components.
 
     The target folders come from `mapping.yaml`, which lives on the archive
     share itself - so whoever can edit that file could otherwise redirect
     attachments anywhere the process can write, via `../..` or an absolute
-    path. (Note `Path("/mnt/nas") / "/etc"` yields `/etc`: an absolute right
-    operand discards the root entirely.)
+    path.
 
     Absolute paths and `..` components are refused rather than reinterpreted,
     and every remaining component is sanitized. Nested targets such as
     "rechnungen/2026" stay supported. Raises ValueError if nothing usable is
     left, so the caller can fall back to a known-good folder.
+
+    Returning components rather than a joined path keeps this usable for both
+    storage backends: the local one joins them onto a filesystem root, the SMB
+    one onto a UNC path.
     """
-    root_path = Path(root)
     raw = str(relative).replace("\\", "/")
 
     if raw.strip().startswith("/"):
@@ -494,7 +946,18 @@ def safe_join(root: str | Path, relative: str) -> Path:
     if not parts:
         raise ValueError(f"Target folder is empty: {relative!r}")
 
-    result = root_path.joinpath(*parts)
+    return tuple(parts)
+
+
+def safe_join(root: str | Path, relative: str) -> Path:
+    """Join `relative` onto `root`, guaranteeing the result stays under `root`.
+
+    See `safe_relative_parts` for what is accepted. (Note `Path("/mnt/nas") /
+    "/etc"` yields `/etc`: an absolute right operand discards the root
+    entirely - hence the validation rather than a plain join.)
+    """
+    root_path = Path(root)
+    result = root_path.joinpath(*safe_relative_parts(relative))
 
     # Belt and braces: the component filtering above already makes escaping
     # impossible, but verify containment lexically so any future change to the
@@ -598,14 +1061,14 @@ import logging
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
-from pathlib import Path
 
 from imapclient import IMAPClient
 
 from .config import Config
-from .filenames import safe_join, sanitize_filename, unique_path, write_atomic
+from .filenames import safe_relative_parts, sanitize_filename
 from .mapping import Mapping
 from .state import ProcessedStore
+from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -630,10 +1093,11 @@ def _extension_of(filename: str) -> str:
 
 
 class Archiver:
-    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore):
+    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore, storage: Storage):
         self.config = config
         self.mapping = mapping
         self.store = store
+        self.storage = storage
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.config.imap_host, port=self.config.imap_port, ssl=self.config.imap_ssl)
@@ -726,17 +1190,19 @@ class Archiver:
                 folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
                     filename, mail_folder, mail_keyword
                 )
-                target_dir = self._target_dir(folder_name)
+                target_parts = self._target_parts(folder_name)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if self.config.dry_run:
-                    logger.info("[dry-run] would save %s -> %s", out_name, target_dir)
+                    logger.info(
+                        "[dry-run] would save %s -> %s",
+                        out_name,
+                        self.storage.display(target_parts),
+                    )
                     continue
 
-                target_dir.mkdir(parents=True, exist_ok=True)
-                out_path = unique_path(target_dir, out_name)
-                write_atomic(out_path, payload)
-                saved.append(str(out_path))
+                out_path = self.storage.save_unique(target_parts, out_name, payload)
+                saved.append(out_path)
                 logger.info(
                     "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
                     uid,
@@ -754,25 +1220,25 @@ class Archiver:
                 client.move([uid], self.config.imap_processed_folder)
         return True
 
-    def _target_dir(self, folder_name: str) -> Path:
-        """Map a configured folder name onto a directory inside the storage root.
+    def _target_parts(self, folder_name: str) -> tuple[str, ...]:
+        """Map a configured folder name onto path components inside the archive root.
 
         Folder names come from mapping.yaml on the share and are therefore
-        untrusted; anything that would escape the storage root is rejected and
+        untrusted; anything that would escape the archive root is rejected and
         replaced with the fallback folder rather than being written outside.
         """
         for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
             try:
-                target = safe_join(self.config.storage_root, candidate)
+                target = safe_relative_parts(candidate)
             except ValueError as exc:
                 logger.error(
-                    "Unsafe target folder %r (%s) - not writing outside the storage root", candidate, exc
+                    "Unsafe target folder %r (%s) - not writing outside the archive root", candidate, exc
                 )
                 continue
             if note and candidate != folder_name:
                 logger.warning("Using %s folder %r instead of %r", note, candidate, folder_name)
             return target
-        raise ValueError("No usable target folder inside the storage root")
+        raise ValueError("No usable target folder inside the archive root")
 
     def _resolve_attachment_folder(
         self, filename: str, mail_folder: str, mail_keyword: str | None
@@ -861,34 +1327,14 @@ import logging
 import os
 import sys
 import time
-from pathlib import Path
 
+from . import storage as storage_module
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
-
-
-def _check_storage_root(config: Config) -> None:
-    """Fail fast if the archive target is missing or read-only.
-
-    Without this, a share that failed to mount is indistinguishable from an
-    empty one: attachments would be written into the container's own
-    filesystem and quietly vanish with the container.
-    """
-    root = Path(config.storage_root)
-    if not root.is_dir():
-        raise SystemExit(
-            f"STORAGE_ROOT {config.storage_root} does not exist or is not a directory - "
-            "is the SMB share mounted?"
-        )
-    if not os.access(root, os.W_OK | os.X_OK):
-        raise SystemExit(
-            f"STORAGE_ROOT {config.storage_root} is not writable by uid {os.getuid()} - "
-            "check the mount options (uid/gid/file_mode) and the share permissions."
-        )
 
 
 def main() -> None:
@@ -899,18 +1345,21 @@ def main() -> None:
     )
 
     config = Config.from_env()
-    _check_storage_root(config)
-    mapping_full_path = os.path.join(config.storage_root, config.mapping_path)
-    mapping = Mapping(mapping_full_path, config.fallback_folder)
+    storage = storage_module.from_config(config)
+    # Fail fast: an unreachable share is otherwise indistinguishable from an
+    # empty one, and attachments would land somewhere they silently vanish.
+    storage.check_writable()
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    archiver = Archiver(config, mapping, store)
+    archiver = Archiver(config, mapping, store, storage)
 
     logger.info(
-        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s dry_run=%s",
+        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s (%s) dry_run=%s",
         config.imap_host,
         config.imap_folder,
         config.imap_mode,
-        config.storage_root,
+        storage.description,
+        config.storage_backend,
         config.dry_run,
     )
 
@@ -938,6 +1387,7 @@ def main() -> None:
             time.sleep(config.poll_interval)
     finally:
         store.close()
+        storage.close()
 
 
 def _run_poll(archiver: Archiver, client, config: Config) -> None:
@@ -977,10 +1427,15 @@ import os
 import textwrap
 
 from mail2nas.mapping import Mapping
+from mail2nas.storage import LocalStorage
 
 
 def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+
+def _mapping(tmp_path, fallback_folder="unsorted", relative="mapping.yaml") -> Mapping:
+    return Mapping(LocalStorage(str(tmp_path)), relative, fallback_folder=fallback_folder)
 
 
 def test_resolve_matches_case_insensitive(tmp_path):
@@ -989,7 +1444,7 @@ def test_resolve_matches_case_insensitive(tmp_path):
         RE: rechnungen
         LS: lieferscheine
     """)
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Ihre re 12345")
 
@@ -1000,7 +1455,7 @@ def test_resolve_matches_case_insensitive(tmp_path):
 def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Newsletter August")
 
@@ -1014,7 +1469,7 @@ def test_resolve_prefers_longer_keyword_match(tmp_path):
         RE: rechnungen
         Rechnungskorrektur: korrekturen
     """)
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Rechnungskorrektur zur RE-2024-01")
 
@@ -1023,7 +1478,7 @@ def test_resolve_prefers_longer_keyword_match(tmp_path):
 
 
 def test_missing_mapping_file_falls_back_to_default(tmp_path):
-    mapping = Mapping(str(tmp_path / "does-not-exist.yaml"), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path, relative="does-not-exist.yaml")
 
     folder, keyword = mapping.resolve("Rechnung 123")
 
@@ -1034,7 +1489,7 @@ def test_missing_mapping_file_falls_back_to_default(tmp_path):
 def test_reload_picks_up_changes(tmp_path):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
     assert mapping.resolve("RE 1")[0] == "rechnungen"
 
     _write_mapping(mapping_path, "RE: invoices\n")
@@ -1051,7 +1506,7 @@ def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
     """A half-written mapping.yaml on the share must not take the service down."""
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
     assert mapping.resolve("RE 1")[0] == "rechnungen"
 
     mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
@@ -1066,7 +1521,7 @@ def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
 def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
 
     mapping_path.write_text("- just\n- a\n- list\n", encoding="utf-8")
     stat = mapping_path.stat()
@@ -1080,7 +1535,7 @@ def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
 def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    mapping = _mapping(tmp_path)
 
     mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
     stat = mapping_path.stat()
@@ -1248,6 +1703,7 @@ from mail2nas.archiver import Archiver
 from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
+from mail2nas.storage import LocalStorage
 
 
 def _make_config(tmp_path, **overrides) -> Config:
@@ -1262,7 +1718,16 @@ def _make_config(tmp_path, **overrides) -> Config:
         imap_oversized_folder=None,
         imap_mode="poll",
         poll_interval=60,
+        storage_backend="local",
         storage_root=str(tmp_path),
+        smb_host="",
+        smb_share="",
+        smb_user="",
+        smb_password="",
+        smb_domain="",
+        smb_port=445,
+        smb_root="",
+        smb_encrypt=True,
         mapping_path="mapping.yaml",
         fallback_folder="unsorted",
         match_body=False,
@@ -1290,9 +1755,10 @@ def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overri
     mapping_path = tmp_path / "mapping.yaml"
     if mapping_content is not None:
         _write_mapping(mapping_path, mapping_content)
-    mapping = Mapping(str(mapping_path), config.fallback_folder)
+    storage = LocalStorage(config.storage_root)
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store)
+    return Archiver(config, mapping, store, storage)
 
 
 class FakeIMAPClient:
@@ -1554,11 +2020,12 @@ def test_process_message_confines_absolute_traversal_target(tmp_path):
     assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
 
 
-def test_target_dir_rejects_escape_and_uses_fallback(tmp_path):
+def test_target_parts_reject_escape_and_use_fallback(tmp_path):
     archiver = _make_archiver(tmp_path)
 
-    assert archiver._target_dir("../evil") == tmp_path / "unsorted"
-    assert archiver._target_dir("rechnungen") == tmp_path / "rechnungen"
+    assert archiver._target_parts("../evil") == ("unsorted",)
+    assert archiver._target_parts("rechnungen") == ("rechnungen",)
+    assert archiver._target_parts("rechnungen/2026") == ("rechnungen", "2026")
 
 
 def test_nested_mapping_target_is_supported(tmp_path):
@@ -1610,6 +2077,8 @@ def _env(monkeypatch, **overrides):
     for key in list(REQUIRED) + [
         "IMAP_PORT", "IMAP_MODE", "POLL_INTERVAL_SECONDS", "FILENAME_PREFIX",
         "MAX_ATTACHMENT_SIZE_MB", "MAX_MESSAGE_SIZE_MB", "MAX_ATTACHMENTS_PER_MESSAGE",
+        "STORAGE_BACKEND", "SMB_HOST", "SMB_SHARE", "SMB_USER", "SMB_PASSWORD",
+        "SMB_DOMAIN", "SMB_PORT", "SMB_ROOT", "SMB_ENCRYPT", "MAPPING_PATH",
     ]:
         monkeypatch.delenv(key, raising=False)
     for key, value in {**REQUIRED, **overrides}.items():
@@ -1676,30 +2145,109 @@ def test_imap_mode_is_case_insensitive(monkeypatch):
     _env(monkeypatch, IMAP_MODE="IDLE")
 
     assert Config.from_env().imap_mode == "idle"
+
+
+# --- storage backend ----------------------------------------------------------
+
+SMB = {
+    "STORAGE_BACKEND": "smb",
+    "SMB_HOST": "nas.local",
+    "SMB_SHARE": "Belege",
+    "SMB_USER": "mail2nas",
+    "SMB_PASSWORD": "secret",
+}
+
+
+def test_backend_defaults_to_local_so_existing_installs_keep_working(monkeypatch):
+    _env(monkeypatch)
+
+    config = Config.from_env()
+
+    assert config.storage_backend == "local"
+    assert config.storage_root == "/mnt/nas"
+
+
+def test_smb_backend_loads_its_settings(monkeypatch):
+    _env(monkeypatch, **SMB, SMB_ROOT="archiv/2026", SMB_DOMAIN="WORKGROUP")
+
+    config = Config.from_env()
+
+    assert config.storage_backend == "smb"
+    assert (config.smb_host, config.smb_share) == ("nas.local", "Belege")
+    assert config.smb_root == "archiv/2026"
+    assert config.smb_domain == "WORKGROUP"
+    assert config.smb_port == 445
+    assert config.smb_encrypt is True
+
+
+@pytest.mark.parametrize("missing", ["SMB_HOST", "SMB_SHARE", "SMB_USER", "SMB_PASSWORD"])
+def test_smb_backend_reports_the_missing_setting(monkeypatch, missing):
+    _env(monkeypatch, **SMB)
+    monkeypatch.delenv(missing)
+
+    with pytest.raises(SystemExit, match=missing):
+        Config.from_env()
+
+
+def test_local_backend_does_not_require_smb_settings(monkeypatch):
+    _env(monkeypatch, STORAGE_BACKEND="local")
+
+    assert Config.from_env().smb_host == ""
+
+
+def test_unknown_backend_is_rejected(monkeypatch):
+    _env(monkeypatch, STORAGE_BACKEND="nfs")
+
+    with pytest.raises(SystemExit, match="STORAGE_BACKEND"):
+        Config.from_env()
+
+
+def test_empty_smb_root_means_the_share_root(monkeypatch):
+    _env(monkeypatch, **SMB, SMB_ROOT="")
+
+    assert Config.from_env().smb_root == ""
+
+
+@pytest.mark.parametrize("value", ["../etc", "/etc", ".."])
+def test_smb_root_cannot_escape_the_share(monkeypatch, value):
+    _env(monkeypatch, **SMB, SMB_ROOT=value)
+
+    with pytest.raises(SystemExit, match="SMB_ROOT"):
+        Config.from_env()
+
+
+@pytest.mark.parametrize("value", ["../mapping.yaml", "/etc/passwd"])
+def test_mapping_path_cannot_escape_the_archive_root(monkeypatch, value):
+    _env(monkeypatch, MAPPING_PATH=value)
+
+    with pytest.raises(SystemExit, match="MAPPING_PATH"):
+        Config.from_env()
 MAIL2NAS_EOF
 
-# --- tests/test_main.py ---
-cat > tests/test_main.py <<'MAIL2NAS_EOF'
+# --- tests/test_storage.py ---
+cat > tests/test_storage.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
 
-from mail2nas.main import _check_storage_root
+from mail2nas.storage import LocalStorage, SmbStorage, from_config
 from tests.test_archiver import _make_config
 
 
+# --- local backend ------------------------------------------------------------
+
+
 def test_accepts_a_writable_storage_root(tmp_path):
-    _check_storage_root(_make_config(tmp_path, storage_root=str(tmp_path)))
+    LocalStorage(str(tmp_path)).check_writable()
 
 
 def test_missing_storage_root_fails_fast(tmp_path):
     """An unmounted share must not be mistaken for an empty one."""
-    missing = tmp_path / "not-mounted"
-
     with pytest.raises(SystemExit, match="does not exist"):
-        _check_storage_root(_make_config(tmp_path, storage_root=str(missing)))
+        LocalStorage(str(tmp_path / "not-mounted")).check_writable()
 
 
 def test_storage_root_that_is_a_file_fails_fast(tmp_path):
@@ -1707,7 +2255,7 @@ def test_storage_root_that_is_a_file_fails_fast(tmp_path):
     a_file.write_text("x", encoding="utf-8")
 
     with pytest.raises(SystemExit, match="does not exist or is not a directory"):
-        _check_storage_root(_make_config(tmp_path, storage_root=str(a_file)))
+        LocalStorage(str(a_file)).check_writable()
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="root ignores write permission bits")
@@ -1717,9 +2265,132 @@ def test_read_only_storage_root_fails_fast(tmp_path):
     readonly.chmod(0o500)
     try:
         with pytest.raises(SystemExit, match="not writable"):
-            _check_storage_root(_make_config(tmp_path, storage_root=str(readonly)))
+            LocalStorage(str(readonly)).check_writable()
     finally:
         readonly.chmod(0o700)
+
+
+def test_local_save_unique_creates_directories_and_avoids_overwriting(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+
+    first = storage.save_unique(("rechnungen", "2026"), "beleg.pdf", b"one")
+    second = storage.save_unique(("rechnungen", "2026"), "beleg.pdf", b"two")
+
+    assert first != second
+    assert (tmp_path / "rechnungen" / "2026" / "beleg.pdf").read_bytes() == b"one"
+    assert (tmp_path / "rechnungen" / "2026" / "beleg_1.pdf").read_bytes() == b"two"
+
+
+def test_local_read_text_and_modified_time(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    (tmp_path / "mapping.yaml").write_text("RE: rechnungen\n", encoding="utf-8")
+
+    assert storage.read_text("mapping.yaml") == "RE: rechnungen\n"
+    assert storage.modified_time("mapping.yaml") > 0
+
+    with pytest.raises(FileNotFoundError):
+        storage.modified_time("nope.yaml")
+
+
+# --- SMB backend: path building (no server involved) --------------------------
+
+
+def _smb(**overrides) -> SmbStorage:
+    defaults = dict(host="nas.local", share="Belege", user="mail2nas", password="secret")
+    defaults.update(overrides)
+    return SmbStorage(**defaults)
+
+
+def test_smb_builds_unc_paths():
+    storage = _smb()
+
+    assert storage._unc(("rechnungen", "2026"), "beleg.pdf") == (
+        "\\\\nas.local\\Belege\\rechnungen\\2026\\beleg.pdf"
+    )
+    assert storage._unc(()) == "\\\\nas.local\\Belege"
+
+
+def test_smb_root_prefixes_every_path():
+    storage = _smb(root="archiv/2026")
+
+    assert storage._unc(("rechnungen",)) == "\\\\nas.local\\Belege\\archiv\\2026\\rechnungen"
+    assert storage.description == "//nas.local/Belege/archiv/2026"
+
+
+def test_smb_display_uses_forward_slashes():
+    assert _smb().display(("rechnungen",), "beleg.pdf") == "//nas.local/Belege/rechnungen/beleg.pdf"
+
+
+def test_smb_root_cannot_escape_the_share():
+    with pytest.raises(ValueError):
+        _smb(root="../../etc")
+
+
+# --- SMB backend: reconnect behaviour -----------------------------------------
+
+
+def test_smb_retries_once_on_a_failed_call(monkeypatch):
+    storage = _smb()
+    monkeypatch.setattr(storage, "_connect", lambda: None)
+    monkeypatch.setattr(storage, "_reset", lambda: None)
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError(errno.ECONNRESET, "connection reset")
+        return "ok"
+
+    assert storage._with_reconnect("write", flaky) == "ok"
+    assert len(attempts) == 2
+
+
+def test_smb_missing_file_is_reported_as_filenotfound_without_retrying(monkeypatch):
+    """The mapping file may legitimately not exist - that is not a broken session."""
+    storage = _smb()
+    monkeypatch.setattr(storage, "_connect", lambda: None)
+    attempts = []
+
+    def missing():
+        attempts.append(1)
+        raise OSError(errno.ENOENT, "no such file")
+
+    with pytest.raises(FileNotFoundError):
+        storage._with_reconnect("stat", missing)
+    assert len(attempts) == 1
+
+
+def test_smb_reraises_when_the_retry_also_fails(monkeypatch):
+    storage = _smb()
+    monkeypatch.setattr(storage, "_connect", lambda: None)
+    monkeypatch.setattr(storage, "_reset", lambda: None)
+
+    def always_broken():
+        raise OSError(errno.EACCES, "permission denied")
+
+    with pytest.raises(OSError, match="permission denied"):
+        storage._with_reconnect("write", always_broken)
+
+
+# --- backend selection ---------------------------------------------------------
+
+
+def test_from_config_selects_the_configured_backend(tmp_path):
+    local = from_config(_make_config(tmp_path, storage_backend="local"))
+    assert isinstance(local, LocalStorage)
+
+    smb = from_config(
+        _make_config(
+            tmp_path,
+            storage_backend="smb",
+            smb_host="nas.local",
+            smb_share="Belege",
+            smb_user="u",
+            smb_password="p",
+        )
+    )
+    assert isinstance(smb, SmbStorage)
+    assert smb.description == "//nas.local/Belege"
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---

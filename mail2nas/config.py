@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .filenames import safe_relative_parts
+
 # Executable/script types that are quarantined instead of filed normally,
 # even if their filename happens to match a mapping keyword. This is a
 # defense-in-depth measure against mail attachments being used to smuggle
@@ -48,6 +50,25 @@ def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
     return value
 
 
+def _relative(name: str, default: str, allow_empty: bool = False) -> str:
+    """Read a setting that must stay inside the archive root."""
+    value = os.environ.get(name, default).strip()
+    if allow_empty and value in ("", "."):
+        return ""
+    try:
+        safe_relative_parts(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a path relative to the archive root: {exc}") from None
+    return value
+
+
+def _required(name: str, because: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(f"{name} is required {because}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     imap_host: str
@@ -61,7 +82,19 @@ class Config:
     imap_mode: str  # "idle" or "poll"
     poll_interval: int
 
+    # "smb" talks to the NAS directly (nothing mounted anywhere), "local"
+    # archives into an already-mounted directory at storage_root.
+    storage_backend: str
     storage_root: str
+    smb_host: str
+    smb_share: str
+    smb_user: str
+    smb_password: str
+    smb_domain: str
+    smb_port: int
+    smb_root: str
+    smb_encrypt: bool
+
     mapping_path: str
     fallback_folder: str
     match_body: bool
@@ -79,6 +112,12 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Defaults to "local" so an existing install whose .env predates this
+        # setting keeps working against its mounted share after an update;
+        # every install path writes the value explicitly.
+        backend = _choice("STORAGE_BACKEND", "local", ("smb", "local"))
+        smb = backend == "smb"
+        because = "when STORAGE_BACKEND=smb"
         try:
             return cls(
                 imap_host=os.environ["IMAP_HOST"],
@@ -91,8 +130,17 @@ class Config:
                 imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
                 imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
                 poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
+                storage_backend=backend,
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
-                mapping_path=os.environ.get("MAPPING_PATH", "mapping.yaml"),
+                smb_host=_required("SMB_HOST", because) if smb else "",
+                smb_share=_required("SMB_SHARE", because) if smb else "",
+                smb_user=_required("SMB_USER", because) if smb else "",
+                smb_password=_required("SMB_PASSWORD", because) if smb else "",
+                smb_domain=os.environ.get("SMB_DOMAIN", "").strip(),
+                smb_port=_int("SMB_PORT", "445", minimum=1, maximum=65535),
+                smb_root=_relative("SMB_ROOT", "", allow_empty=True),
+                smb_encrypt=_bool("SMB_ENCRYPT", True),
+                mapping_path=_relative("MAPPING_PATH", "mapping.yaml"),
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
                 filename_prefix=_choice(

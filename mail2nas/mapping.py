@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import yaml
+
+from .filenames import safe_relative_parts
+from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
 
 class Mapping:
-    """Keyword -> target-subfolder mapping, reloaded from disk on demand.
+    """Keyword -> target-subfolder mapping, reloaded on demand.
 
-    The mapping file is expected to live on the same SMB share the
-    attachments are archived to, so it can be edited by anyone with
-    access to the share without touching the container/deployment.
+    The mapping file lives on the same share the attachments are archived
+    to, so it can be edited by anyone with access to the share without
+    touching the container/deployment. It is read through the storage
+    backend, so it works the same whether the share is mounted or reached
+    over SMB directly.
     """
 
-    def __init__(self, path: str, fallback_folder: str):
-        self._path = Path(path)
+    def __init__(self, storage: Storage, relative_path: str, fallback_folder: str):
+        self._storage = storage
+        self._path = storage.display(safe_relative_parts(relative_path))
+        self._relative_path = relative_path
         self._fallback_folder = fallback_folder
         self._rules: list[tuple[str, str]] = []
         self._mtime: float | None = None
@@ -25,7 +31,7 @@ class Mapping:
 
     def reload(self, force: bool = False) -> None:
         try:
-            mtime = self._path.stat().st_mtime
+            mtime = self._storage.modified_time(self._relative_path)
         except FileNotFoundError:
             if force:
                 logger.warning(
@@ -33,6 +39,17 @@ class Mapping:
                 )
                 self._rules = []
                 self._mtime = None
+            return
+        except Exception as exc:  # noqa: BLE001 - a dropped share must not kill the loop
+            # With the SMB backend this is a network call, so it can fail for
+            # reasons that have nothing to do with the file itself. Keep the
+            # rules we already have; the next cycle tries again.
+            logger.warning(
+                "Could not check mapping file %s (%s) - keeping the previous %d rule(s)",
+                self._path,
+                exc,
+                len(self._rules),
+            )
             return
 
         if not force and self._mtime == mtime:
@@ -44,8 +61,7 @@ class Mapping:
         # propagate out of the IMAP loop and leave the service reconnecting in
         # a tight loop, archiving nothing at all until someone noticed.
         try:
-            with self._path.open("r", encoding="utf-8") as fh:
-                raw = yaml.safe_load(fh) or {}
+            raw = yaml.safe_load(self._storage.read_text(self._relative_path)) or {}
             if not isinstance(raw, dict):
                 raise ValueError("file must contain a mapping of keyword -> folder")
             rules = sorted(

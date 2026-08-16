@@ -7,20 +7,14 @@ services:
     env_file:
       - .env
     environment:
-      STORAGE_ROOT: /mnt/nas
       STATE_DB_PATH: /data/state.db
     volumes:
-      # Plain bind mount of an already-mounted directory - the SMB share is
-      # mounted by the OS (host fstab, or the Proxmox host bind-mounted into
-      # the LXC), NOT by Docker.
-      #
-      # Docker's local volume driver with type=cifs issues the mount() syscall
-      # itself, which the kernel refuses from inside an unprivileged LXC
-      # ("invalid argument"), and it would also put the SMB password into the
-      # daemon's volume metadata. Mounting one level up avoids both.
-      - ${NAS_PATH:-/mnt/nas}:/mnt/nas
+      # Only local state (processed-message tracking) - the archive itself is
+      # reached over SMB by the application, so there is nothing to mount here.
+      # For STORAGE_BACKEND=local, add docker-compose.local.yml:
+      #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
       - state:/data
 
 volumes:
-  # Local state (processed-message tracking), no need for this to live on the share.
+  # Local state, no need for this to live on the share.
   state:

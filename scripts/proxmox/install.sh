@@ -11,11 +11,12 @@
 # Erwartet die App-Konfiguration entweder als bereits gesetzte
 # Umgebungsvariablen, oder in /root/mail2nas-install.env (wird automatisch
 # geladen und danach geloescht, da sie Klartext-Zugangsdaten enthaelt).
-# Erforderlich sind nur IMAP_HOST/IMAP_USER/IMAP_PASSWORD.
+# Erforderlich sind IMAP_HOST/IMAP_USER/IMAP_PASSWORD sowie - beim
+# Standard-Backend STORAGE_BACKEND=smb - SMB_HOST/SMB_SHARE/SMB_USER/
+# SMB_PASSWORD. Es wird nichts gemountet: mail2nas spricht SMB direkt.
 #
-# SMB-Zugangsdaten werden hier NICHT gebraucht: das Share muss bereits vom
-# Betriebssystem unter NAS_PATH (Default /mnt/nas) eingebunden sein - siehe
-# README, Abschnitt "Warum der SMB-Mount auf dem Host passiert".
+# Mit STORAGE_BACKEND=local wird stattdessen in ein bereits vom Betriebssystem
+# gemountetes Verzeichnis (NAS_PATH, Default /mnt/nas) geschrieben.
 # Existiert bereits eine .env und werden keine Zugangsdaten uebergeben,
 # laeuft das Skript im Update-Modus und laesst die Konfiguration unveraendert.
 
@@ -73,26 +74,37 @@ else
   : "${IMAP_PASSWORD:?IMAP_PASSWORD ist nicht gesetzt}"
 fi
 
-# Das SMB-Share muss bereits vom Betriebssystem gemountet sein (per Bind-Mount
-# vom Proxmox-Host, oder per fstab in einer VM). Lieber hier abbrechen als
-# spaeter Anhaenge in ein leeres Verzeichnis schreiben, das beim naechsten
-# Neustart verschwindet.
+STORAGE_BACKEND="${STORAGE_BACKEND:-smb}"
 NAS_PATH="${NAS_PATH:-/mnt/nas}"
-if [ ! -d "$NAS_PATH" ]; then
-  echo "FEHLER: $NAS_PATH existiert nicht." >&2
-  echo "Das SMB-Share muss vor der Installation dort eingebunden sein - siehe README" >&2
-  echo "(Abschnitt 'Warum der SMB-Mount auf dem Host passiert')." >&2
-  exit 1
-fi
-if ! mountpoint -q "$NAS_PATH" 2>/dev/null; then
-  echo "WARNUNG: $NAS_PATH ist kein Mountpoint - liegt das Share wirklich dort?" >&2
-  echo "         Anhaenge wuerden sonst in das lokale Dateisystem geschrieben." >&2
+
+if [ "$WRITE_ENV" -eq 1 ]; then
+  if [ "$STORAGE_BACKEND" = "smb" ]; then
+    # Nichts zu mounten - die Anwendung verbindet sich selbst zum NAS.
+    : "${SMB_HOST:?SMB_HOST ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
+    : "${SMB_SHARE:?SMB_SHARE ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
+    : "${SMB_USER:?SMB_USER ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
+    : "${SMB_PASSWORD:?SMB_PASSWORD ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
+  else
+    # local: das Share muss bereits vom Betriebssystem gemountet sein. Lieber
+    # hier abbrechen als spaeter Anhaenge in ein leeres Verzeichnis schreiben,
+    # das beim naechsten Neustart verschwindet.
+    if [ ! -d "$NAS_PATH" ]; then
+      echo "FEHLER: $NAS_PATH existiert nicht." >&2
+      echo "Bei STORAGE_BACKEND=local muss das Share dort eingebunden sein." >&2
+      echo "Ohne Mount stattdessen STORAGE_BACKEND=smb verwenden (Default)." >&2
+      exit 1
+    fi
+    if ! mountpoint -q "$NAS_PATH" 2>/dev/null; then
+      echo "WARNUNG: $NAS_PATH ist kein Mountpoint - liegt das Share wirklich dort?" >&2
+      echo "         Anhaenge wuerden sonst in das lokale Dateisystem geschrieben." >&2
+    fi
+  fi
 fi
 
-echo "==> Pakete installieren (git, cifs-utils, curl, ca-certificates) ..."
+echo "==> Pakete installieren (git, curl, ca-certificates) ..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends ca-certificates curl gnupg git cifs-utils >/dev/null
+apt-get install -y --no-install-recommends ca-certificates curl gnupg git >/dev/null
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "==> Docker installieren (offizielles get.docker.com-Skript) ..."
@@ -130,6 +142,16 @@ IMAP_OVERSIZED_FOLDER=$(dq "${IMAP_OVERSIZED_FOLDER:-}")
 IMAP_MODE=$(dq "${IMAP_MODE:-idle}")
 POLL_INTERVAL_SECONDS=$(dq "${POLL_INTERVAL_SECONDS:-300}")
 
+STORAGE_BACKEND=$(dq "${STORAGE_BACKEND}")
+SMB_HOST=$(dq "${SMB_HOST:-}")
+SMB_SHARE=$(dq "${SMB_SHARE:-}")
+SMB_USER=$(dq "${SMB_USER:-}")
+SMB_PASSWORD=$(dq "${SMB_PASSWORD:-}")
+SMB_DOMAIN=$(dq "${SMB_DOMAIN:-}")
+SMB_PORT=$(dq "${SMB_PORT:-445}")
+SMB_ROOT=$(dq "${SMB_ROOT:-}")
+SMB_ENCRYPT=$(dq "${SMB_ENCRYPT:-true}")
+STORAGE_ROOT=$(dq "${STORAGE_ROOT:-/mnt/nas}")
 NAS_PATH=$(dq "${NAS_PATH}")
 
 MAPPING_PATH=$(dq "${MAPPING_PATH:-mapping.yaml}")
@@ -150,8 +172,23 @@ ENVEOF
 chmod 600 .env
 fi
 
+if [ "$WRITE_ENV" -eq 0 ]; then
+  # Update-Modus: das Backend steht in der bestehenden .env. Fehlt es dort,
+  # stammt die Installation aus einer Version vor dem SMB-Backend und arbeitet
+  # mit einem gemounteten Share - dann muss der Bind-Mount erhalten bleiben.
+  ENV_BACKEND="$(sed -n 's/^STORAGE_BACKEND=//p' .env | tail -1 | tr -d "\"' ")"
+  STORAGE_BACKEND="${ENV_BACKEND:-local}"
+  echo "==> Backend aus bestehender .env: $STORAGE_BACKEND"
+fi
+
 echo "==> docker compose build && up -d ..."
-docker compose up -d --build
+# Beim local-Backend braucht es zusaetzlich den Bind-Mount des gemounteten
+# Shares; beim SMB-Backend wird nichts gemountet.
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ "$STORAGE_BACKEND" = "local" ]; then
+  COMPOSE_FILES+=(-f docker-compose.local.yml)
+fi
+docker compose "${COMPOSE_FILES[@]}" up -d --build
 
 if [ -f /root/mail2nas-install.env ]; then
   shred -u /root/mail2nas-install.env 2>/dev/null || rm -f /root/mail2nas-install.env
@@ -168,7 +205,14 @@ echo "Config:  $TARGET_DIR/.env (chmod 600)"
 
 if [ "$WRITE_ENV" -eq 1 ]; then
   echo
-  echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml nach"
-  echo "$NAS_PATH kopieren und an deine Stichwoerter anpassen:"
-  echo "  cp $TARGET_DIR/config/mapping.example.yaml $NAS_PATH/mapping.yaml"
+  if [ "$STORAGE_BACKEND" = "smb" ]; then
+    echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml in die"
+    echo "Wurzel der Freigabe //${SMB_HOST}/${SMB_SHARE} kopieren (vom NAS oder"
+    echo "einem anderen Rechner aus) und an die eigenen Stichwoerter anpassen."
+    echo "Vorlage: $TARGET_DIR/config/mapping.example.yaml"
+  else
+    echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml nach"
+    echo "$NAS_PATH kopieren und an deine Stichwoerter anpassen:"
+    echo "  cp $TARGET_DIR/config/mapping.example.yaml $NAS_PATH/mapping.yaml"
+  fi
 fi

@@ -5,14 +5,14 @@ import logging
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
-from pathlib import Path
 
 from imapclient import IMAPClient
 
 from .config import Config
-from .filenames import safe_join, sanitize_filename, unique_path, write_atomic
+from .filenames import safe_relative_parts, sanitize_filename
 from .mapping import Mapping
 from .state import ProcessedStore
+from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +37,11 @@ def _extension_of(filename: str) -> str:
 
 
 class Archiver:
-    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore):
+    def __init__(self, config: Config, mapping: Mapping, store: ProcessedStore, storage: Storage):
         self.config = config
         self.mapping = mapping
         self.store = store
+        self.storage = storage
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.config.imap_host, port=self.config.imap_port, ssl=self.config.imap_ssl)
@@ -133,17 +134,19 @@ class Archiver:
                 folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
                     filename, mail_folder, mail_keyword
                 )
-                target_dir = self._target_dir(folder_name)
+                target_parts = self._target_parts(folder_name)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if self.config.dry_run:
-                    logger.info("[dry-run] would save %s -> %s", out_name, target_dir)
+                    logger.info(
+                        "[dry-run] would save %s -> %s",
+                        out_name,
+                        self.storage.display(target_parts),
+                    )
                     continue
 
-                target_dir.mkdir(parents=True, exist_ok=True)
-                out_path = unique_path(target_dir, out_name)
-                write_atomic(out_path, payload)
-                saved.append(str(out_path))
+                out_path = self.storage.save_unique(target_parts, out_name, payload)
+                saved.append(out_path)
                 logger.info(
                     "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
                     uid,
@@ -161,25 +164,25 @@ class Archiver:
                 client.move([uid], self.config.imap_processed_folder)
         return True
 
-    def _target_dir(self, folder_name: str) -> Path:
-        """Map a configured folder name onto a directory inside the storage root.
+    def _target_parts(self, folder_name: str) -> tuple[str, ...]:
+        """Map a configured folder name onto path components inside the archive root.
 
         Folder names come from mapping.yaml on the share and are therefore
-        untrusted; anything that would escape the storage root is rejected and
+        untrusted; anything that would escape the archive root is rejected and
         replaced with the fallback folder rather than being written outside.
         """
         for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
             try:
-                target = safe_join(self.config.storage_root, candidate)
+                target = safe_relative_parts(candidate)
             except ValueError as exc:
                 logger.error(
-                    "Unsafe target folder %r (%s) - not writing outside the storage root", candidate, exc
+                    "Unsafe target folder %r (%s) - not writing outside the archive root", candidate, exc
                 )
                 continue
             if note and candidate != folder_name:
                 logger.warning("Using %s folder %r instead of %r", note, candidate, folder_name)
             return target
-        raise ValueError("No usable target folder inside the storage root")
+        raise ValueError("No usable target folder inside the archive root")
 
     def _resolve_attachment_folder(
         self, filename: str, mail_folder: str, mail_keyword: str | None

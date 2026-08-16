@@ -13,7 +13,7 @@ kann aber genauso als einfacher systemd-Service laufen.
 - [Installation, Variante 2: Proxmox ohne Git (manuelles Kopieren)](#installation-variante-2-proxmox-ohne-git-manuelles-kopieren)
 - [Weiter mit Docker Compose](#weiter-mit-docker-compose)
 - [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
-- [Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert)
+- [Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -44,6 +44,11 @@ kann aber genauso als einfacher systemd-Service laufen.
 6. `mapping.yaml` liegt selbst auf dem SMB-Share und wird bei jedem Zyklus
    neu eingelesen - Anpassungen wirken ohne Neustart/Redeploy.
 
+Der Zugriff auf die Freigabe laeuft standardmaessig **direkt per SMB aus der
+Anwendung heraus**: es wird nichts gemountet, weder im Container noch auf dem
+Proxmox-Host. Warum das so ist und welche Alternative es gibt, steht unter
+[Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift).
+
 ## Voraussetzungen
 
 - Ein IMAP-Postfach (am besten ein dediziertes Konto/App-Passwort, keine
@@ -51,7 +56,9 @@ kann aber genauso als einfacher systemd-Service laufen.
 - Ein SMB-Share mit einem Benutzer, der Schreibrechte auf die Zielordner hat.
 - Ein Proxmox-Host mit einer LXC (Debian/Ubuntu-Template) oder VM, auf der
   entweder Docker+Compose oder Python 3.11+ verfuegbar ist.
-- `cifs-utils`, um das SMB-Share einzubinden.
+- **Kein** Mount und damit auch kein `cifs-utils` noetig - mail2nas spricht
+  SMB selbst. Nur beim optionalen `STORAGE_BACKEND=local` muss das Share
+  vorher vom Betriebssystem eingebunden sein.
 - Zugriff auf `apt`/`pip` fuer Paketinstallationen (Internet oder ein
   interner Mirror) - **git/GitHub wird nicht benoetigt**, siehe naechster
   Abschnitt.
@@ -76,9 +83,9 @@ Das Skript:
 2. Fragt anschliessend nach den IMAP- und SMB-Zugangsdaten sowie dem
    Mapping-Pfad und Fallback-Ordner.
 3. Legt eine neue, unprivilegierte Debian-12-LXC an (`pct create`).
-4. Installiert darin Docker, git und cifs-utils, klont dieses Repository,
-   schreibt die `.env` aus deinen Eingaben und startet den Dienst
-   (`docker compose up -d`).
+4. Installiert darin Docker und git, klont dieses Repository, schreibt die
+   `.env` aus deinen Eingaben und startet den Dienst (`docker compose up -d`).
+   Es wird kein Share gemountet - weder in der LXC noch auf dem Host.
 5. Zeigt am Ende die Container-IP sowie die Befehle zum Log-Ansehen und fuer
    einen Testlauf.
 
@@ -95,7 +102,9 @@ der Installation einfach in `/opt/mail2nas/.env` in der LXC anpassen und
 
 Danach fehlt nur noch `config/mapping.example.yaml` (liegt im Container unter
 `/opt/mail2nas/config/`) als `mapping.yaml` auf die Wurzel des SMB-Shares zu
-kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge).
+kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge). Da in
+der LXC nichts gemountet ist, geht das am einfachsten direkt vom NAS oder von
+einem beliebigen anderen Rechner mit Zugriff auf die Freigabe.
 
 **Voraussetzung**: Der Proxmox-Host selbst braucht dafuer Internetzugriff auf
 GitHub (fuer den `curl`-Aufruf und den `git clone` in der LXC) sowie auf die
@@ -193,40 +202,42 @@ Empfohlener Weg, sobald der Ordner (per Variante A oder B) auf dem Zielsystem
 liegt:
 
 ```bash
-apt-get update && apt-get install -y docker.io docker-compose-plugin cifs-utils
-
-# Das SMB-Share zuerst per Betriebssystem einbinden - NICHT per Docker,
-# siehe "Warum der SMB-Mount auf dem Host passiert".
-cat > /etc/mail2nas-smb-credentials <<'EOF'
-username=mail2nas
-password=changeme
-EOF
-chmod 600 /etc/mail2nas-smb-credentials
-mkdir -p /mnt/nas
-echo '//nas.local/Belege /mnt/nas cifs credentials=/etc/mail2nas-smb-credentials,uid=1000,gid=1000,file_mode=0660,dir_mode=0770,vers=3.0,_netdev,nofail 0 0' >> /etc/fstab
-mount /mnt/nas
-mountpoint /mnt/nas          # muss "is a mountpoint" melden
+apt-get update && apt-get install -y docker.io docker-compose-plugin
 
 cd /opt/mail2nas
 cp .env.example .env
-$EDITOR .env                 # IMAP-Zugangsdaten eintragen, NAS_PATH pruefen
+$EDITOR .env    # IMAP- und SMB-Zugangsdaten eintragen
 
 docker compose up -d --build
 docker compose logs -f
 ```
 
+Es ist nichts zu mounten: mit dem Default `STORAGE_BACKEND=smb` verbindet sich
+mail2nas selbst mit `//SMB_HOST/SMB_SHARE`. Beim Start wird einmal testweise
+geschrieben, damit falsche Zugangsdaten oder fehlende Schreibrechte sofort im
+Log stehen statt erst bei der ersten Mail.
+
 Danach `config/mapping.example.yaml` als `mapping.yaml` auf die Wurzel des
-Shares kopieren (Pfad relativ dazu ist in `MAPPING_PATH` konfigurierbar) und
-an die eigenen Stichwoerter/Ordner anpassen:
+Shares legen (Pfad relativ dazu ist in `MAPPING_PATH` konfigurierbar) und an
+die eigenen Stichwoerter/Ordner anpassen. Da das Share hier nirgends gemountet
+ist, geht das ueber einen beliebigen SMB-Client - Windows-Explorer, die
+Dateiverwaltung des NAS, oder `smbclient`:
 
 ```bash
-cp config/mapping.example.yaml /mnt/nas/mapping.yaml
-$EDITOR /mnt/nas/mapping.yaml
+smbclient //nas.local/Belege -U mail2nas -c 'put config/mapping.example.yaml mapping.yaml'
 ```
 
-Falls kein separater Mount-Zugriff aufs Share besteht, reicht es auch, die
-Datei einmalig ueber einen beliebigen SMB-Client (Windows-Explorer,
-`smbclient`, ...) auf das Share zu legen.
+### Variante mit bereits gemountetem Share
+
+Ist das Share ohnehin schon vom Betriebssystem eingebunden (eigener
+fstab-Eintrag, Bind-Mount vom Proxmox-Host), kann mail2nas stattdessen einfach
+in dieses Verzeichnis schreiben. Dann `STORAGE_BACKEND=local` setzen, `NAS_PATH`
+auf das gemountete Verzeichnis zeigen lassen und die Compose-Override-Datei
+mitgeben, die den Bind-Mount ergaenzt:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```
 
 ### Testlauf ohne Nebenwirkungen
 
@@ -247,35 +258,22 @@ der Ordner per Bootstrap-Skript oder scp vorliegt (siehe oben).
 ```bash
 cd /opt/mail2nas
 
-apt-get update && apt-get install -y python3-venv python3-pip cifs-utils
+apt-get update && apt-get install -y python3-venv python3-pip
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
-# SMB-Zugangsdaten in einer separaten, nur fuer root lesbaren Datei ablegen:
-cat > /etc/mail2nas-smb-credentials <<'EOF'
-username=mail2nas
-password=changeme
-domain=WORKGROUP
-EOF
-chmod 600 /etc/mail2nas-smb-credentials
-
-mkdir -p /mnt/nas
-
-# SMB-Share dauerhaft einbinden, z. B. via /etc/fstab:
-echo '//nas.local/Belege /mnt/nas cifs credentials=/etc/mail2nas-smb-credentials,uid=mail2nas,gid=mail2nas,vers=3.0,_netdev 0 0' >> /etc/fstab
-
 # Systembenutzer fuer den Dienst anlegen
 useradd --system --home /opt/mail2nas --shell /usr/sbin/nologin mail2nas || true
-
-mount /mnt/nas
 ```
 
-Danach `.env` lokal anlegen (mit `STORAGE_ROOT=/mnt/nas`):
+Auch hier wird nichts gemountet - die SMB-Zugangsdaten stehen in der `.env`,
+die nur dem Dienstbenutzer gehoert. Danach `.env` anlegen:
 
 ```bash
 cp .env.example .env
 $EDITOR .env
 chown -R mail2nas:mail2nas /opt/mail2nas
+chmod 600 /opt/mail2nas/.env
 ```
 
 Anschliessend als systemd-Service einrichten
@@ -289,7 +287,6 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/opt/mail2nas/.env
-Environment=STORAGE_ROOT=/mnt/nas
 Environment=STATE_DB_PATH=/opt/mail2nas/state.db
 ExecStart=/opt/mail2nas/venv/bin/python -m mail2nas.main
 WorkingDirectory=/opt/mail2nas
@@ -311,61 +308,85 @@ systemctl status mail2nas
 journalctl -u mail2nas -f
 ```
 
-`mapping.yaml` wie im Docker-Abschnitt beschrieben auf `/mnt/nas` (bzw. den
-konfigurierten `MAPPING_PATH`) kopieren.
+`mapping.yaml` wie im Docker-Abschnitt beschrieben auf die Wurzel der Freigabe
+(bzw. den konfigurierten `MAPPING_PATH`) legen.
 
-## Warum der SMB-Mount auf dem Host passiert
+Soll stattdessen ein bereits gemountetes Verzeichnis verwendet werden:
+`STORAGE_BACKEND=local` und `STORAGE_ROOT=/mnt/nas` in der `.env` setzen, und
+in der Unit `After=`/`RequiresMountsFor=` auf den Mountpunkt zeigen lassen.
 
-Das SMB-Share wird **nicht von Docker** gemountet, sondern vom Betriebssystem
-eine Ebene hoeher. Docker bekommt nur einen gewoehnlichen Bind-Mount eines
-bereits eingebundenen Verzeichnisses.
+## Wie mail2nas auf das Share zugreift
 
-Der naheliegende Weg - Dockers `local`-Volume-Treiber mit `type: cifs` -
-funktioniert in der hier empfohlenen Umgebung naemlich nicht:
+Standardmaessig (`STORAGE_BACKEND=smb`) spricht mail2nas das SMB-Protokoll
+**direkt aus der Anwendung**. Es wird nirgends ein Dateisystem eingehaengt:
+nicht im Docker-Container, nicht in der LXC und nicht auf dem Proxmox-Host.
 
-- Dieser Treiber setzt den `mount()`-Syscall **selbst** ab (er benutzt nicht
-  das Hilfsprogramm `mount.cifs`). Fuer Dateisysteme wie CIFS verweigert der
-  Kernel diesen Syscall aus dem User-Namespace einer **unprivilegierten LXC**.
-  Ergebnis ist die wenig aussagekraeftige Meldung:
-  ```
-  failed to mount local volume: ... vers=3.0,uid=1000,... : invalid argument
-  ```
-- Zusaetzlich landet das SMB-Passwort dabei dauerhaft in den Volume-Metadaten
-  des Docker-Daemons und ist per `docker volume inspect` auslesbar.
+Der Grund ist eine harte Kernel-Grenze: CIFS ist nicht als `FS_USERNS_MOUNT`
+markiert, und `mount(2)` ist fuer solche Dateisysteme aus dem User-Namespace
+einer **unprivilegierten LXC** verboten. Das gilt unabhaengig davon, wer den
+Mount versucht:
 
-Beides entfaellt mit dem Mount auf Host-Ebene. Die Aufteilung sieht so aus:
+- Dockers `local`-Volume-Treiber mit `type: cifs` setzt den `mount()`-Syscall
+  selbst ab und scheitert mit der wenig aussagekraeftigen Meldung
+  `failed to mount local volume: ... : invalid argument`. Zusaetzlich landet
+  das SMB-Passwort dabei dauerhaft in den Volume-Metadaten des Docker-Daemons
+  und ist per `docker volume inspect` auslesbar.
+- `mount.cifs` innerhalb der LXC scheitert am selben Syscall - auch mit
+  gelockerten AppArmor-Profilen.
+
+Frueher wurde deshalb auf dem Proxmox-Host gemountet und das Verzeichnis per
+Bind-Mount in die LXC gereicht. Das funktioniert, hat aber zwei Nachteile, die
+sich nicht wegkonfigurieren lassen:
+
+- Der Mountpunkt ist fuer **jeden mit Root-Shell auf dem Node** sichtbar, nicht
+  nur fuer diesen einen Container.
+- Die SMB-Zugangsdaten muessen in einer Datei auf dem Host liegen. Wer dort
+  root wird, hat damit Zugriff auf die gesamte Freigabe - und die Datei landet
+  in jedem Host-Backup.
+
+Mit dem SMB-Backend entfaellt beides. Die Zugangsdaten stehen nur noch in der
+`.env` der LXC (`chmod 600`), und der Zugriff endet an der Container-Grenze:
 
 ```
-Proxmox-Host   /etc/fstab:  //nas/share  ->  /mnt/mail2nas-<CTID>   (cifs)
-                                 |
-                   pct -mp0 Bind-Mount   ->  /mnt/nas   (in der LXC)
-                                 |
-              docker compose Bind-Mount  ->  /mnt/nas   (im Container)
+mail2nas (im Container)  --SMB3-->  //nas/share
+        keine Mounts, kein cifs-utils, keine Host-Konfiguration
 ```
 
-Konkrete Vorteile:
+Weitere Eigenschaften:
 
-- Funktioniert mit einer **unprivilegierten** LXC - die brauchst du nicht
-  aufzuweichen, nur damit ein Mount klappt.
-- Die SMB-Zugangsdaten liegen ausschliesslich auf dem Host in
-  `/etc/mail2nas-smb-credentials-<CTID>` (`chmod 600`) und nie im Container
-  oder in der `.env`.
-- Der Host kuemmert sich um Reconnects nach einem Netzwerkausfall, statt dass
-  jeder Container das einzeln tut.
+- Verbindungen werden bei Fehlern automatisch einmal neu aufgebaut - ein
+  NAS-Neustart oder eine abgelaufene Session beendet den Dienst nicht.
+- Anhaenge werden unter einem temporaeren Namen geschrieben und erst danach
+  umbenannt. Ein abgebrochener Transfer hinterlaesst dadurch nie eine
+  abgeschnittene Datei unter einem Namen, der wie eine vollstaendige Rechnung
+  aussieht.
+- Die Verbindung ist per Default SMB3-verschluesselt (`SMB_ENCRYPT=true`).
+  Aeltere NAS-Firmware kann das ablehnen - dann `SMB_ENCRYPT=false` setzen.
+- Mit `SMB_ROOT` laesst sich alles auf einen Unterordner der Freigabe
+  begrenzen.
 
-`scripts/proxmox/mail2nas.sh` richtet das alles automatisch ein (inklusive
-`fstab`-Eintrag mit Sicherung der bisherigen Datei). Bei einer VM oder auf
-Bare Metal ohne LXC gilt dasselbe Prinzip: Share per `/etc/fstab` nach
-`/mnt/nas` mounten, `NAS_PATH` zeigt dann dorthin.
+### Wann `STORAGE_BACKEND=local` sinnvoll ist
 
-### uid-Mapping bei unprivilegierten Containern
+Wenn das Share aus anderen Gruenden ohnehin schon vom Betriebssystem
+eingebunden ist, oder wenn statt SMB etwas ganz anderes darunterliegt (NFS,
+lokale Platte, ZFS-Dataset). Dann schreibt mail2nas einfach in das
+konfigurierte Verzeichnis `STORAGE_ROOT`, und um den Mount kuemmert sich das
+System. Fuer Docker ergaenzt `docker-compose.local.yml` den noetigen
+Bind-Mount:
 
-Der Docker-Container laeuft als uid 1000. Proxmox bildet den User-Namespace
-einer unprivilegierten LXC ab 100000 ab, aus uid 1000 im Container wird auf
-dem Host also **101000**. Genau diesen Wert traegt das Installationsskript im
-`fstab`-Eintrag als `uid=`/`gid=` ein - sonst gehoerten die gemounteten
-Dateien im Container niemandem und waeren nicht beschreibbar. Bei einem
-privilegierten Container bleibt es bei `uid=1000`.
+```
+Host   /etc/fstab:  //nas/share  ->  /mnt/mail2nas-<CTID>   (cifs)
+                          |
+            pct -mp0 Bind-Mount   ->  /mnt/nas   (in der LXC)
+                          |
+   docker-compose.local.yml       ->  /mnt/nas   (im Container)
+```
+
+In einer unprivilegierten LXC muss der `fstab`-Eintrag auf dem Host dann
+`uid=101000,gid=101000` setzen: der Container laeuft als uid 1000, und Proxmox
+bildet den User-Namespace ab 100000 ab. Ohne das gehoerten die Dateien im
+Container niemandem und waeren nicht beschreibbar. Bei einem privilegierten
+Container bleibt es bei `uid=1000`.
 
 ## Konfiguration (Environment-Variablen)
 
@@ -377,8 +398,15 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `IMAP_PROCESSED_FOLDER` | Optional: Zielordner fuer verarbeitete Mails | leer (nur `\Seen`) |
 | `IMAP_MODE` | `idle` (Push) oder `poll` | `poll` |
 | `POLL_INTERVAL_SECONDS` | Intervall im Poll-Modus bzw. IDLE-Refresh | `300` |
-| `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten SMB-Shares | `/mnt/nas` |
-| `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zu `STORAGE_ROOT` | `mapping.yaml` |
+| `STORAGE_BACKEND` | `smb` (direkt per SMB, nichts gemountet) oder `local` (in ein gemountetes Verzeichnis schreiben) | `local` |
+| `SMB_HOST` / `SMB_SHARE` | NAS und Freigabename, nur bei `STORAGE_BACKEND=smb` | - |
+| `SMB_USER` / `SMB_PASSWORD` | SMB-Login mit Schreibrechten auf die Zielordner | - |
+| `SMB_DOMAIN` | Domain/Workgroup, leer lassen wenn nicht noetig | leer |
+| `SMB_PORT` | Port des SMB-Servers | `445` |
+| `SMB_ROOT` | Unterordner innerhalb der Freigabe, unter dem alles abgelegt wird | leer (Wurzel) |
+| `SMB_ENCRYPT` | SMB3-Verschluesselung erzwingen (`false` fuer aeltere Server) | `true` |
+| `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten Shares, nur bei `STORAGE_BACKEND=local` | `/mnt/nas` |
+| `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zur Archiv-Wurzel | `mapping.yaml` |
 | `FALLBACK_FOLDER` | Zielordner ohne Mapping-Treffer | `unsorted` |
 | `MATCH_BODY` | Zusaetzlich den Mailtext durchsuchen | `false` |
 | `FILENAME_PREFIX` | `none` \| `date` \| `sender` \| `date_sender` | `date_sender` |
@@ -389,17 +417,20 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `MAX_ATTACHMENTS_PER_MESSAGE` | Anhaenge ueber diesem Limit werden nicht mehr verarbeitet | `20` |
 | `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
-| `NAS_PATH` | Pfad des bereits gemounteten Shares auf dem Docker-Host, wird nach `/mnt/nas` im Container gebunden | `/mnt/nas` |
+| `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
 
-**Keine SMB-Zugangsdaten in der `.env`.** Das Share wird vom Betriebssystem
-gemountet, nicht von Docker - die Zugangsdaten liegen daher in einer
-Credentials-Datei mit `chmod 600` (beim Helper-Skript
-`/etc/mail2nas-smb-credentials-<CTID>` auf dem Proxmox-Host). Siehe
-[Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert).
-`NAS_PATH` sagt Docker nur, welches bereits gemountete Verzeichnis es
-durchreichen soll.
+**Zum Default von `STORAGE_BACKEND`:** Der Default ist bewusst `local`, damit
+eine bestehende Installation, deren `.env` diese Variable noch nicht kennt,
+nach einem Update unveraendert mit ihrem gemounteten Share weiterlaeuft. Alle
+Installationswege (`.env.example`, die Skripte in `scripts/`) setzen den Wert
+ausdruecklich auf `smb`.
+
+**Die SMB-Zugangsdaten stehen in der `.env`** (`chmod 600`, nur in der LXC bzw.
+auf dem Zielsystem). Auf dem Proxmox-Host liegen keine Zugangsdaten und kein
+Mount mehr - siehe
+[Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift).
 
 ## Mapping-Datei und Mehrfach-Anhaenge
 
@@ -501,9 +532,10 @@ Mailserver/ClamAV) einplanen.
 - **Logs pruefen**: `docker compose logs -f` bzw. `journalctl -u mail2nas -f`.
   Jede verarbeitete Mail wird mit UID, Betreff, getroffenem Stichwort,
   Zielordner und gespeicherten Dateien geloggt.
-- **Nichts passiert**: pruefen, ob das SMB-Share tatsaechlich gemountet ist
-  (`mount | grep cifs` bzw. `docker volume inspect mail2nas_nas`), und ob
-  `mapping.yaml` unter dem konfigurierten `MAPPING_PATH` liegt.
+- **Nichts passiert**: pruefen, ob `mapping.yaml` unter dem konfigurierten
+  `MAPPING_PATH` in der Wurzel der Freigabe liegt (beim Start wird geloggt,
+  wie viele Regeln geladen wurden - `Loaded N mapping rule(s)`), und ob im
+  IMAP-Ordner ueberhaupt ungelesene Mails liegen.
 - **Mail landet immer im Fallback-Ordner**: Stichwort in `mapping.yaml`
   pruefen (Betreff-Text muss das Stichwort als Teilstring enthalten, Gross-/
   Kleinschreibung ist egal); bei Bedarf `MATCH_BODY=true` setzen, um auch
@@ -512,9 +544,21 @@ Mailserver/ClamAV) einplanen.
   (`STATE_DB_PATH`) verhindert werden. Bei einem kompletten Neuaufsetzen des
   Containers/Diensts bleibt diese Datei erhalten, solange das zugehoerige
   Volume (`state`) bzw. der Pfad im systemd-Betrieb nicht geloescht wird.
-- **CIFS-Mount schlaegt fehl**: SMB-Protokollversion pruefen (`vers=3.0` ist
-  meist am kompatibelsten), sowie ob der SMB-Benutzer tatsaechlich
-  Schreibrechte auf dem Share hat.
+- **`Cannot archive to //... over SMB`**: der Startup-Schreibtest ist
+  fehlgeschlagen, der Dienst startet bewusst nicht. Die Meldung enthaelt den
+  Original-Fehler des Servers:
+  - `STATUS_LOGON_FAILURE` -> `SMB_USER`/`SMB_PASSWORD`/`SMB_DOMAIN` pruefen.
+  - `STATUS_BAD_NETWORK_NAME` bzw. `No such file or directory` auf einem Pfad
+    direkt unterhalb der Freigabe -> `SMB_SHARE` (oder `SMB_ROOT`) stimmt
+    nicht, Gross-/Kleinschreibung beachten.
+  - `STATUS_ACCESS_DENIED` -> der Benutzer darf nicht schreiben (ggf. nur im
+    per `SMB_ROOT` gesetzten Unterordner).
+  - Timeouts/`Connection refused` -> `SMB_HOST`/`SMB_PORT` und Firewall.
+  - Meldungen rund um Verschluesselung/Dialekt -> `SMB_ENCRYPT=false` testen,
+    aeltere NAS-Firmware unterstuetzt SMB3-Encryption nicht.
+- **`STORAGE_ROOT ... does not exist`** (nur bei `STORAGE_BACKEND=local`): das
+  Share ist nicht gemountet. Entweder den Mount reparieren oder auf
+  `STORAGE_BACKEND=smb` umstellen, dann wird kein Mount mehr gebraucht.
 
 ## Tests
 
@@ -546,9 +590,12 @@ python3 scripts/regenerate-bootstrap.py --check  # nur pruefen (fuer CI)
   Hauptpostfachs verwenden.
 - Dedizierten SMB-Benutzer mit Schreibrechten nur auf die relevanten
   Zielordner einrichten, statt vollem Share-Zugriff.
-- Im systemd-Betrieb liegen die SMB-Zugangsdaten in
-  `/etc/mail2nas-smb-credentials` - Datei mit `chmod 600` nur fuer `root`
-  lesbar halten.
+- Die SMB-Zugangsdaten stehen ausschliesslich in der `.env` des Zielsystems.
+  Es liegen keine Zugangsdaten und kein Mount auf dem Proxmox-Host, also
+  bekommt auch niemand ueber eine Host-Shell oder ein Host-Backup Zugriff auf
+  die Freigabe. Nur beim optionalen `STORAGE_BACKEND=local` gilt das nicht:
+  dort ist der Mountpunkt fuer jeden mit Root-Shell auf dem Node sichtbar und
+  die Credentials-Datei liegt auf dem Host.
 - Siehe auch den ausfuehrlichen Abschnitt
   [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
   zu Groessenlimits, Dateiendungs-Quarantaene und Pfad-Traversal-Schutz.
@@ -687,7 +734,7 @@ auf.
 
 | Was | Wo | Warum es das Update ueberlebt |
 |---|---|---|
-| Zugangsdaten & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
+| Zugangsdaten (IMAP + SMB) & alle Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
 | Stichwort-Mapping | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
 | Bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
 
@@ -704,6 +751,10 @@ cd /opt/mail2nas
 git fetch --depth 1 origin main && git reset --hard FETCH_HEAD
 docker compose up -d --build
 ```
+
+Wer `STORAGE_BACKEND=local` verwendet, haengt dabei die Override-Datei mit an
+(`-f docker-compose.yml -f docker-compose.local.yml`), sonst fehlt der
+Bind-Mount des Shares. `update.sh` erkennt das anhand der `.env` selbst.
 
 Ein erneuter Aufruf von `scripts/proxmox/install.sh` ist ebenfalls
 gefahrlos: erkennt es eine vorhandene `.env` und bekommt keine Zugangsdaten

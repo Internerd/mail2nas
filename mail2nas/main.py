@@ -4,34 +4,14 @@ import logging
 import os
 import sys
 import time
-from pathlib import Path
 
+from . import storage as storage_module
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
-
-
-def _check_storage_root(config: Config) -> None:
-    """Fail fast if the archive target is missing or read-only.
-
-    Without this, a share that failed to mount is indistinguishable from an
-    empty one: attachments would be written into the container's own
-    filesystem and quietly vanish with the container.
-    """
-    root = Path(config.storage_root)
-    if not root.is_dir():
-        raise SystemExit(
-            f"STORAGE_ROOT {config.storage_root} does not exist or is not a directory - "
-            "is the SMB share mounted?"
-        )
-    if not os.access(root, os.W_OK | os.X_OK):
-        raise SystemExit(
-            f"STORAGE_ROOT {config.storage_root} is not writable by uid {os.getuid()} - "
-            "check the mount options (uid/gid/file_mode) and the share permissions."
-        )
 
 
 def main() -> None:
@@ -42,18 +22,21 @@ def main() -> None:
     )
 
     config = Config.from_env()
-    _check_storage_root(config)
-    mapping_full_path = os.path.join(config.storage_root, config.mapping_path)
-    mapping = Mapping(mapping_full_path, config.fallback_folder)
+    storage = storage_module.from_config(config)
+    # Fail fast: an unreachable share is otherwise indistinguishable from an
+    # empty one, and attachments would land somewhere they silently vanish.
+    storage.check_writable()
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    archiver = Archiver(config, mapping, store)
+    archiver = Archiver(config, mapping, store, storage)
 
     logger.info(
-        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s dry_run=%s",
+        "Starting mail2nas: imap=%s folder=%s mode=%s storage=%s (%s) dry_run=%s",
         config.imap_host,
         config.imap_folder,
         config.imap_mode,
-        config.storage_root,
+        storage.description,
+        config.storage_backend,
         config.dry_run,
     )
 
@@ -81,6 +64,7 @@ def main() -> None:
             time.sleep(config.poll_interval)
     finally:
         store.close()
+        storage.close()
 
 
 def _run_poll(archiver: Archiver, client, config: Config) -> None:

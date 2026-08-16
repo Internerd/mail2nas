@@ -31,21 +31,23 @@ def sanitize_path_segment(segment: str) -> str:
     return segment.strip().rstrip(". ").strip()
 
 
-def safe_join(root: str | Path, relative: str) -> Path:
-    """Join `relative` onto `root`, guaranteeing the result stays under `root`.
+def safe_relative_parts(relative: str) -> tuple[str, ...]:
+    """Split `relative` into validated, sanitized path components.
 
     The target folders come from `mapping.yaml`, which lives on the archive
     share itself - so whoever can edit that file could otherwise redirect
     attachments anywhere the process can write, via `../..` or an absolute
-    path. (Note `Path("/mnt/nas") / "/etc"` yields `/etc`: an absolute right
-    operand discards the root entirely.)
+    path.
 
     Absolute paths and `..` components are refused rather than reinterpreted,
     and every remaining component is sanitized. Nested targets such as
     "rechnungen/2026" stay supported. Raises ValueError if nothing usable is
     left, so the caller can fall back to a known-good folder.
+
+    Returning components rather than a joined path keeps this usable for both
+    storage backends: the local one joins them onto a filesystem root, the SMB
+    one onto a UNC path.
     """
-    root_path = Path(root)
     raw = str(relative).replace("\\", "/")
 
     if raw.strip().startswith("/"):
@@ -69,7 +71,18 @@ def safe_join(root: str | Path, relative: str) -> Path:
     if not parts:
         raise ValueError(f"Target folder is empty: {relative!r}")
 
-    result = root_path.joinpath(*parts)
+    return tuple(parts)
+
+
+def safe_join(root: str | Path, relative: str) -> Path:
+    """Join `relative` onto `root`, guaranteeing the result stays under `root`.
+
+    See `safe_relative_parts` for what is accepted. (Note `Path("/mnt/nas") /
+    "/etc"` yields `/etc`: an absolute right operand discards the root
+    entirely - hence the validation rather than a plain join.)
+    """
+    root_path = Path(root)
+    result = root_path.joinpath(*safe_relative_parts(relative))
 
     # Belt and braces: the component filtering above already makes escaping
     # impossible, but verify containment lexically so any future change to the
