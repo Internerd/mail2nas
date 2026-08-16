@@ -13,6 +13,7 @@ kann aber genauso als einfacher systemd-Service laufen.
 - [Installation, Variante 2: Proxmox ohne Git (manuelles Kopieren)](#installation-variante-2-proxmox-ohne-git-manuelles-kopieren)
 - [Weiter mit Docker Compose](#weiter-mit-docker-compose)
 - [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
+- [Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -192,28 +193,35 @@ Empfohlener Weg, sobald der Ordner (per Variante A oder B) auf dem Zielsystem
 liegt:
 
 ```bash
-cd /opt/mail2nas
-
-# einmalig, falls noch nicht vorhanden - noetig fuer den CIFS-Volume-Treiber
 apt-get update && apt-get install -y docker.io docker-compose-plugin cifs-utils
 
-cp .env.example .env
-$EDITOR .env                    # IMAP- und SMB-Zugangsdaten eintragen
+# Das SMB-Share zuerst per Betriebssystem einbinden - NICHT per Docker,
+# siehe "Warum der SMB-Mount auf dem Host passiert".
+cat > /etc/mail2nas-smb-credentials <<'EOF'
+username=mail2nas
+password=changeme
+EOF
+chmod 600 /etc/mail2nas-smb-credentials
+mkdir -p /mnt/nas
+echo '//nas.local/Belege /mnt/nas cifs credentials=/etc/mail2nas-smb-credentials,uid=1000,gid=1000,file_mode=0660,dir_mode=0770,vers=3.0,_netdev,nofail 0 0' >> /etc/fstab
+mount /mnt/nas
+mountpoint /mnt/nas          # muss "is a mountpoint" melden
 
-docker compose build
-docker compose up -d
+cd /opt/mail2nas
+cp .env.example .env
+$EDITOR .env                 # IMAP-Zugangsdaten eintragen, NAS_PATH pruefen
+
+docker compose up -d --build
 docker compose logs -f
 ```
 
 Danach `config/mapping.example.yaml` als `mapping.yaml` auf die Wurzel des
-SMB-Shares kopieren (Pfad relativ dazu ist in `MAPPING_PATH` konfigurierbar)
-und an die eigenen Stichwoerter/Ordner anpassen - z. B. direkt vom
-Proxmox-Host aus, sobald das Share gemountet ist:
+Shares kopieren (Pfad relativ dazu ist in `MAPPING_PATH` konfigurierbar) und
+an die eigenen Stichwoerter/Ordner anpassen:
 
 ```bash
-# Beispiel: Share ist unter /mnt/nas-tmp erreichbar
-cp config/mapping.example.yaml /mnt/nas-tmp/mapping.yaml
-$EDITOR /mnt/nas-tmp/mapping.yaml
+cp config/mapping.example.yaml /mnt/nas/mapping.yaml
+$EDITOR /mnt/nas/mapping.yaml
 ```
 
 Falls kein separater Mount-Zugriff aufs Share besteht, reicht es auch, die
@@ -306,6 +314,59 @@ journalctl -u mail2nas -f
 `mapping.yaml` wie im Docker-Abschnitt beschrieben auf `/mnt/nas` (bzw. den
 konfigurierten `MAPPING_PATH`) kopieren.
 
+## Warum der SMB-Mount auf dem Host passiert
+
+Das SMB-Share wird **nicht von Docker** gemountet, sondern vom Betriebssystem
+eine Ebene hoeher. Docker bekommt nur einen gewoehnlichen Bind-Mount eines
+bereits eingebundenen Verzeichnisses.
+
+Der naheliegende Weg - Dockers `local`-Volume-Treiber mit `type: cifs` -
+funktioniert in der hier empfohlenen Umgebung naemlich nicht:
+
+- Dieser Treiber setzt den `mount()`-Syscall **selbst** ab (er benutzt nicht
+  das Hilfsprogramm `mount.cifs`). Fuer Dateisysteme wie CIFS verweigert der
+  Kernel diesen Syscall aus dem User-Namespace einer **unprivilegierten LXC**.
+  Ergebnis ist die wenig aussagekraeftige Meldung:
+  ```
+  failed to mount local volume: ... vers=3.0,uid=1000,... : invalid argument
+  ```
+- Zusaetzlich landet das SMB-Passwort dabei dauerhaft in den Volume-Metadaten
+  des Docker-Daemons und ist per `docker volume inspect` auslesbar.
+
+Beides entfaellt mit dem Mount auf Host-Ebene. Die Aufteilung sieht so aus:
+
+```
+Proxmox-Host   /etc/fstab:  //nas/share  ->  /mnt/mail2nas-<CTID>   (cifs)
+                                 |
+                   pct -mp0 Bind-Mount   ->  /mnt/nas   (in der LXC)
+                                 |
+              docker compose Bind-Mount  ->  /mnt/nas   (im Container)
+```
+
+Konkrete Vorteile:
+
+- Funktioniert mit einer **unprivilegierten** LXC - die brauchst du nicht
+  aufzuweichen, nur damit ein Mount klappt.
+- Die SMB-Zugangsdaten liegen ausschliesslich auf dem Host in
+  `/etc/mail2nas-smb-credentials-<CTID>` (`chmod 600`) und nie im Container
+  oder in der `.env`.
+- Der Host kuemmert sich um Reconnects nach einem Netzwerkausfall, statt dass
+  jeder Container das einzeln tut.
+
+`scripts/proxmox/mail2nas.sh` richtet das alles automatisch ein (inklusive
+`fstab`-Eintrag mit Sicherung der bisherigen Datei). Bei einer VM oder auf
+Bare Metal ohne LXC gilt dasselbe Prinzip: Share per `/etc/fstab` nach
+`/mnt/nas` mounten, `NAS_PATH` zeigt dann dorthin.
+
+### uid-Mapping bei unprivilegierten Containern
+
+Der Docker-Container laeuft als uid 1000. Proxmox bildet den User-Namespace
+einer unprivilegierten LXC ab 100000 ab, aus uid 1000 im Container wird auf
+dem Host also **101000**. Genau diesen Wert traegt das Installationsskript im
+`fstab`-Eintrag als `uid=`/`gid=` ein - sonst gehoerten die gemounteten
+Dateien im Container niemandem und waeren nicht beschreibbar. Bei einem
+privilegierten Container bleibt es bei `uid=1000`.
+
 ## Konfiguration (Environment-Variablen)
 
 | Variable | Beschreibung | Default |
@@ -328,13 +389,17 @@ konfigurierten `MAPPING_PATH`) kopieren.
 | `MAX_ATTACHMENTS_PER_MESSAGE` | Anhaenge ueber diesem Limit werden nicht mehr verarbeitet | `20` |
 | `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
+| `NAS_PATH` | Pfad des bereits gemounteten Shares auf dem Docker-Host, wird nach `/mnt/nas` im Container gebunden | `/mnt/nas` |
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
 
-SMB-Zugangsdaten (`SMB_HOST`, `SMB_SHARE`, `SMB_USER`, `SMB_PASSWORD`,
-`SMB_DOMAIN`) werden nur vom CIFS-Volume-Treiber in `docker-compose.yml`
-verwendet, nicht vom Python-Code selbst. Im systemd/venv-Betrieb entfallen
-sie, da das Share dort direkt per `/etc/fstab` gemountet wird.
+**Keine SMB-Zugangsdaten in der `.env`.** Das Share wird vom Betriebssystem
+gemountet, nicht von Docker - die Zugangsdaten liegen daher in einer
+Credentials-Datei mit `chmod 600` (beim Helper-Skript
+`/etc/mail2nas-smb-credentials-<CTID>` auf dem Proxmox-Host). Siehe
+[Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert).
+`NAS_PATH` sagt Docker nur, welches bereits gemountete Verzeichnis es
+durchreichen soll.
 
 ## Mapping-Datei und Mehrfach-Anhaenge
 

@@ -141,6 +141,66 @@ SMB_DOMAIN="$(input 'SMB-Domain/Workgroup (leer lassen falls keine)' 'WORKGROUP'
 MAPPING_PATH="$(input 'Pfad zur mapping.yaml relativ zur Freigabe' 'mapping.yaml')"
 FALLBACK_FOLDER="$(input 'Fallback-Ordner ohne Mapping-Treffer' 'unsorted')"
 
+# --- SMB-Share auf dem HOST einbinden -------------------------------------
+#
+# Bewusst nicht im Container: Dockers cifs-Volume-Treiber setzt den
+# mount()-Syscall selbst ab, und den verweigert der Kernel innerhalb einer
+# unprivilegierten LXC ("invalid argument"). Ausserdem blieben die
+# SMB-Zugangsdaten so in den Volume-Metadaten des Docker-Daemons stehen.
+# Stattdessen: Host mountet das Share, die LXC bekommt es per Bind-Mount.
+
+HOST_MOUNT="/mnt/mail2nas-${CTID}"
+CRED_FILE="/etc/mail2nas-smb-credentials-${CTID}"
+
+# uid/gid, unter der die Dateien im Container erscheinen sollen. Das Image
+# laeuft als uid 1000; in einer unprivilegierten LXC ist das auf dem Host
+# uid 100000+1000, weil Proxmox den Namespace ab 100000 abbildet.
+if [ "$UNPRIVILEGED" -eq 1 ]; then
+  MOUNT_UID=101000
+else
+  MOUNT_UID=1000
+fi
+
+echo "==> SMB-Share auf dem Host einbinden ($HOST_MOUNT) ..."
+if ! command -v mount.cifs >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y cifs-utils
+fi
+
+umask 077
+cat > "$CRED_FILE" <<CREDEOF
+username=${SMB_USER}
+password=${SMB_PASSWORD}
+CREDEOF
+# Eine leere domain=-Zeile lassen manche Server/Kernel-Versionen scheitern,
+# daher nur schreiben, wenn tatsaechlich eine gesetzt ist.
+[ -n "$SMB_DOMAIN" ] && echo "domain=${SMB_DOMAIN}" >> "$CRED_FILE"
+chmod 600 "$CRED_FILE"
+
+mkdir -p "$HOST_MOUNT"
+
+FSTAB_LINE="//${SMB_HOST}/${SMB_SHARE} ${HOST_MOUNT} cifs credentials=${CRED_FILE},uid=${MOUNT_UID},gid=${MOUNT_UID},file_mode=0660,dir_mode=0770,vers=3.0,_netdev,nofail 0 0"
+if ! grep -qF " ${HOST_MOUNT} cifs " /etc/fstab 2>/dev/null; then
+  cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)"
+  echo "$FSTAB_LINE" >> /etc/fstab
+  echo "    fstab-Eintrag ergaenzt (Sicherung unter /etc/fstab.bak.*)"
+else
+  echo "    fstab-Eintrag fuer $HOST_MOUNT existiert bereits - unveraendert"
+fi
+
+mountpoint -q "$HOST_MOUNT" || mount "$HOST_MOUNT"
+
+if ! mountpoint -q "$HOST_MOUNT"; then
+  echo >&2
+  echo "FEHLER: //${SMB_HOST}/${SMB_SHARE} konnte nicht auf $HOST_MOUNT gemountet werden." >&2
+  echo "Haeufige Ursachen: falsche Zugangsdaten, Share-Name mit anderer Gross-/" >&2
+  echo "Kleinschreibung, oder der Server verlangt eine andere SMB-Version." >&2
+  echo "Manuell testen (andere Version probieren):" >&2
+  echo "  mount -t cifs //${SMB_HOST}/${SMB_SHARE} $HOST_MOUNT -o credentials=$CRED_FILE,vers=2.1" >&2
+  echo "Danach ggf. vers= in /etc/fstab anpassen und dieses Skript erneut starten." >&2
+  exit 1
+fi
+echo "    Mount erfolgreich."
+
 msg "Alle Eingaben erfasst.
 
 Container $CTID ($CT_HOSTNAME) wird jetzt erstellt und eingerichtet - das kann je nach Verbindung ein paar Minuten dauern. Dieses Fenster schliesst sich, der Fortschritt laeuft danach im Klartext auf der Shell."
@@ -157,6 +217,7 @@ pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
   --unprivileged "$UNPRIVILEGED" \
   --features "nesting=1,keyctl=1" \
+  --mp0 "${HOST_MOUNT},mp=/mnt/nas" \
   --onboot 1 \
   --start 1
 
@@ -186,11 +247,7 @@ IMAP_PASSWORD=$(sq "$IMAP_PASSWORD")
 IMAP_FOLDER=$(sq "$IMAP_FOLDER")
 IMAP_MODE=$(sq "$IMAP_MODE")
 POLL_INTERVAL_SECONDS=$(sq "$POLL_INTERVAL_SECONDS")
-SMB_HOST=$(sq "$SMB_HOST")
-SMB_SHARE=$(sq "$SMB_SHARE")
-SMB_USER=$(sq "$SMB_USER")
-SMB_PASSWORD=$(sq "$SMB_PASSWORD")
-SMB_DOMAIN=$(sq "$SMB_DOMAIN")
+NAS_PATH='/mnt/nas'
 MAPPING_PATH=$(sq "$MAPPING_PATH")
 FALLBACK_FOLDER=$(sq "$FALLBACK_FOLDER")
 MAIL2NAS_REPO_URL=$(sq "$REPO_URL")
@@ -215,7 +272,11 @@ FINAL_MSG="Fertig!
 
 Container $CTID ($CT_HOSTNAME) laeuft unter ${CT_IP:-<unbekannt>}.
 
-Naechster Schritt: config/mapping.example.yaml (im Container unter /opt/mail2nas) als mapping.yaml auf die Wurzel deines SMB-Shares (\"$SMB_SHARE\") kopieren und an deine Stichwoerter anpassen.
+Das Share //${SMB_HOST}/${SMB_SHARE} ist auf dem Host unter $HOST_MOUNT eingebunden (Eintrag in /etc/fstab) und als /mnt/nas in den Container durchgereicht. Die SMB-Zugangsdaten liegen nur auf dem Host in $CRED_FILE (chmod 600), nicht im Container.
+
+Naechster Schritt - Mapping-Datei anlegen, direkt vom Host aus:
+  cp /var/lib/lxc/$CTID/rootfs/opt/mail2nas/config/mapping.example.yaml $HOST_MOUNT/mapping.yaml 2>/dev/null || pct exec $CTID -- cp /opt/mail2nas/config/mapping.example.yaml /mnt/nas/mapping.yaml
+  nano $HOST_MOUNT/mapping.yaml
 
 Logs pruefen:
   pct exec $CTID -- bash -c 'cd /opt/mail2nas && docker compose logs -f'

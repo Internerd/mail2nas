@@ -11,8 +11,13 @@
 # Erwartet die App-Konfiguration entweder als bereits gesetzte
 # Umgebungsvariablen, oder in /root/mail2nas-install.env (wird automatisch
 # geladen und danach geloescht, da sie Klartext-Zugangsdaten enthaelt).
-# Mindestens IMAP_HOST/IMAP_USER/IMAP_PASSWORD und SMB_HOST/SMB_SHARE/
-# SMB_USER/SMB_PASSWORD muessen gesetzt sein.
+# Erforderlich sind nur IMAP_HOST/IMAP_USER/IMAP_PASSWORD.
+#
+# SMB-Zugangsdaten werden hier NICHT gebraucht: das Share muss bereits vom
+# Betriebssystem unter NAS_PATH (Default /mnt/nas) eingebunden sein - siehe
+# README, Abschnitt "Warum der SMB-Mount auf dem Host passiert".
+# Existiert bereits eine .env und werden keine Zugangsdaten uebergeben,
+# laeuft das Skript im Update-Modus und laesst die Konfiguration unveraendert.
 
 set -euo pipefail
 
@@ -66,10 +71,22 @@ else
   : "${IMAP_HOST:?IMAP_HOST ist nicht gesetzt}"
   : "${IMAP_USER:?IMAP_USER ist nicht gesetzt}"
   : "${IMAP_PASSWORD:?IMAP_PASSWORD ist nicht gesetzt}"
-  : "${SMB_HOST:?SMB_HOST ist nicht gesetzt}"
-  : "${SMB_SHARE:?SMB_SHARE ist nicht gesetzt}"
-  : "${SMB_USER:?SMB_USER ist nicht gesetzt}"
-  : "${SMB_PASSWORD:?SMB_PASSWORD ist nicht gesetzt}"
+fi
+
+# Das SMB-Share muss bereits vom Betriebssystem gemountet sein (per Bind-Mount
+# vom Proxmox-Host, oder per fstab in einer VM). Lieber hier abbrechen als
+# spaeter Anhaenge in ein leeres Verzeichnis schreiben, das beim naechsten
+# Neustart verschwindet.
+NAS_PATH="${NAS_PATH:-/mnt/nas}"
+if [ ! -d "$NAS_PATH" ]; then
+  echo "FEHLER: $NAS_PATH existiert nicht." >&2
+  echo "Das SMB-Share muss vor der Installation dort eingebunden sein - siehe README" >&2
+  echo "(Abschnitt 'Warum der SMB-Mount auf dem Host passiert')." >&2
+  exit 1
+fi
+if ! mountpoint -q "$NAS_PATH" 2>/dev/null; then
+  echo "WARNUNG: $NAS_PATH ist kein Mountpoint - liegt das Share wirklich dort?" >&2
+  echo "         Anhaenge wuerden sonst in das lokale Dateisystem geschrieben." >&2
 fi
 
 echo "==> Pakete installieren (git, cifs-utils, curl, ca-certificates) ..."
@@ -113,11 +130,7 @@ IMAP_OVERSIZED_FOLDER=$(dq "${IMAP_OVERSIZED_FOLDER:-}")
 IMAP_MODE=$(dq "${IMAP_MODE:-idle}")
 POLL_INTERVAL_SECONDS=$(dq "${POLL_INTERVAL_SECONDS:-300}")
 
-SMB_HOST=$(dq "${SMB_HOST}")
-SMB_SHARE=$(dq "${SMB_SHARE}")
-SMB_USER=$(dq "${SMB_USER}")
-SMB_PASSWORD=$(dq "${SMB_PASSWORD}")
-SMB_DOMAIN=$(dq "${SMB_DOMAIN:-}")
+NAS_PATH=$(dq "${NAS_PATH}")
 
 MAPPING_PATH=$(dq "${MAPPING_PATH:-mapping.yaml}")
 FALLBACK_FOLDER=$(dq "${FALLBACK_FOLDER:-unsorted}")
@@ -155,7 +168,7 @@ echo "Config:  $TARGET_DIR/.env (chmod 600)"
 
 if [ "$WRITE_ENV" -eq 1 ]; then
   echo
-  echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml auf die"
-  echo "Wurzel des SMB-Shares (\"${SMB_SHARE:-}\") kopieren und an deine"
-  echo "Stichwoerter anpassen - siehe README.md fuer Details."
+  echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml nach"
+  echo "$NAS_PATH kopieren und an deine Stichwoerter anpassen:"
+  echo "  cp $TARGET_DIR/config/mapping.example.yaml $NAS_PATH/mapping.yaml"
 fi

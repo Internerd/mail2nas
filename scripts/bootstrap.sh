@@ -67,13 +67,18 @@ IMAP_MODE=idle
 POLL_INTERVAL_SECONDS=300
 
 # --- Target SMB share ----------------------------------------------------
-# Mounted by docker-compose.yml at /mnt/nas inside the container.
-SMB_HOST=nas.local
-SMB_SHARE=Belege
-SMB_USER=mail2nas
-SMB_PASSWORD=changeme
-# Use an empty string ("") if your SMB server has no domain/workgroup.
-SMB_DOMAIN=WORKGROUP
+# Das SMB-Share wird NICHT von Docker gemountet, sondern vom Betriebssystem:
+# auf dem Proxmox-Host per /etc/fstab und dann per Bind-Mount in die LXC
+# (so macht es scripts/proxmox/mail2nas.sh), oder bei einer VM/Bare-Metal
+# direkt per /etc/fstab in diesem System.
+#
+# Grund: Dockers cifs-Volume-Treiber setzt den mount()-Syscall selbst ab. Der
+# ist in einer unprivilegierten LXC kernelseitig gesperrt ("invalid argument"),
+# und die SMB-Zugangsdaten landen dabei in den Volume-Metadaten des Docker-
+# Daemons. Beides entfaellt, wenn das Share eine Ebene hoeher gemountet wird.
+#
+# Hier steht daher nur noch, WO das bereits gemountete Share liegt:
+NAS_PATH=/mnt/nas
 
 # --- Mapping & filing behaviour -------------------------------------------
 # Path to the mapping file, relative to the SMB share root (/mnt/nas).
@@ -167,19 +172,18 @@ services:
       STORAGE_ROOT: /mnt/nas
       STATE_DB_PATH: /data/state.db
     volumes:
-      - nas:/mnt/nas
+      # Plain bind mount of an already-mounted directory - the SMB share is
+      # mounted by the OS (host fstab, or the Proxmox host bind-mounted into
+      # the LXC), NOT by Docker.
+      #
+      # Docker's local volume driver with type=cifs issues the mount() syscall
+      # itself, which the kernel refuses from inside an unprivileged LXC
+      # ("invalid argument"), and it would also put the SMB password into the
+      # daemon's volume metadata. Mounting one level up avoids both.
+      - ${NAS_PATH:-/mnt/nas}:/mnt/nas
       - state:/data
 
 volumes:
-  # Mounted by the Docker daemon on the host via cifs-utils - the container
-  # itself never needs SMB credentials or CAP_SYS_ADMIN.
-  # Requires cifs-utils to be installed on the Proxmox host/LXC running Docker.
-  nas:
-    driver: local
-    driver_opts:
-      type: cifs
-      device: "//${SMB_HOST}/${SMB_SHARE}"
-      o: "username=${SMB_USER},password=${SMB_PASSWORD},domain=${SMB_DOMAIN},vers=3.0,uid=1000,gid=1000,file_mode=0664,dir_mode=0775"
   # Local state (processed-message tracking), no need for this to live on the share.
   state:
 MAIL2NAS_EOF
