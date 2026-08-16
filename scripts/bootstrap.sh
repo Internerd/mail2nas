@@ -13,6 +13,8 @@
 # requirements*.txt, Dockerfile, docker-compose.yml, .env.example,
 # .dockerignore. Siehe README.md im Original-Repo fuer die Installation
 # im Anschluss.
+#
+# NICHT VON HAND BEARBEITEN - erzeugt von scripts/regenerate-bootstrap.py.
 
 set -euo pipefail
 
@@ -22,19 +24,19 @@ cd "$TARGET"
 
 echo "Schreibe Projektdateien nach $TARGET ..."
 
-# --- requirements.txt --------------------------------------------------
+# --- requirements.txt ---
 cat > requirements.txt <<'MAIL2NAS_EOF'
 imapclient>=3.0,<4.0
 PyYAML>=6.0,<7.0
 MAIL2NAS_EOF
 
-# --- requirements-dev.txt ------------------------------------------------
+# --- requirements-dev.txt ---
 cat > requirements-dev.txt <<'MAIL2NAS_EOF'
 -r requirements.txt
 pytest>=8.0,<9.0
 MAIL2NAS_EOF
 
-# --- .env.example --------------------------------------------------------
+# --- .env.example ---
 cat > .env.example <<'MAIL2NAS_EOF'
 # Copy to .env and fill in real values. Never commit the real .env file.
 #
@@ -110,10 +112,14 @@ LOG_LEVEL=INFO
 DRY_RUN=false
 MAIL2NAS_EOF
 
-# --- .dockerignore ---------------------------------------------------------
+# --- .dockerignore ---
 cat > .dockerignore <<'MAIL2NAS_EOF'
 .git
+# .env and the credential-bearing backups update.sh writes next to it must
+# never enter the build context.
 .env
+.env.*
+!.env.example
 __pycache__
 *.pyc
 .venv
@@ -123,7 +129,7 @@ tests
 README.md
 MAIL2NAS_EOF
 
-# --- Dockerfile --------------------------------------------------------
+# --- Dockerfile ---
 cat > Dockerfile <<'MAIL2NAS_EOF'
 FROM python:3.12-slim
 
@@ -147,7 +153,7 @@ ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python", "-m", "mail2nas.main"]
 MAIL2NAS_EOF
 
-# --- docker-compose.yml -------------------------------------------------
+# --- docker-compose.yml ---
 cat > docker-compose.yml <<'MAIL2NAS_EOF'
 services:
   mail2nas:
@@ -178,7 +184,7 @@ volumes:
   state:
 MAIL2NAS_EOF
 
-# --- config/mapping.example.yaml -----------------------------------------
+# --- config/mapping.example.yaml ---
 cat > config/mapping.example.yaml <<'MAIL2NAS_EOF'
 # Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
 # (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
@@ -214,10 +220,7 @@ Mahnung: mahnungen
 Gutschrift: gutschriften
 MAIL2NAS_EOF
 
-# --- mail2nas/__init__.py -------------------------------------------------
-touch mail2nas/__init__.py
-
-# --- mail2nas/config.py ---------------------------------------------------
+# --- mail2nas/config.py ---
 cat > mail2nas/config.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -247,6 +250,26 @@ def _extension_set(name: str, default: str) -> frozenset[str]:
     return frozenset(
         ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip()
     )
+
+
+def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:
+    """Read an integer setting, failing with a usable message instead of a traceback."""
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a whole number, got {raw!r}") from None
+    if value < minimum or (maximum is not None and value > maximum):
+        allowed = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise SystemExit(f"{name} must be {allowed}, got {value}")
+    return value
+
+
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in allowed:
+        raise SystemExit(f"{name} must be one of {', '.join(allowed)}, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -283,23 +306,25 @@ class Config:
         try:
             return cls(
                 imap_host=os.environ["IMAP_HOST"],
-                imap_port=int(os.environ.get("IMAP_PORT", "993")),
+                imap_port=_int("IMAP_PORT", "993", minimum=1, maximum=65535),
                 imap_user=os.environ["IMAP_USER"],
                 imap_password=os.environ["IMAP_PASSWORD"],
                 imap_ssl=_bool("IMAP_SSL", True),
                 imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
                 imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
                 imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
-                imap_mode=os.environ.get("IMAP_MODE", "poll").lower(),
-                poll_interval=int(os.environ.get("POLL_INTERVAL_SECONDS", "300")),
+                imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
+                poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
                 mapping_path=os.environ.get("MAPPING_PATH", "mapping.yaml"),
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
-                filename_prefix=os.environ.get("FILENAME_PREFIX", "date_sender"),
-                max_attachment_size_mb=int(os.environ.get("MAX_ATTACHMENT_SIZE_MB", "25")),
-                max_message_size_mb=int(os.environ.get("MAX_MESSAGE_SIZE_MB", "50")),
-                max_attachments_per_message=int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "20")),
+                filename_prefix=_choice(
+                    "FILENAME_PREFIX", "date_sender", ("none", "date", "sender", "date_sender")
+                ),
+                max_attachment_size_mb=_int("MAX_ATTACHMENT_SIZE_MB", "25"),
+                max_message_size_mb=_int("MAX_MESSAGE_SIZE_MB", "50"),
+                max_attachments_per_message=_int("MAX_ATTACHMENTS_PER_MESSAGE", "20"),
                 blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
@@ -309,7 +334,7 @@ class Config:
             raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
 MAIL2NAS_EOF
 
-# --- mail2nas/mapping.py ---------------------------------------------------
+# --- mail2nas/mapping.py ---
 cat > mail2nas/mapping.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -351,18 +376,35 @@ class Mapping:
         if not force and self._mtime == mtime:
             return
 
-        with self._path.open("r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+        # The mapping file is edited by hand on a network share, so a malformed
+        # or half-written version is a matter of when, not if. Keep serving the
+        # last good rules instead of letting the exception escape: it would
+        # propagate out of the IMAP loop and leave the service reconnecting in
+        # a tight loop, archiving nothing at all until someone noticed.
+        try:
+            with self._path.open("r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            if not isinstance(raw, dict):
+                raise ValueError("file must contain a mapping of keyword -> folder")
+            rules = sorted(
+                ((str(keyword), str(folder)) for keyword, folder in raw.items()),
+                # Longest keyword first, so "Rechnungskorrektur" beats "RE".
+                key=lambda kv: len(kv[0]),
+                reverse=True,
+            )
+        except Exception as exc:
+            # Remember the mtime anyway, so a persistently broken file is
+            # reported once rather than on every single cycle.
+            self._mtime = mtime
+            logger.error(
+                "Could not load mapping file %s (%s) - keeping the previous %d rule(s)",
+                self._path,
+                exc,
+                len(self._rules),
+            )
+            return
 
-        if not isinstance(raw, dict):
-            raise ValueError(f"Mapping file {self._path} must contain a mapping of keyword -> folder")
-
-        # Longest keyword first, so "Rechnungskorrektur" is checked before "RE".
-        self._rules = sorted(
-            ((str(keyword), str(folder)) for keyword, folder in raw.items()),
-            key=lambda kv: len(kv[0]),
-            reverse=True,
-        )
+        self._rules = rules
         self._mtime = mtime
         logger.info("Loaded %d mapping rule(s) from %s", len(self._rules), self._path)
 
@@ -375,15 +417,23 @@ class Mapping:
         return self._fallback_folder, None
 MAIL2NAS_EOF
 
-# --- mail2nas/filenames.py --------------------------------------------------
+# --- mail2nas/filenames.py ---
 cat > mail2nas/filenames.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import unicodedata
 from pathlib import Path
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# Characters that are path separators, reserved on Windows/SMB, or control
+# characters. Folder names keep spaces and non-ASCII letters (people do name
+# folders "Rechnungen 2026"), so this is deliberately more permissive than
+# the attachment-filename sanitizer.
+_UNSAFE_SEGMENT = re.compile(r'[\x00-\x1f\x7f<>:"|?*\\/]+')
 
 
 def sanitize_filename(name: str) -> str:
@@ -391,6 +441,66 @@ def sanitize_filename(name: str) -> str:
     name = unicodedata.normalize("NFKD", name)
     name = _UNSAFE.sub("_", name).strip("._")
     return name or "attachment"
+
+
+def sanitize_path_segment(segment: str) -> str:
+    """Sanitize a single folder-name component (never a path)."""
+    segment = unicodedata.normalize("NFKC", segment)
+    segment = _UNSAFE_SEGMENT.sub("_", segment)
+    # Trailing dots/spaces are silently dropped by Windows/SMB, which would
+    # make the on-disk name differ from what was configured.
+    return segment.strip().rstrip(". ").strip()
+
+
+def safe_join(root: str | Path, relative: str) -> Path:
+    """Join `relative` onto `root`, guaranteeing the result stays under `root`.
+
+    The target folders come from `mapping.yaml`, which lives on the archive
+    share itself - so whoever can edit that file could otherwise redirect
+    attachments anywhere the process can write, via `../..` or an absolute
+    path. (Note `Path("/mnt/nas") / "/etc"` yields `/etc`: an absolute right
+    operand discards the root entirely.)
+
+    Absolute paths and `..` components are refused rather than reinterpreted,
+    and every remaining component is sanitized. Nested targets such as
+    "rechnungen/2026" stay supported. Raises ValueError if nothing usable is
+    left, so the caller can fall back to a known-good folder.
+    """
+    root_path = Path(root)
+    raw = str(relative).replace("\\", "/")
+
+    if raw.strip().startswith("/"):
+        # Confining "/etc/cron.d" to "<root>/etc/cron.d" would be safe but
+        # produces a surprising deep tree on the share. An absolute target is
+        # always a misconfiguration, so say so and let the caller fall back.
+        raise ValueError(f"Target folder must be relative to the storage root: {relative!r}")
+
+    parts: list[str] = []
+    for candidate in raw.split("/"):
+        candidate = candidate.strip()
+        if candidate in ("", "."):
+            continue
+        if candidate == "..":
+            raise ValueError(f"Refusing parent-directory component in target folder: {relative!r}")
+        cleaned = sanitize_path_segment(candidate)
+        if not cleaned or cleaned == "..":
+            raise ValueError(f"Target folder component is empty after sanitizing: {relative!r}")
+        parts.append(cleaned)
+
+    if not parts:
+        raise ValueError(f"Target folder is empty: {relative!r}")
+
+    result = root_path.joinpath(*parts)
+
+    # Belt and braces: the component filtering above already makes escaping
+    # impossible, but verify containment lexically so any future change to the
+    # parsing cannot silently reopen the hole.
+    root_abs = os.path.abspath(root_path)
+    result_abs = os.path.abspath(result)
+    if result_abs != root_abs and not result_abs.startswith(root_abs.rstrip(os.sep) + os.sep):
+        raise ValueError(f"Target folder escapes the storage root: {relative!r}")
+
+    return result
 
 
 def unique_path(directory: str | Path, filename: str) -> Path:
@@ -407,9 +517,33 @@ def unique_path(directory: str | Path, filename: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def write_atomic(path: str | Path, data: bytes) -> None:
+    """Write `data` to `path` via a temporary file plus rename.
+
+    A direct write that is interrupted (container restart, SMB share dropping
+    mid-transfer) would leave a truncated file behind that still looks like a
+    complete invoice. Renaming into place means the final name only ever
+    appears once the bytes are fully written.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".mail2nas-tmp-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 MAIL2NAS_EOF
 
-# --- mail2nas/state.py -------------------------------------------------------
+# --- mail2nas/state.py ---
 cat > mail2nas/state.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -451,7 +585,7 @@ class ProcessedStore:
         self._conn.close()
 MAIL2NAS_EOF
 
-# --- mail2nas/archiver.py -----------------------------------------------------
+# --- mail2nas/archiver.py ---
 cat > mail2nas/archiver.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -465,7 +599,7 @@ from pathlib import Path
 from imapclient import IMAPClient
 
 from .config import Config
-from .filenames import sanitize_filename, unique_path
+from .filenames import safe_join, sanitize_filename, unique_path, write_atomic
 from .mapping import Mapping
 from .state import ProcessedStore
 
@@ -588,7 +722,7 @@ class Archiver:
                 folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
                     filename, mail_folder, mail_keyword
                 )
-                target_dir = Path(self.config.storage_root) / folder_name
+                target_dir = self._target_dir(folder_name)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if self.config.dry_run:
@@ -597,7 +731,7 @@ class Archiver:
 
                 target_dir.mkdir(parents=True, exist_ok=True)
                 out_path = unique_path(target_dir, out_name)
-                out_path.write_bytes(payload)
+                write_atomic(out_path, payload)
                 saved.append(str(out_path))
                 logger.info(
                     "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
@@ -616,6 +750,26 @@ class Archiver:
                 client.move([uid], self.config.imap_processed_folder)
         return True
 
+    def _target_dir(self, folder_name: str) -> Path:
+        """Map a configured folder name onto a directory inside the storage root.
+
+        Folder names come from mapping.yaml on the share and are therefore
+        untrusted; anything that would escape the storage root is rejected and
+        replaced with the fallback folder rather than being written outside.
+        """
+        for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
+            try:
+                target = safe_join(self.config.storage_root, candidate)
+            except ValueError as exc:
+                logger.error(
+                    "Unsafe target folder %r (%s) - not writing outside the storage root", candidate, exc
+                )
+                continue
+            if note and candidate != folder_name:
+                logger.warning("Using %s folder %r instead of %r", note, candidate, folder_name)
+            return target
+        raise ValueError("No usable target folder inside the storage root")
+
     def _resolve_attachment_folder(
         self, filename: str, mail_folder: str, mail_keyword: str | None
     ) -> tuple[str, str | None, bool]:
@@ -633,7 +787,11 @@ class Archiver:
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 
-        if _extension_of(filename) in self.config.blocked_extensions:
+        # Check both the name as received and the name actually written to
+        # disk: sanitizing can change the trailing extension, and only the
+        # latter is what a file manager will act on when someone opens it.
+        extensions = {_extension_of(filename), _extension_of(sanitize_filename(_decode(filename)))}
+        if extensions & self.config.blocked_extensions:
             return self.config.quarantine_folder, matched_keyword, True
         return folder_name, matched_keyword, False
 
@@ -691,7 +849,7 @@ class Archiver:
             return ""
 MAIL2NAS_EOF
 
-# --- mail2nas/main.py ---------------------------------------------------------
+# --- mail2nas/main.py ---
 cat > mail2nas/main.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -699,6 +857,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 from .archiver import Archiver
 from .config import Config
@@ -706,6 +865,26 @@ from .mapping import Mapping
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
+
+
+def _check_storage_root(config: Config) -> None:
+    """Fail fast if the archive target is missing or read-only.
+
+    Without this, a share that failed to mount is indistinguishable from an
+    empty one: attachments would be written into the container's own
+    filesystem and quietly vanish with the container.
+    """
+    root = Path(config.storage_root)
+    if not root.is_dir():
+        raise SystemExit(
+            f"STORAGE_ROOT {config.storage_root} does not exist or is not a directory - "
+            "is the SMB share mounted?"
+        )
+    if not os.access(root, os.W_OK | os.X_OK):
+        raise SystemExit(
+            f"STORAGE_ROOT {config.storage_root} is not writable by uid {os.getuid()} - "
+            "check the mount options (uid/gid/file_mode) and the share permissions."
+        )
 
 
 def main() -> None:
@@ -716,6 +895,7 @@ def main() -> None:
     )
 
     config = Config.from_env()
+    _check_storage_root(config)
     mapping_full_path = os.path.join(config.storage_root, config.mapping_path)
     mapping = Mapping(mapping_full_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
@@ -785,10 +965,7 @@ if __name__ == "__main__":
     main()
 MAIL2NAS_EOF
 
-# --- tests/__init__.py ---------------------------------------------------
-touch tests/__init__.py
-
-# --- tests/test_mapping.py ------------------------------------------------
+# --- tests/test_mapping.py ---
 cat > tests/test_mapping.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -864,13 +1041,71 @@ def test_reload_picks_up_changes(tmp_path):
     mapping.reload()
 
     assert mapping.resolve("RE 1")[0] == "invoices"
+
+
+def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
+    """A half-written mapping.yaml on the share must not take the service down."""
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    mapping.reload()  # must not raise
+
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+
+def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping_path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    mapping.reload()
+
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+
+def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    with caplog.at_level("ERROR"):
+        mapping.reload()
+        mapping.reload()
+        mapping.reload()
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
 MAIL2NAS_EOF
 
-# --- tests/test_filenames.py ----------------------------------------------
+# --- tests/test_filenames.py ---
 cat > tests/test_filenames.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
-from mail2nas.filenames import sanitize_filename, unique_path
+import os
+from pathlib import Path
+
+import pytest
+
+from mail2nas.filenames import (
+    safe_join,
+    sanitize_filename,
+    sanitize_path_segment,
+    unique_path,
+    write_atomic,
+)
 
 
 def test_sanitize_filename_replaces_unsafe_characters():
@@ -902,9 +1137,103 @@ def test_unique_path_returns_original_when_free(tmp_path):
     result = unique_path(tmp_path, "invoice.pdf")
 
     assert result == tmp_path / "invoice.pdf"
+
+
+# --- path segment sanitizing -------------------------------------------------
+
+
+def test_sanitize_path_segment_keeps_readable_folder_names():
+    assert sanitize_path_segment("Rechnungen 2026") == "Rechnungen 2026"
+
+
+def test_sanitize_path_segment_strips_separators_and_reserved_chars():
+    assert "/" not in sanitize_path_segment("a/b")
+    assert "\\" not in sanitize_path_segment("a\\b")
+    assert ":" not in sanitize_path_segment("C:name")
+
+
+def test_sanitize_path_segment_strips_trailing_dot_and_space():
+    assert sanitize_path_segment("rechnungen. ") == "rechnungen"
+
+
+# --- safe_join: the mapping.yaml target folders are untrusted -----------------
+
+
+def test_safe_join_allows_plain_and_nested_folders(tmp_path):
+    assert safe_join(tmp_path, "rechnungen") == tmp_path / "rechnungen"
+    assert safe_join(tmp_path, "rechnungen/2026") == tmp_path / "rechnungen" / "2026"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../outside",
+        "../../../../tmp/pwned",
+        "rechnungen/../../outside",
+        "..",
+    ],
+)
+def test_safe_join_refuses_parent_directory_escape(tmp_path, hostile):
+    with pytest.raises(ValueError):
+        safe_join(tmp_path, hostile)
+
+
+@pytest.mark.parametrize("hostile", ["/etc/cron.d", "/tmp/pwned", "//srv/other"])
+def test_safe_join_refuses_absolute_paths(tmp_path, hostile):
+    # Path("/mnt/nas") / "/etc" would otherwise yield "/etc" outright.
+    with pytest.raises(ValueError):
+        safe_join(tmp_path, hostile)
+
+
+def test_safe_join_refuses_backslash_escape(tmp_path):
+    with pytest.raises(ValueError):
+        safe_join(tmp_path, r"..\..\outside")
+
+
+@pytest.mark.parametrize("empty", ["", "   ", "/", "./"])
+def test_safe_join_refuses_empty_target(tmp_path, empty):
+    with pytest.raises(ValueError):
+        safe_join(tmp_path, empty)
+
+
+# --- atomic writes -----------------------------------------------------------
+
+
+def test_write_atomic_writes_content(tmp_path):
+    target = tmp_path / "invoice.pdf"
+
+    write_atomic(target, b"%PDF-1.4 payload")
+
+    assert target.read_bytes() == b"%PDF-1.4 payload"
+
+
+def test_write_atomic_leaves_no_temp_files_behind(tmp_path):
+    write_atomic(tmp_path / "invoice.pdf", b"data")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["invoice.pdf"]
+
+
+def test_write_atomic_does_not_leave_partial_file_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "invoice.pdf"
+
+    class Boom(Exception):
+        pass
+
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        raise Boom("simulated crash before rename")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(Boom):
+        write_atomic(target, b"partial")
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
 MAIL2NAS_EOF
 
-# --- tests/test_archiver.py -------------------------------------------------
+# --- tests/test_archiver.py ---
 cat > tests/test_archiver.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
@@ -1193,10 +1522,210 @@ def test_process_message_is_idempotent_for_already_processed_message_id(tmp_path
 
     assert len(first_run_files) == 1
     assert len(second_run_files) == 1
+
+
+# --- untrusted mapping targets must not escape the storage root -------------
+
+
+def test_process_message_confines_relative_traversal_target(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: ../outside-escape\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert not (tmp_path.parent / "outside-escape").exists()
+    # rejected target falls back rather than being written outside
+    assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
+
+
+def test_process_message_confines_absolute_traversal_target(tmp_path):
+    escape = tmp_path.parent / "absolute-escape"
+    archiver = _make_archiver(tmp_path, mapping_content=f"RE: {escape}\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=raw), 2)
+
+    assert not escape.exists()
+    # rejected as a misconfiguration, so it lands in the fallback folder
+    assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
+
+
+def test_target_dir_rejects_escape_and_uses_fallback(tmp_path):
+    archiver = _make_archiver(tmp_path)
+
+    assert archiver._target_dir("../evil") == tmp_path / "unsorted"
+    assert archiver._target_dir("rechnungen") == tmp_path / "rechnungen"
+
+
+def test_nested_mapping_target_is_supported(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen/2026\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert any((tmp_path / "rechnungen" / "2026").glob("*"))
+
+
+def test_quarantine_still_wins_over_a_traversal_target(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: ../outside\n")
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=raw), 4)
+
+    assert not (tmp_path.parent / "outside").exists()
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_attachments_are_written_atomically_without_temp_leftovers(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+
+    names = [p.name for p in (tmp_path / "rechnungen").iterdir()]
+    assert len(names) == 1
+    assert not any(n.startswith(".mail2nas-tmp-") for n in names)
 MAIL2NAS_EOF
+
+# --- tests/test_config.py ---
+cat > tests/test_config.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.config import Config
+
+REQUIRED = {
+    "IMAP_HOST": "imap.example.com",
+    "IMAP_USER": "archiv@example.com",
+    "IMAP_PASSWORD": "secret",
+}
+
+
+def _env(monkeypatch, **overrides):
+    for key in list(REQUIRED) + [
+        "IMAP_PORT", "IMAP_MODE", "POLL_INTERVAL_SECONDS", "FILENAME_PREFIX",
+        "MAX_ATTACHMENT_SIZE_MB", "MAX_MESSAGE_SIZE_MB", "MAX_ATTACHMENTS_PER_MESSAGE",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in {**REQUIRED, **overrides}.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_defaults_load(monkeypatch):
+    _env(monkeypatch)
+
+    config = Config.from_env()
+
+    assert config.imap_port == 993
+    assert config.imap_mode == "poll"
+    assert config.filename_prefix == "date_sender"
+
+
+def test_missing_required_variable_is_reported(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.delenv("IMAP_PASSWORD")
+
+    with pytest.raises(SystemExit, match="IMAP_PASSWORD"):
+        Config.from_env()
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "", "12.5"])
+def test_non_numeric_int_setting_is_rejected_clearly(monkeypatch, value):
+    _env(monkeypatch, MAX_ATTACHMENT_SIZE_MB=value)
+
+    with pytest.raises(SystemExit, match="MAX_ATTACHMENT_SIZE_MB"):
+        Config.from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_non_positive_limits_are_rejected(monkeypatch, value):
+    _env(monkeypatch, MAX_MESSAGE_SIZE_MB=value)
+
+    with pytest.raises(SystemExit, match="MAX_MESSAGE_SIZE_MB"):
+        Config.from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "70000"])
+def test_port_out_of_range_is_rejected(monkeypatch, value):
+    _env(monkeypatch, IMAP_PORT=value)
+
+    with pytest.raises(SystemExit, match="IMAP_PORT"):
+        Config.from_env()
+
+
+def test_typo_in_imap_mode_fails_instead_of_silently_polling(monkeypatch):
+    _env(monkeypatch, IMAP_MODE="idel")
+
+    with pytest.raises(SystemExit, match="IMAP_MODE"):
+        Config.from_env()
+
+
+def test_typo_in_filename_prefix_fails(monkeypatch):
+    _env(monkeypatch, FILENAME_PREFIX="date-sender")
+
+    with pytest.raises(SystemExit, match="FILENAME_PREFIX"):
+        Config.from_env()
+
+
+def test_imap_mode_is_case_insensitive(monkeypatch):
+    _env(monkeypatch, IMAP_MODE="IDLE")
+
+    assert Config.from_env().imap_mode == "idle"
+MAIL2NAS_EOF
+
+# --- tests/test_main.py ---
+cat > tests/test_main.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from mail2nas.main import _check_storage_root
+from tests.test_archiver import _make_config
+
+
+def test_accepts_a_writable_storage_root(tmp_path):
+    _check_storage_root(_make_config(tmp_path, storage_root=str(tmp_path)))
+
+
+def test_missing_storage_root_fails_fast(tmp_path):
+    """An unmounted share must not be mistaken for an empty one."""
+    missing = tmp_path / "not-mounted"
+
+    with pytest.raises(SystemExit, match="does not exist"):
+        _check_storage_root(_make_config(tmp_path, storage_root=str(missing)))
+
+
+def test_storage_root_that_is_a_file_fails_fast(tmp_path):
+    a_file = tmp_path / "afile"
+    a_file.write_text("x", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="does not exist or is not a directory"):
+        _check_storage_root(_make_config(tmp_path, storage_root=str(a_file)))
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores write permission bits")
+def test_read_only_storage_root_fails_fast(tmp_path):
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o500)
+    try:
+        with pytest.raises(SystemExit, match="not writable"):
+            _check_storage_root(_make_config(tmp_path, storage_root=str(readonly)))
+    finally:
+        readonly.chmod(0o700)
+MAIL2NAS_EOF
+
+# --- mail2nas/__init__.py ---
+touch mail2nas/__init__.py
+
+# --- tests/__init__.py ---
+touch tests/__init__.py
 
 echo "Fertig: $TARGET enthaelt jetzt das komplette mail2nas-Projekt."
 echo "Naechste Schritte:"
 echo "  cd $TARGET"
 echo "  cp .env.example .env && \$EDITOR .env"
-echo "  # siehe README.md (Abschnitt 'Installation auf Proxmox ohne Git') fuer den Rest"
+echo "  # siehe README.md (Abschnitt 'Installation, Variante 2') fuer den Rest"

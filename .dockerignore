@@ -1,5 +1,9 @@
 .git
+# .env and the credential-bearing backups update.sh writes next to it must
+# never enter the build context.
 .env
+.env.*
+!.env.example
 __pycache__
 *.pyc
 .venv

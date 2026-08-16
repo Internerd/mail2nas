@@ -72,3 +72,50 @@ def test_reload_picks_up_changes(tmp_path):
     mapping.reload()
 
     assert mapping.resolve("RE 1")[0] == "invoices"
+
+
+def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
+    """A half-written mapping.yaml on the share must not take the service down."""
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    mapping.reload()  # must not raise
+
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+
+def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping_path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    mapping.reload()
+
+    assert mapping.resolve("RE 1")[0] == "rechnungen"
+
+
+def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
+    mapping_path = tmp_path / "mapping.yaml"
+    _write_mapping(mapping_path, "RE: rechnungen\n")
+    mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
+
+    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
+    stat = mapping_path.stat()
+    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+
+    with caplog.at_level("ERROR"):
+        mapping.reload()
+        mapping.reload()
+        mapping.reload()
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1

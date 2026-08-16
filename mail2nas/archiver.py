@@ -10,7 +10,7 @@ from pathlib import Path
 from imapclient import IMAPClient
 
 from .config import Config
-from .filenames import sanitize_filename, unique_path
+from .filenames import safe_join, sanitize_filename, unique_path, write_atomic
 from .mapping import Mapping
 from .state import ProcessedStore
 
@@ -133,7 +133,7 @@ class Archiver:
                 folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
                     filename, mail_folder, mail_keyword
                 )
-                target_dir = Path(self.config.storage_root) / folder_name
+                target_dir = self._target_dir(folder_name)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if self.config.dry_run:
@@ -142,7 +142,7 @@ class Archiver:
 
                 target_dir.mkdir(parents=True, exist_ok=True)
                 out_path = unique_path(target_dir, out_name)
-                out_path.write_bytes(payload)
+                write_atomic(out_path, payload)
                 saved.append(str(out_path))
                 logger.info(
                     "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
@@ -161,6 +161,26 @@ class Archiver:
                 client.move([uid], self.config.imap_processed_folder)
         return True
 
+    def _target_dir(self, folder_name: str) -> Path:
+        """Map a configured folder name onto a directory inside the storage root.
+
+        Folder names come from mapping.yaml on the share and are therefore
+        untrusted; anything that would escape the storage root is rejected and
+        replaced with the fallback folder rather than being written outside.
+        """
+        for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
+            try:
+                target = safe_join(self.config.storage_root, candidate)
+            except ValueError as exc:
+                logger.error(
+                    "Unsafe target folder %r (%s) - not writing outside the storage root", candidate, exc
+                )
+                continue
+            if note and candidate != folder_name:
+                logger.warning("Using %s folder %r instead of %r", note, candidate, folder_name)
+            return target
+        raise ValueError("No usable target folder inside the storage root")
+
     def _resolve_attachment_folder(
         self, filename: str, mail_folder: str, mail_keyword: str | None
     ) -> tuple[str, str | None, bool]:
@@ -178,7 +198,11 @@ class Archiver:
         if matched_keyword is None:
             folder_name, matched_keyword = mail_folder, mail_keyword
 
-        if _extension_of(filename) in self.config.blocked_extensions:
+        # Check both the name as received and the name actually written to
+        # disk: sanitizing can change the trailing extension, and only the
+        # latter is what a file manager will act on when someone opens it.
+        extensions = {_extension_of(filename), _extension_of(sanitize_filename(_decode(filename)))}
+        if extensions & self.config.blocked_extensions:
             return self.config.quarantine_folder, matched_keyword, True
         return folder_name, matched_keyword, False
 

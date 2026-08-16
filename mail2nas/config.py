@@ -28,6 +28,26 @@ def _extension_set(name: str, default: str) -> frozenset[str]:
     )
 
 
+def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:
+    """Read an integer setting, failing with a usable message instead of a traceback."""
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a whole number, got {raw!r}") from None
+    if value < minimum or (maximum is not None and value > maximum):
+        allowed = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise SystemExit(f"{name} must be {allowed}, got {value}")
+    return value
+
+
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in allowed:
+        raise SystemExit(f"{name} must be one of {', '.join(allowed)}, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     imap_host: str
@@ -62,23 +82,25 @@ class Config:
         try:
             return cls(
                 imap_host=os.environ["IMAP_HOST"],
-                imap_port=int(os.environ.get("IMAP_PORT", "993")),
+                imap_port=_int("IMAP_PORT", "993", minimum=1, maximum=65535),
                 imap_user=os.environ["IMAP_USER"],
                 imap_password=os.environ["IMAP_PASSWORD"],
                 imap_ssl=_bool("IMAP_SSL", True),
                 imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
                 imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
                 imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
-                imap_mode=os.environ.get("IMAP_MODE", "poll").lower(),
-                poll_interval=int(os.environ.get("POLL_INTERVAL_SECONDS", "300")),
+                imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
+                poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
                 storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
                 mapping_path=os.environ.get("MAPPING_PATH", "mapping.yaml"),
                 fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
                 match_body=_bool("MATCH_BODY", False),
-                filename_prefix=os.environ.get("FILENAME_PREFIX", "date_sender"),
-                max_attachment_size_mb=int(os.environ.get("MAX_ATTACHMENT_SIZE_MB", "25")),
-                max_message_size_mb=int(os.environ.get("MAX_MESSAGE_SIZE_MB", "50")),
-                max_attachments_per_message=int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "20")),
+                filename_prefix=_choice(
+                    "FILENAME_PREFIX", "date_sender", ("none", "date", "sender", "date_sender")
+                ),
+                max_attachment_size_mb=_int("MAX_ATTACHMENT_SIZE_MB", "25"),
+                max_message_size_mb=_int("MAX_MESSAGE_SIZE_MB", "50"),
+                max_attachments_per_message=_int("MAX_ATTACHMENTS_PER_MESSAGE", "20"),
                 blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),

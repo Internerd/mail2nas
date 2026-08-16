@@ -285,3 +285,66 @@ def test_process_message_is_idempotent_for_already_processed_message_id(tmp_path
 
     assert len(first_run_files) == 1
     assert len(second_run_files) == 1
+
+
+# --- untrusted mapping targets must not escape the storage root -------------
+
+
+def test_process_message_confines_relative_traversal_target(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: ../outside-escape\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert not (tmp_path.parent / "outside-escape").exists()
+    # rejected target falls back rather than being written outside
+    assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
+
+
+def test_process_message_confines_absolute_traversal_target(tmp_path):
+    escape = tmp_path.parent / "absolute-escape"
+    archiver = _make_archiver(tmp_path, mapping_content=f"RE: {escape}\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=raw), 2)
+
+    assert not escape.exists()
+    # rejected as a misconfiguration, so it lands in the fallback folder
+    assert any(p.is_file() for p in (tmp_path / "unsorted").rglob("*"))
+
+
+def test_target_dir_rejects_escape_and_uses_fallback(tmp_path):
+    archiver = _make_archiver(tmp_path)
+
+    assert archiver._target_dir("../evil") == tmp_path / "unsorted"
+    assert archiver._target_dir("rechnungen") == tmp_path / "rechnungen"
+
+
+def test_nested_mapping_target_is_supported(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen/2026\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert any((tmp_path / "rechnungen" / "2026").glob("*"))
+
+
+def test_quarantine_still_wins_over_a_traversal_target(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: ../outside\n")
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=raw), 4)
+
+    assert not (tmp_path.parent / "outside").exists()
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_attachments_are_written_atomically_without_temp_leftovers(tmp_path):
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+
+    names = [p.name for p in (tmp_path / "rechnungen").iterdir()]
+    assert len(names) == 1
+    assert not any(n.startswith(".mail2nas-tmp-") for n in names)

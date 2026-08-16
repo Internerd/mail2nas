@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# .env plus the timestamped backups scripts/proxmox/update.sh creates - all of
+# them contain IMAP/SMB credentials in clear text.
 .env
+.env.*
+!.env.example
 *.db
 .pytest_cache/

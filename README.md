@@ -371,6 +371,19 @@ damit um:
   (`mail2nas/filenames.py::sanitize_filename`) - Zeichen wie `/`, `..` oder
   Steuerzeichen (auch ueber Unicode-Tricks wie fullwidth-Slashes oder
   Right-to-Left-Override) koennen so nicht aus dem Zielordner ausbrechen.
+- **Keine Pfad-Traversal ueber Zielordner**: Auch die Zielordner aus
+  `mapping.yaml` sind nicht vertrauenswuerdig - die Datei liegt auf dem Share
+  und ist damit fuer jeden mit Schreibrechten aenderbar. `safe_join()` weist
+  absolute Pfade und `..`-Komponenten ab und prueft zusaetzlich, dass das
+  Ergebnis unterhalb von `STORAGE_ROOT` bleibt; abgewiesene Ziele landen im
+  `FALLBACK_FOLDER` statt ausserhalb des Shares. (Ohne diese Pruefung wuerde
+  bereits ein Eintrag wie `RE: /etc/cron.d` genuegen: in Python ersetzt ein
+  absoluter rechter Operand beim Pfad-Join den kompletten Wurzelpfad.)
+  Verschachtelte Ziele wie `rechnungen/2026` bleiben normal nutzbar.
+- **Atomares Schreiben**: Anhaenge werden in eine temporaere Datei geschrieben
+  und erst dann an ihren endgueltigen Namen umbenannt. Bricht die
+  SMB-Verbindung mitten im Transfer ab, entsteht so keine abgeschnittene
+  Datei, die spaeter faelschlich als vollstaendige Rechnung durchgeht.
 - **Groessenlimits gegen Speicher-/Platten-Erschoepfung**: Die Groesse der
   gesamten Mail wird per `RFC822.SIZE` geprueft, *bevor* der Inhalt geladen
   wird (`MAX_MESSAGE_SIZE_MB`); einzelne Anhaenge werden zusaetzlich einzeln
@@ -399,6 +412,18 @@ damit um:
 - **Idempotenz statt Wiederholungs-DoS**: bereits verarbeitete Message-IDs
   werden in SQLite vermerkt, damit eine kaputte/boesartige Mail nicht bei
   jedem Zyklus erneut komplett verarbeitet wird.
+- **Eine kaputte `mapping.yaml` legt den Dienst nicht lahm**: Da die Datei auf
+  dem Share von Hand bearbeitet wird, ist eine halb geschriebene oder
+  ungueltige Version nur eine Frage der Zeit. Statt die Ausnahme bis in die
+  IMAP-Schleife durchschlagen zu lassen (was in einer Reconnect-Endlosschleife
+  endete, in der gar nichts mehr archiviert wurde), wird der Fehler einmal
+  geloggt und mit dem letzten funktionierenden Regelsatz weitergearbeitet.
+- **Fail-fast beim Start**: Ist `STORAGE_ROOT` nicht vorhanden oder nicht
+  beschreibbar, bricht der Dienst mit einer klaren Meldung ab, statt Anhaenge
+  in das Dateisystem des Containers zu schreiben, wo sie mit dem naechsten
+  Neustart verschwinden wuerden. Fehlerhafte Konfigurationswerte
+  (`IMAP_MODE`, `FILENAME_PREFIX`, Zahlenwerte, Portbereich) werden beim Start
+  benannt, statt still ein anderes Verhalten zu waehlen.
 
 Diese Massnahmen reduzieren die Angriffsflaeche deutlich, ersetzen aber
 keinen Virenscanner. Wer mail2nas produktiv gegen das offene Internet
@@ -432,6 +457,19 @@ Mailserver/ClamAV) einplanen.
 python3 -m venv venv
 venv/bin/pip install -r requirements-dev.txt
 venv/bin/pytest
+```
+
+Die Suite deckt unter anderem die oben beschriebenen Schutzmassnahmen ab
+(Traversal-Versuche ueber Zielordner, Quarantaene, Groessen- und
+Anzahl-Limits, kaputte `mapping.yaml`, Konfigurationsvalidierung).
+
+`scripts/bootstrap.sh` enthaelt eine eingebettete Kopie aller Projektdateien
+und wird generiert, nicht von Hand gepflegt. Nach Aenderungen an einer
+eingebetteten Datei:
+
+```bash
+python3 scripts/regenerate-bootstrap.py          # neu erzeugen
+python3 scripts/regenerate-bootstrap.py --check  # nur pruefen (fuer CI)
 ```
 
 ## Sicherheitshinweise

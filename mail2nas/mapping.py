@@ -38,18 +38,35 @@ class Mapping:
         if not force and self._mtime == mtime:
             return
 
-        with self._path.open("r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+        # The mapping file is edited by hand on a network share, so a malformed
+        # or half-written version is a matter of when, not if. Keep serving the
+        # last good rules instead of letting the exception escape: it would
+        # propagate out of the IMAP loop and leave the service reconnecting in
+        # a tight loop, archiving nothing at all until someone noticed.
+        try:
+            with self._path.open("r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            if not isinstance(raw, dict):
+                raise ValueError("file must contain a mapping of keyword -> folder")
+            rules = sorted(
+                ((str(keyword), str(folder)) for keyword, folder in raw.items()),
+                # Longest keyword first, so "Rechnungskorrektur" beats "RE".
+                key=lambda kv: len(kv[0]),
+                reverse=True,
+            )
+        except Exception as exc:
+            # Remember the mtime anyway, so a persistently broken file is
+            # reported once rather than on every single cycle.
+            self._mtime = mtime
+            logger.error(
+                "Could not load mapping file %s (%s) - keeping the previous %d rule(s)",
+                self._path,
+                exc,
+                len(self._rules),
+            )
+            return
 
-        if not isinstance(raw, dict):
-            raise ValueError(f"Mapping file {self._path} must contain a mapping of keyword -> folder")
-
-        # Longest keyword first, so "Rechnungskorrektur" is checked before "RE".
-        self._rules = sorted(
-            ((str(keyword), str(folder)) for keyword, folder in raw.items()),
-            key=lambda kv: len(kv[0]),
-            reverse=True,
-        )
+        self._rules = rules
         self._mtime = mtime
         logger.info("Loaded %d mapping rule(s) from %s", len(self._rules), self._path)
 
