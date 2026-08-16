@@ -362,8 +362,9 @@ sich nicht wegkonfigurieren lassen:
   root wird, hat damit Zugriff auf die gesamte Freigabe - und die Datei landet
   in jedem Host-Backup.
 
-Mit dem SMB-Backend entfaellt beides. Die Zugangsdaten stehen nur noch in der
-`.env` der LXC (`chmod 600`), und der Zugriff endet an der Container-Grenze:
+Mit dem SMB-Backend entfaellt beides. Die SMB-Zugangsdaten stehen nur noch in
+der `.env` der LXC (`chmod 600`) - auf dem Host liegt weder ein Mount noch ein
+Passwort - und der Zugriff endet an der Container-Grenze:
 
 ```
 mail2nas (im Container)  --SMB3-->  //nas/share
