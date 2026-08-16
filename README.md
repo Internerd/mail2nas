@@ -21,6 +21,7 @@ kann aber genauso als einfacher systemd-Service laufen.
 - [Sicherheitshinweise](#sicherheitshinweise)
 - [Datenschutz (DSGVO)](#datenschutz-dsgvo)
 - [Rechnungsarchivierung / GoBD-Hinweis](#rechnungsarchivierung--gobd-hinweis)
+- [Haftungsausschluss](#haftungsausschluss)
 - [Lizenz](#lizenz)
 - [Updates einspielen](#updates-einspielen)
 
@@ -505,12 +506,54 @@ ein nachgelagertes DMS) die oben genannten Anforderungen erfuellen. Im
 Zweifel den Steuerberater/die Steuerberaterin zur konkreten Umsetzung
 befragen.
 
+## Haftungsausschluss
+
+mail2nas ist ein privates Open-Source-Projekt, keine kommerzielle Software
+und keine Rechts-, Steuer- oder Sicherheitsberatung. Es wird "wie besehen"
+("as is"), ohne jegliche Gewaehrleistung bereitgestellt - siehe die
+vollstaendige Haftungsausschluss-Klausel in der [LICENSE](LICENSE) (MIT).
+Ergaenzend gilt:
+
+- **Keine Garantie fuer Vollstaendigkeit oder Korrektheit der Zustellung.**
+  mail2nas verarbeitet Mails automatisiert per Stichwort-Mapping; eine
+  Fehlklassifizierung, ein verpasster Anhang (z. B. wegen eines nicht
+  erkannten Formats, eines Netzwerk-/IMAP-Fehlers oder falscher
+  Mapping-Konfiguration) oder ein Ausfall des Dienstes koennen nicht
+  ausgeschlossen werden. Wer sich auf die vollstaendige, fristgerechte
+  Archivierung geschaeftskritischer Dokumente (z. B. Rechnungen) verlassen
+  muss, sollte zusaetzliche Kontrollen (Stichproben, Monitoring, Backups des
+  Quell-Postfachs) vorsehen - siehe auch den Abschnitt zu
+  [GoBD](#rechnungsarchivierung--gobd-hinweis) oben.
+- **Keine Haftung fuer Datenverlust oder -beschaedigung** auf dem Ziel-Share,
+  im Postfach oder in der Statusdatenbank, unabhaengig von der Ursache
+  (Softwarefehler, Fehlkonfiguration, Ausfall der zugrundeliegenden
+  Infrastruktur wie Proxmox/Docker/SMB/IMAP).
+- **Keine Haftung fuer Sicherheitsvorfaelle** trotz der in
+  [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
+  beschriebenen Massnahmen. Diese reduzieren bekannte Risiken, koennen aber
+  keinen vollstaendigen Schutz garantieren (z. B. gegen bislang unbekannte
+  Schwachstellen in verwendeten Bibliotheken/Basis-Images). Sicherheitsupdates
+  (Docker-Base-Image, Python-Abhaengigkeiten, Betriebssystem der LXC) liegen
+  in der Verantwortung der betreibenden Person.
+- **Die Proxmox-/Installer-Skripte** (`scripts/proxmox/*.sh`,
+  `scripts/bootstrap.sh`) greifen aktiv in die Zielumgebung ein (legen
+  Container an, installieren Pakete, schreiben Dateien mit Zugangsdaten).
+  Vor dem Einsatz in produktiven Proxmox-Umgebungen empfiehlt sich ein
+  Testlauf in einer Nicht-Produktivumgebung.
+- Nutzung erfolgt vollstaendig auf eigenes Risiko der betreibenden Person
+  bzw. Organisation. Bei rechtlichen oder steuerlichen Unsicherheiten
+  (insbesondere zu DSGVO- oder GoBD-Konformitaet des Gesamtaufbaus) bitte
+  entsprechend fachkundigen Rat einholen - siehe
+  [Datenschutz (DSGVO)](#datenschutz-dsgvo) und
+  [GoBD-Hinweis](#rechnungsarchivierung--gobd-hinweis).
+
 ## Lizenz
 
 MIT-Lizenz, siehe [LICENSE](LICENSE). Nutzung auf eigene Verantwortung, ohne
-Gewaehrleistung - siehe insbesondere die Abschnitte oben zu Datenschutz und
-GoBD, falls das Tool fuer geschaeftliche/steuerlich relevante Zwecke
-eingesetzt wird.
+Gewaehrleistung - siehe insbesondere den
+[Haftungsausschluss](#haftungsausschluss) sowie die Abschnitte zu
+Datenschutz und GoBD oben, falls das Tool fuer geschaeftliche/steuerlich
+relevante Zwecke eingesetzt wird.
 
 ## Updates einspielen
 
