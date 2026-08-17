@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email
 import logging
+from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
@@ -10,8 +11,10 @@ from imapclient import IMAPClient
 
 from .accounts import Account
 from .config import Config
-from .filenames import safe_relative_parts, sanitize_filename
-from .mapping import Mapping
+from .filenames import extension_of, safe_relative_parts, sanitize_filename
+from .mapping import Mapping, Rule
+from .printers import Printer
+from .printing import PrintService, job_title
 from .state import ProcessedStore
 from .storage import Storage
 
@@ -33,10 +36,20 @@ def _message_id(msg: Message, uid: int, account_key: str) -> str:
     return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
-def _extension_of(filename: str) -> str:
-    if "." not in filename:
-        return ""
-    return filename.rsplit(".", 1)[-1].strip().lower()
+@dataclass(frozen=True)
+class AttachmentPlan:
+    """What is to happen with one attachment, decided before anything happens.
+
+    Filing and printing are two independent answers to the same question, and
+    both depend on the same rule match - so they are worked out together and
+    then carried out, rather than being re-derived at each step.
+    """
+
+    folder: str
+    keyword: str | None
+    quarantined: bool
+    archive: bool
+    printer: Printer | None
 
 
 class Archiver:
@@ -47,12 +60,14 @@ class Archiver:
         store: ProcessedStore,
         storage: Storage,
         account: Account,
+        printing: PrintService | None = None,
     ):
         self.config = config
         self.mapping = mapping
         self.store = store
         self.storage = storage
         self.account = account
+        self.printing = printing
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -60,10 +75,10 @@ class Archiver:
         client.select_folder(self.account.folder)
         return client
 
-    def _resolve(self, *texts: str) -> tuple[str, str | None]:
+    def _match(self, *texts: str) -> Rule | None:
         # Rules can be limited to a single mailbox, so the account has to be
         # part of every lookup.
-        return self.mapping.resolve(*texts, account_id=self.account.key)
+        return self.mapping.match(*texts, account_id=self.account.key)
 
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
@@ -114,7 +129,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self._resolve(subject, body)
+        mail_rule = self._match(subject, body)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -147,31 +162,56 @@ class Archiver:
                     )
                     continue
 
-                folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
-                    filename, mail_folder, mail_keyword
-                )
-                target_parts = self._target_parts(folder_name)
+                plan = self._plan_attachment(filename, mail_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
-                if self.config.dry_run:
+                if plan.archive:
+                    target_parts = self._target_parts(plan.folder)
+                    if self.config.dry_run:
+                        logger.info(
+                            "[dry-run] would save %s -> %s",
+                            out_name,
+                            self.storage.display(target_parts),
+                        )
+                    else:
+                        out_path = self.storage.save_unique(target_parts, out_name, payload)
+                        saved.append(out_path)
+                        logger.info(
+                            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+                            uid,
+                            subject,
+                            filename,
+                            plan.keyword or "<fallback>",
+                            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
+                            out_path,
+                        )
+                elif plan.printer is not None:
                     logger.info(
-                        "[dry-run] would save %s -> %s",
-                        out_name,
-                        self.storage.display(target_parts),
+                        "UID %s '%s': attachment '%s' is printed only, not archived",
+                        uid,
+                        subject,
+                        filename,
                     )
-                    continue
+                else:
+                    # Neither filed nor printed - that is a configuration
+                    # mistake rather than an intention, and the attachment is
+                    # gone once the mail is marked as read.
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' was neither archived nor printed - "
+                        "the mailbox is set to print only but nothing prints it",
+                        uid,
+                        subject,
+                        filename,
+                    )
 
-                out_path = self.storage.save_unique(target_parts, out_name, payload)
-                saved.append(out_path)
-                logger.info(
-                    "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
-                    uid,
-                    subject,
-                    filename,
-                    matched_keyword or "<fallback>",
-                    " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
-                    out_path,
-                )
+                # Printing comes after filing, deliberately: the share is the
+                # archive and paper is the copy, so a printer that is offline
+                # or out of paper must never be the reason an attachment was
+                # not stored.
+                if plan.printer is not None:
+                    self.printing.send(
+                        plan.printer, payload, out_name, job_title(subject, filename)
+                    )
 
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
@@ -200,10 +240,8 @@ class Archiver:
             return target
         raise ValueError("No usable target folder inside the archive root")
 
-    def _resolve_attachment_folder(
-        self, filename: str, mail_folder: str, mail_keyword: str | None
-    ) -> tuple[str, str | None, bool]:
-        """Decide the target folder for a single attachment.
+    def _plan_attachment(self, filename: str, mail_rule: Rule | None) -> AttachmentPlan:
+        """Decide where a single attachment is filed, and whether it is printed.
 
         The attachment's own filename is checked against the mapping first,
         so multiple differently-named attachments on the same mail can land
@@ -213,17 +251,57 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self._resolve(filename)
-        if matched_keyword is None:
-            folder_name, matched_keyword = mail_folder, mail_keyword
+        rule = self._match(filename) or mail_rule
 
         # Check both the name as received and the name actually written to
         # disk: sanitizing can change the trailing extension, and only the
         # latter is what a file manager will act on when someone opens it.
-        extensions = {_extension_of(filename), _extension_of(sanitize_filename(_decode(filename)))}
-        if extensions & self.config.blocked_extensions:
-            return self.config.quarantine_folder, matched_keyword, True
-        return folder_name, matched_keyword, False
+        extensions = {extension_of(filename), extension_of(sanitize_filename(_decode(filename)))}
+        quarantined = bool(extensions & self.config.blocked_extensions)
+
+        return AttachmentPlan(
+            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule),
+            keyword=rule.keyword if rule else None,
+            quarantined=quarantined,
+            # "Print only" still files anything quarantined: it cannot be
+            # printed either, and dropping it without a trace would hide
+            # exactly the attachment somebody may need to look at.
+            archive=self.account.archive_attachments or quarantined,
+            printer=self._printer_for(rule, quarantined),
+        )
+
+    def _folder_of(self, rule: Rule | None) -> str:
+        return rule.folder if rule else self.config.fallback_folder
+
+    def _printer_for(self, rule: Rule | None, quarantined: bool) -> Printer | None:
+        """Which printer this attachment goes to, if any.
+
+        Printing is requested either by the mailbox ("print everything that
+        arrives here") or by the matched rule ("print invoices"). The printer
+        is then the most specific one configured: the rule's own choice beats
+        the mailbox default.
+        """
+        if self.printing is None or not self.config.printing_enabled:
+            return None
+        if quarantined:
+            # A blocked attachment is a suspected executable. It is neither
+            # printable nor something to hand to a printer driver.
+            return None
+
+        by_rule = rule is not None and rule.print_attachments
+        if not (self.account.print_attachments or by_rule):
+            return None
+
+        printer = self.printing.printer_for(
+            rule.printer if by_rule else "", self.account.printer
+        )
+        if printer is None:
+            logger.warning(
+                "Printing is enabled for %s but no usable printer is configured - "
+                "nothing was printed",
+                f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}",
+            )
+        return printer
 
     @staticmethod
     def _date_prefix(msg: Message) -> str:

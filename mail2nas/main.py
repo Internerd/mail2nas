@@ -5,11 +5,14 @@ import os
 import sys
 import threading
 
+from . import printing as printing_module
 from . import storage as storage_module
 from .accounts import AccountStore, seed_from_config
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
+from .printers import PrinterStore
+from .printers import seed_from_config as seed_printer_from_config
 from .runtime import SETTING_MAPPING_PATH, Runtime
 from .state import ProcessedStore, SettingsStore
 
@@ -40,10 +43,16 @@ def main() -> None:
     _protect_state_file(config.state_db_path)
     seed_from_config(accounts, settings, config)
 
+    printers = PrinterStore(config.state_db_path)
+    seed_printer_from_config(printers, settings, config)
+    printing = printing_module.from_config(config, printers)
+
     mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
     mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    runtime = Runtime(config, storage, mapping, store, settings, accounts)
+    runtime = Runtime(
+        config, storage, mapping, store, settings, accounts, printers=printers, printing=printing
+    )
 
     if config.web_enabled:
         # Imported lazily so the archiver still runs if the web dependencies
@@ -53,10 +62,11 @@ def main() -> None:
         web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: storage=%s (%s) mapping=%s dry_run=%s",
+        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d dry_run=%s",
         storage.description,
         config.storage_backend,
         mapping_path,
+        len(printers.enabled()) if config.printing_enabled else 0,
         config.dry_run,
     )
 
@@ -109,6 +119,7 @@ class _Worker:
             self._runtime.store,
             self._runtime.storage,
             self.account,
+            self._runtime.printing,
         )
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(

@@ -15,6 +15,11 @@ DEFAULT_BLOCKED_EXTENSIONS = (
     "jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk"
 )
 
+# Formats CUPS prints without help. Office documents are deliberately absent:
+# without a converter installed they come out as pages of raw markup, and
+# installing one is a decision for whoever runs the container.
+DEFAULT_PRINTABLE_EXTENSIONS = "pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff"
+
 
 def _bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
@@ -110,6 +115,20 @@ class Config:
     state_db_path: str
     dry_run: bool
 
+    # Printing. Which attachments get printed, and on which printer, is
+    # configured per mailbox and per mapping rule in the UI - these are the
+    # infrastructure bits behind it plus the optional first printer, so an
+    # install that is driven purely from the .env can set one up too.
+    printing_enabled: bool
+    lp_binary: str
+    print_timeout: int
+    printable_extensions: frozenset[str]
+    printer_name: str
+    printer_destination: str
+    printer_server: str
+    printer_options: str
+    printer_copies: int
+
     # Optional web UI for editing the keyword -> folder mapping.
     web_enabled: bool
     web_host: str
@@ -160,6 +179,17 @@ class Config:
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
+                printing_enabled=_bool("PRINTING_ENABLED", True),
+                lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+                print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
+                printable_extensions=_extension_set(
+                    "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS
+                ),
+                printer_name=os.environ.get("PRINTER_NAME", "").strip(),
+                printer_destination=os.environ.get("PRINTER_DESTINATION", "").strip(),
+                printer_server=os.environ.get("PRINTER_SERVER", "").strip(),
+                printer_options=os.environ.get("PRINTER_OPTIONS", "").strip(),
+                printer_copies=_int("PRINTER_COPIES", "1", minimum=1, maximum=20),
                 web_enabled=_bool("WEB_ENABLED", False),
                 web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip(),
                 web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),

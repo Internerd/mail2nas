@@ -42,6 +42,13 @@ class Account:
     processed_folder: str
     oversized_folder: str
     enabled: bool
+    # Print every attachment from this mailbox, regardless of the rules.
+    print_attachments: bool = False
+    # Printer for this mailbox, as a string key ("" = none configured). A rule
+    # that names its own printer overrides it.
+    printer: str = ""
+    # Off means "print only": attachments are not written to the share.
+    archive_attachments: bool = True
 
     @property
     def key(self) -> str:
@@ -61,6 +68,9 @@ class Account:
             self.processed_folder,
             self.oversized_folder,
             self.enabled,
+            self.print_attachments,
+            self.printer,
+            self.archive_attachments,
         )
 
 
@@ -92,6 +102,7 @@ class AccountStore:
                 "oversized_folder TEXT NOT NULL DEFAULT '', "
                 "enabled INTEGER NOT NULL DEFAULT 1)"
             )
+            _add_missing_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)
@@ -111,11 +122,15 @@ class AccountStore:
             processed_folder=row[9],
             oversized_folder=row[10],
             enabled=bool(row[11]),
+            print_attachments=bool(row[12]),
+            printer=row[13] or "",
+            archive_attachments=bool(row[14]),
         )
 
     _COLUMNS = (
         "id, name, host, port, ssl, user, password, folder, mode, "
-        "processed_folder, oversized_folder, enabled"
+        "processed_folder, oversized_folder, enabled, "
+        "print_attachments, printer, archive_attachments"
     )
 
     def all(self) -> list[Account]:
@@ -138,9 +153,11 @@ class AccountStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO imap_accounts (name, host, port, ssl, user, password, folder, "
-                "mode, processed_folder, oversized_folder, enabled) "
+                "mode, processed_folder, oversized_folder, enabled, print_attachments, "
+                "printer, archive_attachments) "
                 "VALUES (:name, :host, :port, :ssl, :user, :password, :folder, :mode, "
-                ":processed_folder, :oversized_folder, :enabled)",
+                ":processed_folder, :oversized_folder, :enabled, :print_attachments, "
+                ":printer, :archive_attachments)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -162,6 +179,9 @@ class AccountStore:
                 "processed_folder": current.processed_folder,
                 "oversized_folder": current.oversized_folder,
                 "enabled": current.enabled,
+                "print_attachments": current.print_attachments,
+                "printer": current.printer,
+                "archive_attachments": current.archive_attachments,
                 **fields,
             }
         )
@@ -171,13 +191,33 @@ class AccountStore:
                 "UPDATE imap_accounts SET name = :name, host = :host, port = :port, ssl = :ssl, "
                 "user = :user, password = :password, folder = :folder, mode = :mode, "
                 "processed_folder = :processed_folder, oversized_folder = :oversized_folder, "
-                "enabled = :enabled WHERE id = :id",
+                "enabled = :enabled, print_attachments = :print_attachments, "
+                "printer = :printer, archive_attachments = :archive_attachments WHERE id = :id",
                 values,
             )
 
     def delete(self, account_id: int) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM imap_accounts WHERE id = ?", (account_id,))
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to date.
+
+    Printing was added after the table existed, and an update must not require
+    re-entering every mailbox - so the columns are added in place, with
+    defaults that keep an already-configured install behaving exactly as
+    before (nothing printed, everything archived).
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(imap_accounts)")}
+    for column, definition in (
+        ("print_attachments", "INTEGER NOT NULL DEFAULT 0"),
+        ("printer", "TEXT NOT NULL DEFAULT ''"),
+        ("archive_attachments", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE imap_accounts ADD COLUMN {column} {definition}")
+            logger.info("Added the %s column to the account table", column)
 
 
 def _defaults(fields: dict) -> dict:
@@ -193,6 +233,9 @@ def _defaults(fields: dict) -> dict:
         "processed_folder": str(fields.get("processed_folder") or "").strip(),
         "oversized_folder": str(fields.get("oversized_folder") or "").strip(),
         "enabled": 1 if fields.get("enabled", True) else 0,
+        "print_attachments": 1 if fields.get("print_attachments", False) else 0,
+        "printer": str(fields.get("printer") or "").strip(),
+        "archive_attachments": 1 if fields.get("archive_attachments", True) else 0,
     }
 
 

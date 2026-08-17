@@ -4,10 +4,21 @@ import textwrap
 from email.message import EmailMessage
 
 from mail2nas.archiver import Archiver
-from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
+from mail2nas.config import (
+    DEFAULT_BLOCKED_EXTENSIONS,
+    DEFAULT_PRINTABLE_EXTENSIONS,
+    Config,
+)
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
 from mail2nas.accounts import Account
+from mail2nas.printers import PrinterStore
+from mail2nas.printing import (
+    PrintError,
+    PrintService,
+    Spooler,
+    parse_extensions,
+)
 from mail2nas.storage import LocalStorage
 
 TEST_ACCOUNT = Account(
@@ -57,6 +68,17 @@ def _make_config(tmp_path, **overrides) -> Config:
         quarantine_folder="quarantaene",
         state_db_path=str(tmp_path / "state.db"),
         dry_run=False,
+        printing_enabled=True,
+        lp_binary="lp",
+        print_timeout=120,
+        printable_extensions=frozenset(
+            e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
+        ),
+        printer_name="",
+        printer_destination="",
+        printer_server="",
+        printer_options="",
+        printer_copies=1,
         web_enabled=False,
         web_host="127.0.0.1",
         web_port=8080,
@@ -72,7 +94,11 @@ def _write_mapping(path, content: str) -> None:
 
 
 def _make_archiver(
-    tmp_path, mapping_content: str | None = None, account: Account | None = None, **config_overrides
+    tmp_path,
+    mapping_content: str | None = None,
+    account: Account | None = None,
+    printing=None,
+    **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
     mapping_path = tmp_path / "mapping.yaml"
@@ -81,7 +107,7 @@ def _make_archiver(
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT)
+    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT, printing)
 
 
 class FakeIMAPClient:
@@ -177,7 +203,7 @@ def test_build_filename_date_only_prefix(tmp_path):
 # --- per-attachment folder resolution ----------------------------------------
 
 
-def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject(tmp_path):
+def test_plan_prefers_attachment_filename_over_mail_subject(tmp_path):
     archiver = _make_archiver(
         tmp_path,
         mapping_content="""
@@ -187,40 +213,34 @@ def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject
     )
     # Mail-level match would be "rechnungen" (subject contains RE), but this
     # specific attachment's own filename literally says "Lieferschein".
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
+    mail_rule = archiver.mapping.match("RE-2024-001 mit Lieferschein")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Lieferschein_4711.pdf", mail_folder, mail_keyword
-    )
+    plan = archiver._plan_attachment("Lieferschein_4711.pdf", mail_rule)
 
-    assert folder == "lieferscheine"
-    assert keyword == "Lieferschein"
-    assert quarantined is False
+    assert plan.folder == "lieferscheine"
+    assert plan.keyword == "Lieferschein"
+    assert plan.quarantined is False
 
 
-def test_resolve_attachment_folder_falls_back_to_mail_level_match(tmp_path):
+def test_plan_falls_back_to_mail_level_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001")
+    mail_rule = archiver.mapping.match("RE-2024-001")
 
     # "anhang1.pdf" itself does not match any keyword.
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "anhang1.pdf", mail_folder, mail_keyword
-    )
+    plan = archiver._plan_attachment("anhang1.pdf", mail_rule)
 
-    assert folder == "rechnungen"
-    assert keyword == "RE"
-    assert quarantined is False
+    assert plan.folder == "rechnungen"
+    assert plan.keyword == "RE"
+    assert plan.quarantined is False
 
 
-def test_resolve_attachment_folder_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
+def test_plan_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Rechnung.exe", "unsorted", None
-    )
+    plan = archiver._plan_attachment("Rechnung.exe", None)
 
-    assert folder == "quarantaene"
-    assert quarantined is True
+    assert plan.folder == "quarantaene"
+    assert plan.quarantined is True
 
 
 # --- full message processing (size/count limits, quarantine, mail-level) ----
@@ -379,3 +399,211 @@ def test_attachments_are_written_atomically_without_temp_leftovers(tmp_path):
     names = [p.name for p in (tmp_path / "rechnungen").iterdir()]
     assert len(names) == 1
     assert not any(n.startswith(".mail2nas-tmp-") for n in names)
+
+
+# --- printing ----------------------------------------------------------------
+
+
+class RecordingSpooler(Spooler):
+    """A spooler that remembers jobs instead of handing them to CUPS."""
+
+    def __init__(self, **kwargs):
+        super().__init__(printable_extensions=parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS))
+        self.jobs: list[tuple[str, str]] = []
+
+    def print_bytes(self, printer, data, filename, title=""):
+        self.jobs.append((printer.destination, filename))
+        return "queued"
+
+    @property
+    def printed_on(self) -> list[str]:
+        return [destination for destination, _ in self.jobs]
+
+
+def _make_printing(tmp_path, *queues: str):
+    """A print service with one printer per given queue name."""
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    ids = [str(store.add(name=queue, destination=queue)) for queue in queues]
+    spooler = RecordingSpooler()
+    return PrintService(store, spooler), spooler, ids
+
+
+def test_a_mailbox_can_print_every_attachment(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+    )
+    raw = _build_message("Newsletter", [("prospekt.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert spooler.printed_on == ["drucker_a"]
+    # still archived: printing is an addition, not a replacement
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_a_rule_can_print_only_what_it_matches(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_b")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+                printer: "{printer_id}"
+              - keyword: Lieferschein
+                folder: lieferscheine
+        """,
+        printing=printing,
+    )
+    raw = _build_message(
+        "Bestellung 42",
+        [("Rechnung_42.pdf", b"invoice"), ("Lieferschein_42.pdf", b"delivery")],
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=raw), 2)
+
+    assert [name for _, name in spooler.jobs] == [
+        "unknown-date_lieferant_example.com_Rechnung_42.pdf"
+    ]
+    assert spooler.printed_on == ["drucker_b"]
+
+
+def test_the_rule_printer_wins_over_the_mailbox_printer(tmp_path):
+    printing, spooler, (rule_printer, account_printer) = _make_printing(
+        tmp_path, "drucker_regel", "drucker_konto"
+    )
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+                printer: "{rule_printer}"
+        """,
+        account=_account(print_attachments=True, printer=account_printer),
+        printing=printing,
+    )
+    raw = _build_message("Rechnung 1", [("Rechnung_1.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert spooler.printed_on == ["drucker_regel"]
+
+
+def test_a_rule_without_its_own_printer_uses_the_mailbox_one(tmp_path):
+    printing, spooler, (account_printer,) = _make_printing(tmp_path, "drucker_konto")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+        """,
+        account=_account(printer=account_printer),
+        printing=printing,
+    )
+    raw = _build_message("Rechnung 1", [("Rechnung_1.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=raw), 4)
+
+    assert spooler.printed_on == ["drucker_konto"]
+
+
+def test_print_only_mailboxes_do_not_write_to_the_share(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+
+    assert spooler.printed_on == ["drucker_a"]
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_a_blocked_attachment_is_quarantined_and_never_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        # print everything, archive nothing - the executable must still be
+        # kept, and must still not reach the printer.
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=6, raw=raw), 6)
+
+    assert spooler.jobs == []
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_nothing_is_printed_without_a_printer(tmp_path, caplog):
+    printing, spooler, _ = _make_printing(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    with caplog.at_level("WARNING"):
+        archiver._process_message(FakeIMAPClient(uid=7, raw=raw), 7)
+
+    assert spooler.jobs == []
+    assert "no usable printer" in caplog.text
+    # the attachment is still filed - printing is the part that failed
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_printing_can_be_switched_off_globally(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+        printing_enabled=False,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=8, raw=raw), 8)
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_a_failing_printer_does_not_stop_the_archiving(tmp_path):
+    class BrokenSpooler(RecordingSpooler):
+        def print_bytes(self, printer, data, filename, title=""):
+            raise PrintError("Drucker offline")
+
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = str(store.add(name="Kaputt", destination="drucker_a"))
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=PrintService(store, BrokenSpooler()),
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=9, raw=raw), 9)
+
+    assert any((tmp_path / "rechnungen").glob("*"))

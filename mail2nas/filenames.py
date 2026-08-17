@@ -22,6 +22,13 @@ def sanitize_filename(name: str) -> str:
     return name or "attachment"
 
 
+def extension_of(filename: str) -> str:
+    """Lower-cased extension without the dot, or "" if there is none."""
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].strip().lower()
+
+
 def sanitize_path_segment(segment: str) -> str:
     """Sanitize a single folder-name component (never a path)."""
     segment = unicodedata.normalize("NFKC", segment)

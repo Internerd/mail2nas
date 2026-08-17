@@ -20,6 +20,11 @@
 #
 # Die Weboberflaeche fuer das Mapping ist per Default an (WEB_ENABLED=true) und
 # braucht dann ein Startpasswort in WEB_PASSWORD.
+#
+# Drucken ist optional und wird komplett in der Weboberflaeche eingerichtet
+# (Drucker anlegen, dann je Postfach/Zuordnung auswaehlen). Hier landen nur
+# die Defaults dafuer in der .env; ein PRINTER_DESTINATION legt beim ersten
+# Start optional gleich einen Drucker an.
 # Existiert bereits eine .env und werden keine Zugangsdaten uebergeben,
 # laeuft das Skript im Update-Modus und laesst die Konfiguration unveraendert.
 
@@ -181,6 +186,16 @@ MAX_MESSAGE_SIZE_MB=$(dq "${MAX_MESSAGE_SIZE_MB:-50}")
 MAX_ATTACHMENTS_PER_MESSAGE=$(dq "${MAX_ATTACHMENTS_PER_MESSAGE:-20}")
 BLOCKED_EXTENSIONS=$(dq "${BLOCKED_EXTENSIONS:-exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk}")
 QUARANTINE_FOLDER=$(dq "${QUARANTINE_FOLDER:-quarantaene}")
+
+PRINTING_ENABLED=$(dq "${PRINTING_ENABLED:-true}")
+LP_BINARY=$(dq "${LP_BINARY:-lp}")
+PRINT_TIMEOUT_SECONDS=$(dq "${PRINT_TIMEOUT_SECONDS:-120}")
+PRINTABLE_EXTENSIONS=$(dq "${PRINTABLE_EXTENSIONS:-pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff}")
+PRINTER_DESTINATION=$(dq "${PRINTER_DESTINATION:-}")
+PRINTER_NAME=$(dq "${PRINTER_NAME:-}")
+PRINTER_SERVER=$(dq "${PRINTER_SERVER:-}")
+PRINTER_OPTIONS=$(dq "${PRINTER_OPTIONS:-}")
+PRINTER_COPIES=$(dq "${PRINTER_COPIES:-1}")
 
 STATE_DB_PATH="/data/state.db"
 LOG_LEVEL=$(dq "${LOG_LEVEL:-INFO}")

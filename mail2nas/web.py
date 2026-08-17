@@ -42,9 +42,12 @@ from .mapping import (
     move_rule,
     save_rules,
     set_account,
+    set_printing,
     validate_folder,
     validate_keyword,
 )
+from .printers import PrinterError
+from .printing import PrintError
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +236,18 @@ MAPPING_BODY = """
         </select>
       </div>
       {% endif %}
+      {% if printers %}
+      <div class="field">
+        <label for="printer">Drucken</label>
+        <select id="printer" name="printer">
+          <option value="">nicht drucken</option>
+          <option value="account">drucken, Drucker des Postfachs</option>
+          {% for printer in printers %}
+            <option value="{{ printer.key }}">drucken auf {{ printer.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       <button type="submit">Hinzufuegen</button>
     </div>
   </form>
@@ -240,6 +255,12 @@ MAPPING_BODY = """
   viele Zeichen, <code>?</code> fuer genau eines - <code>RE*2026</code> passt also auf
   &bdquo;RE-4711 vom 03.2026&ldquo;. Aenderungen wirken beim naechsten Durchlauf,
   ein Neustart ist nicht noetig.</p>
+  {% if printers %}
+  <p class="hint">Mit <em>Drucken</em> wird jeder Anhang, den diese Zuordnung trifft,
+  zusaetzlich ausgedruckt - z. B. nur Rechnungen. Gedruckt wird erst, nachdem der
+  Anhang abgelegt wurde. Drucker werden unter
+  <a href="{{ url_for('config_page') }}">Konfiguration</a> angelegt.</p>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -250,7 +271,9 @@ MAPPING_BODY = """
   <div class="table-wrap">
   <table>
     <tr>
-      <th>Prio</th><th>Stichwort</th><th>Ziel{% if accounts|length > 1 %} und Postfach{% endif %}</th><th></th>
+      <th>Prio</th><th>Stichwort</th>
+      <th>Ziel{% if accounts|length > 1 %}, Postfach{% endif %}{% if printers %} und Druck{% endif %}</th>
+      <th></th>
     </tr>
     {% for rule in rules %}
     <tr>
@@ -288,6 +311,21 @@ MAPPING_BODY = """
             {% endfor %}
             {% if rule.account not in account_keys %}
               <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
+          {% if printers %}
+          <input type="hidden" name="print_fields" value="1">
+          <select name="printer" title="Anhaenge dieser Zuordnung drucken">
+            <option value="" {% if not rule.print_attachments %}selected{% endif %}>nicht drucken</option>
+            <option value="account"
+              {% if rule.print_attachments and not rule.printer %}selected{% endif %}>drucken, Drucker des Postfachs</option>
+            {% for printer in printers %}
+              <option value="{{ printer.key }}"
+                {% if rule.print_attachments and rule.printer == printer.key %}selected{% endif %}>drucken auf {{ printer.name }}</option>
+            {% endfor %}
+            {% if rule.printer and rule.printer not in printer_keys %}
+              <option value="{{ rule.printer }}" selected>(geloeschter Drucker)</option>
             {% endif %}
           </select>
           {% endif %}
@@ -349,6 +387,39 @@ CONFIG_BODY = """
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_account') }}">
     <button type="button">Postfach hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Drucker</h2>
+  {% if printers %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
+    {% for printer in printers %}
+    <tr>
+      <td class="keyword">{{ printer.name }}</td>
+      <td>{{ printer.destination }}{% if printer.server %}<br>
+        <span class="hint">auf {{ printer.server }}</span>{% endif %}</td>
+      <td>{{ printer.options or '-' }}{% if printer.copies > 1 %}
+        <span class="hint">&middot; {{ printer.copies }} Kopien</span>{% endif %}</td>
+      <td>{% if printer.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_printer', printer_id=printer.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Einmal angelegt, dann ueberall per Auswahlfeld verwendbar: je
+  Postfach (alles drucken) und je Zuordnung (z. B. nur Rechnungen).</p>
+  {% elif printing_enabled %}
+  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
+  CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
+  {% else %}
+  <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_printer') }}">
+    <button type="button">Drucker hinzufuegen</button></a></p>
 </div>
 
 <div class="card">
@@ -448,6 +519,41 @@ ACCOUNT_BODY = """
       <label><input type="checkbox" name="enabled" value="1"
         {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
     </p>
+
+    {% if printers %}
+    <input type="hidden" name="print_fields" value="1">
+    <h2>Drucken und Ablegen</h2>
+    <div class="row">
+      <div class="field">
+        <label for="account_printer">Drucker fuer dieses Postfach</label>
+        <select id="account_printer" name="printer">
+          <option value="">kein Drucker</option>
+          {% for printer in printers %}
+            <option value="{{ printer.key }}"
+              {% if account and account.printer == printer.key %}selected{% endif %}>{{ printer.name }}</option>
+          {% endfor %}
+          {% if account and account.printer and account.printer not in printer_keys %}
+            <option value="{{ account.printer }}" selected>(geloeschter Drucker)</option>
+          {% endif %}
+        </select>
+      </div>
+    </div>
+    <p style="margin:.6rem 0 .2rem">
+      <label><input type="checkbox" name="print_attachments" value="1"
+        {% if account and account.print_attachments %}checked{% endif %}>
+        Alle Anhaenge dieses Postfachs drucken</label>
+    </p>
+    <p style="margin:.2rem 0 .2rem">
+      <label><input type="checkbox" name="archive_attachments" value="1"
+        {% if not account or account.archive_attachments %}checked{% endif %}>
+        Anhaenge im Archiv ablegen</label>
+    </p>
+    <p class="hint">Ohne Haken bei &bdquo;ablegen&ldquo; wird nur gedruckt und nichts
+    gespeichert. Anhaenge mit gesperrter Dateiendung landen trotzdem im
+    Quarantaene-Ordner - gedruckt werden sie nie. Einzelne Zuordnungen koennen
+    zusaetzlich drucken, auch auf einem anderen Drucker.</p>
+    {% endif %}
+
     <div class="row" style="margin-top:.6rem">
       <button type="submit">Speichern</button>
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
@@ -465,6 +571,82 @@ ACCOUNT_BODY = """
     <button class="danger" type="submit">Dieses Postfach loeschen</button>
     <p class="hint">Zuordnungen, die nur fuer dieses Postfach gelten, bleiben
     bestehen und greifen dann nicht mehr.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+PRINTER_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Drucker bearbeiten' if printer else 'Drucker hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ printer.name if printer else '' }}"
+               placeholder="z. B. Buero EG" required>
+      </div>
+      <div class="field">
+        <label for="destination">Warteschlange in CUPS</label>
+        <input id="destination" name="destination" type="text"
+               value="{{ printer.destination if printer else '' }}"
+               placeholder="z. B. Kyocera_M2540" required>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="server">CUPS-Server (optional)</label>
+        <input id="server" name="server" type="text" value="{{ printer.server if printer else '' }}"
+               placeholder="leer = lokaler cupsd, sonst z. B. cups.lan:631">
+      </div>
+      <div class="field">
+        <label for="copies">Kopien</label>
+        <input id="copies" name="copies" type="text" value="{{ printer.copies if printer else '1' }}">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="options">Druckoptionen (optional)</label>
+        <input id="options" name="options" type="text"
+               value="{{ printer.options if printer else '' }}"
+               placeholder="z. B. media=A4 sides=two-sided-long-edge">
+      </div>
+    </div>
+    <p style="margin:.8rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not printer or printer.enabled %}checked{% endif %}> Drucker aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Die Warteschlange ist der Name, unter dem der Drucker in CUPS
+  bekannt ist (<code>lpstat -p</code>). Die Optionen sind genau die, die
+  <code>lp -o</code> versteht - jeweils ohne <code>-o</code>, mehrere durch
+  Leerzeichen getrennt.</p>
+</div>
+
+{% if printer %}
+<div class="card">
+  <h2 style="margin-top:0">Testdruck</h2>
+  <form method="post" action="{{ url_for('test_printer', printer_id=printer.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Testseite drucken</button>
+    <p class="hint">Druckt eine Seite mit den Einstellungen dieses Druckers - so
+    laesst sich pruefen, ob die Warteschlange stimmt, bevor die erste Rechnung
+    ankommt.</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Drucker loeschen</h2>
+  <form method="post" action="{{ url_for('delete_printer', printer_id=printer.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diesen Drucker loeschen</button>
+    <p class="hint">Postfaecher und Zuordnungen, die auf ihn zeigen, drucken danach
+    nicht mehr - das steht dann im Log.</p>
   </form>
 </div>
 {% endif %}
@@ -613,6 +795,23 @@ def create_app(runtime) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _printers() -> list:
+        """The printers offered in the dropdowns, or none if printing is off."""
+        if runtime.printers is None or not config.printing_enabled:
+            return []
+        return runtime.printers.all()
+
+    def _print_choice(value: str) -> tuple[bool, str]:
+        """Read the "Drucken" dropdown: off, mailbox printer, or a named one."""
+        value = (value or "").strip()
+        if not value:
+            return False, ""
+        if value == "account":
+            return True, ""
+        if value not in {printer.key for printer in _printers()}:
+            raise MappingError("Diesen Drucker gibt es nicht.")
+        return True, value
+
     def _rules() -> list[Rule]:
         return load_rules(storage, runtime.mapping_path)
 
@@ -650,6 +849,7 @@ def create_app(runtime) -> Flask:
             return sorted({*folders, current}) if current else folders
 
         accounts = runtime.accounts.all()
+        printers = _printers()
         return render(
             MAPPING_BODY,
             "Zuordnungen",
@@ -658,6 +858,8 @@ def create_app(runtime) -> Flask:
             folder_options=folder_options,
             accounts=accounts,
             account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
+            printers=printers,
+            printer_keys=[printer.key for printer in printers],
             storage_description=storage.description,
             mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
@@ -675,9 +877,10 @@ def create_app(runtime) -> Flask:
             keyword = validate_keyword(request.form.get("keyword", ""), rules)
             folder = validate_folder(chosen)
             account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
+            printing, printer = _print_choice(request.form.get("printer", ""))
             if new_folder:
                 storage.create_folder(folder)
-            rules.append(Rule.create(keyword, folder, account))
+            rules.append(Rule.create(keyword, folder, account, printing, printer))
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -707,7 +910,14 @@ def create_app(runtime) -> Flask:
             rule = rules[index]
             folder = validate_folder(request.form.get("folder", ""))
             account = _account_choice(request.form.get("account", rule.account))
-            rules[index] = set_account(Rule.create(rule.keyword, folder, account), account)
+            # The print controls are only rendered when a printer exists, so
+            # their absence means "leave as is" rather than "switch off".
+            if request.form.get("print_fields"):
+                printing, printer = _print_choice(request.form.get("printer", ""))
+            else:
+                printing, printer = rule.print_attachments, rule.printer
+            updated = Rule.create(rule.keyword, folder, account, printing, printer)
+            rules[index] = set_printing(set_account(updated, account), printing, printer)
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -770,6 +980,8 @@ def create_app(runtime) -> Flask:
             CONFIG_BODY,
             "Konfiguration",
             accounts=runtime.accounts.all(),
+            printers=_printers(),
+            printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
             storage_description=storage.description,
             storage_backend=config.storage_backend,
@@ -813,7 +1025,25 @@ def create_app(runtime) -> Flask:
             raise MappingError("Bitte einen Benutzernamen angeben.")
         if not password:
             raise MappingError("Bitte ein Passwort angeben.")
+        if request.form.get("print_fields"):
+            printer = request.form.get("printer", "").strip()
+            if printer and printer not in {p.key for p in _printers()}:
+                raise MappingError("Diesen Drucker gibt es nicht.")
+            printing = {
+                "print_attachments": bool(request.form.get("print_attachments")),
+                "printer": printer,
+                "archive_attachments": bool(request.form.get("archive_attachments")),
+            }
+        elif account is not None:
+            printing = {
+                "print_attachments": account.print_attachments,
+                "printer": account.printer,
+                "archive_attachments": account.archive_attachments,
+            }
+        else:
+            printing = {}
         return {
+            **printing,
             "name": request.form.get("name", ""),
             "host": request.form.get("host", ""),
             "port": port,
@@ -840,7 +1070,7 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ACCOUNT_BODY, "Postfach", account=None)
+        return render(ACCOUNT_BODY, "Postfach", account=None, **_printer_context())
 
     @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
     @login_required
@@ -861,7 +1091,7 @@ def create_app(runtime) -> Flask:
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             account = runtime.accounts.get(account_id)
-        return render(ACCOUNT_BODY, "Postfach", account=account)
+        return render(ACCOUNT_BODY, "Postfach", account=account, **_printer_context())
 
     @app.post("/config/accounts/<int:account_id>/delete")
     @login_required
@@ -870,6 +1100,99 @@ def create_app(runtime) -> Flask:
         runtime.accounts.delete(account_id)
         logger.info("Web UI: deleted IMAP account %s", account_id)
         flash("Postfach geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
+    # --- printers ---------------------------------------------------------
+
+    def _printer_context() -> dict:
+        printers = _printers()
+        return {"printers": printers, "printer_keys": [printer.key for printer in printers]}
+
+    def _printer_form() -> dict:
+        return {
+            "name": request.form.get("name", ""),
+            "destination": request.form.get("destination", ""),
+            "server": request.form.get("server", ""),
+            "options": request.form.get("options", ""),
+            "copies": request.form.get("copies", "1").strip() or "1",
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    def _require_printers():
+        """The printer pages only exist when there is a store behind them."""
+        if runtime.printers is None:
+            abort(404)
+        return runtime.printers
+
+    @app.route("/config/printers/new", methods=["GET", "POST"])
+    @login_required
+    def new_printer():
+        printers = _require_printers()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                printers.add(**_printer_form())
+            except PrinterError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added printer %r", request.form.get("destination"))
+                flash("Drucker angelegt. Ein Testdruck zeigt, ob er erreichbar ist.", "ok")
+                return redirect(url_for("config_page"))
+        return render(PRINTER_BODY, "Drucker", printer=None)
+
+    @app.route("/config/printers/<int:printer_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_printer(printer_id: int):
+        printers = _require_printers()
+        printer = printers.get(printer_id)
+        if printer is None:
+            flash("Diesen Drucker gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                printers.update(printer_id, **_printer_form())
+            except PrinterError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated printer %s", printer_id)
+                flash("Drucker gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            printer = printers.get(printer_id)
+        return render(PRINTER_BODY, "Drucker", printer=printer)
+
+    @app.post("/config/printers/<int:printer_id>/test")
+    @login_required
+    def test_printer(printer_id: int):
+        require_csrf()
+        printers = _require_printers()
+        printer = printers.get(printer_id)
+        if printer is None or runtime.printing is None:
+            flash("Diesen Drucker gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            runtime.printing.spooler.print_test_page(printer)
+        except PrintError as exc:
+            flash(f"Testdruck fehlgeschlagen: {exc}", "error")
+        except Exception as exc:  # noqa: BLE001 - surface anything else in the UI too
+            logger.exception("Web UI: test print failed")
+            flash(f"Testdruck fehlgeschlagen: {exc}", "error")
+        else:
+            flash("Testseite an die Warteschlange uebergeben.", "ok")
+        return redirect(url_for("edit_printer", printer_id=printer_id))
+
+    @app.post("/config/printers/<int:printer_id>/delete")
+    @login_required
+    def delete_printer(printer_id: int):
+        require_csrf()
+        _require_printers().delete(printer_id)
+        logger.info("Web UI: deleted printer %s", printer_id)
+        flash(
+            "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "
+            "drucken nicht mehr.",
+            "ok",
+        )
         return redirect(url_for("config_page"))
 
     @app.route("/password", methods=["GET", "POST"])

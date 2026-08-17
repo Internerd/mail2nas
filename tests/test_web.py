@@ -6,6 +6,8 @@ import pytest
 
 from mail2nas.accounts import AccountStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
+from mail2nas.printers import PrinterStore
+from mail2nas.printing import from_config as printing_from_config
 from mail2nas.runtime import Runtime
 from mail2nas.state import ProcessedStore, SettingsStore
 from mail2nas.storage import LocalStorage
@@ -28,8 +30,16 @@ def env(tmp_path):
     settings = SettingsStore(config.state_db_path)
     accounts = AccountStore(config.state_db_path)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    printers = PrinterStore(config.state_db_path)
     runtime = Runtime(
-        config, storage, mapping, ProcessedStore(config.state_db_path), settings, accounts
+        config,
+        storage,
+        mapping,
+        ProcessedStore(config.state_db_path),
+        settings,
+        accounts,
+        printers=printers,
+        printing=printing_from_config(config, printers),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -594,3 +604,230 @@ def test_the_stored_account_password_is_never_sent_to_the_browser(client, env):
     html = client.get(f"/config/accounts/{account_id}").get_data(as_text=True)
 
     assert "streng-geheim" not in html
+
+
+# --- printers -----------------------------------------------------------------------
+
+
+def _add_printer(runtime, **fields):
+    defaults = dict(name="Buero EG", destination="Kyocera_M2540")
+    defaults.update(fields)
+    return runtime.printers.add(**defaults)
+
+
+def test_config_page_lists_the_printers(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime, server="cups.lan:631")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Buero EG" in html
+    assert "Kyocera_M2540" in html
+    assert "cups.lan:631" in html
+
+
+def test_creating_a_printer_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/printers/new", data={
+        "name": "Buchhaltung", "destination": "HP_LJ", "server": "", "copies": "2",
+        "options": "media=A4 sides=two-sided-long-edge", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/printers/new")})
+
+    printers = runtime.printers.all()
+    assert [(p.name, p.destination, p.copies) for p in printers] == [("Buchhaltung", "HP_LJ", 2)]
+    assert printers[0].option_list == ["media=A4", "sides=two-sided-long-edge"]
+
+
+def test_an_unusable_queue_name_is_rejected_with_a_message(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/printers/new", data={
+        "name": "Kaputt", "destination": "zwei woerter", "copies": "1", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/printers/new")}, follow_redirects=True)
+
+    assert "Leerzeichen" in response.get_data(as_text=True)
+    assert runtime.printers.all() == []
+
+
+def test_editing_a_printer(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}", data={
+        "name": "Buero OG", "destination": "Kyocera_M2540", "copies": "1", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/printers/{printer_id}")})
+
+    printer = runtime.printers.get(printer_id)
+    assert printer.name == "Buero OG"
+    assert printer.enabled is False
+
+
+def test_deleting_a_printer(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.printers.all() == []
+
+
+def test_a_test_print_reports_a_failing_queue(client, env, monkeypatch):
+    import subprocess
+
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess([], 1, "", "lp: Kein Drucker"),
+    )
+
+    response = client.post(
+        f"/config/printers/{printer_id}/test",
+        data={"csrf_token": _csrf(client, f"/config/printers/{printer_id}")},
+        follow_redirects=True,
+    )
+
+    assert "Testdruck fehlgeschlagen" in response.get_data(as_text=True)
+
+
+def test_a_test_print_confirms_a_working_queue(client, env, monkeypatch):
+    import subprocess
+
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess([], 0, "request id is q-1", "")
+    )
+
+    response = client.post(
+        f"/config/printers/{printer_id}/test",
+        data={"csrf_token": _csrf(client, f"/config/printers/{printer_id}")},
+        follow_redirects=True,
+    )
+
+    assert "Testseite" in response.get_data(as_text=True)
+
+
+def test_the_print_settings_of_a_mailbox_are_saved(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    account_id = _add_account(runtime)
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "user": "u",
+        "password": "", "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "print_fields": "1", "print_attachments": "1", "printer": str(printer_id),
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    account = runtime.accounts.get(account_id)
+    assert account.print_attachments is True
+    assert account.printer == str(printer_id)
+    # the "archive" box was not ticked, so this mailbox prints only
+    assert account.archive_attachments is False
+
+
+def test_a_mailbox_cannot_reference_an_unknown_printer(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime)
+    account_id = _add_account(runtime)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}", data={
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "user": "u",
+        "password": "", "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "print_fields": "1", "print_attachments": "1", "printer": "999",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
+
+    assert "Drucker" in response.get_data(as_text=True)
+    assert runtime.accounts.get(account_id).print_attachments is False
+
+
+def test_a_rule_can_be_set_to_print_on_a_specific_printer(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": str(printer_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is True
+    assert rule.printer == str(printer_id)
+
+
+def test_a_rule_can_print_on_the_mailbox_printer(client, env):
+    _, storage, _, config, runtime = env
+    _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "account",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is True
+    assert rule.printer == ""
+
+
+def test_a_rule_cannot_reference_an_unknown_printer(client, env):
+    _, storage, _, config, runtime = env
+    _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "999",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path) == []
+
+
+def test_changing_a_rules_folder_keeps_its_print_settings(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    _login(client)
+
+    client.post("/mapping/update", data={
+        "index": "0", "folder": "belege", "print_fields": "1", "printer": str(printer_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.folder == "belege"
+    assert (rule.print_attachments, rule.printer) == (True, str(printer_id))
+
+
+def test_printing_can_be_switched_off_for_a_rule(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    _login(client)
+
+    client.post("/mapping/update", data={
+        "index": "0", "folder": "rechnungen", "print_fields": "1", "printer": "",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is False
+    assert rule.printer == ""
+
+
+def test_without_a_printer_the_print_controls_stay_hidden(client, env):
+    _login(client)
+
+    html = client.get("/mapping").get_data(as_text=True)
+
+    assert "nicht drucken" not in html

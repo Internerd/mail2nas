@@ -1,7 +1,11 @@
 FROM python:3.12-slim
 
+# cups-client provides `lp`, which is how attachments are printed. It is a
+# client only - no printing daemon runs in this container; it talks to the
+# CUPS server named per printer (or to the host's, via CUPS_SERVER).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
+    cups-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

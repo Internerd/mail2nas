@@ -20,6 +20,25 @@
 # Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
 # "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
 
+# Sobald die Weboberflaeche einmal speichert, wird die Datei ins ausfuehrliche
+# Format ueberfuehrt. Dort ist die Reihenfolge die Prioritaet (die erste
+# passende Regel gewinnt), und dort stehen auch die Postfach- und
+# Druckeinstellungen je Regel:
+#
+#   version: 2
+#   rules:
+#     - keyword: Rechnungskorrektur   # steht VOR "RE", sonst greift "RE" zuerst
+#       folder: korrekturen
+#     - keyword: "Rechnung*"
+#       folder: rechnungen
+#       account: "2"                  # nur fuer dieses Postfach (id aus der UI)
+#       print: true                   # zusaetzlich ausdrucken, nach der Ablage
+#       printer: "1"                  # id eines in der UI angelegten Druckers;
+#                                     # weglassen = Drucker des Postfachs
+#
+# print/printer fehlen = es wird nichts gedruckt. Anhaenge mit gesperrter
+# Dateiendung landen immer in der Quarantaene und werden nie gedruckt.
+
 RE: rechnungen
 Rechnung: rechnungen
 Invoice: rechnungen

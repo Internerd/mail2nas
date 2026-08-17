@@ -9,6 +9,7 @@ and the target folder:
   relying on it happening to be the longer word.
 * **Which mailbox a rule applies to**, once more than one IMAP account is
   configured.
+* **Whether the match is printed**, and on which of the configured printers.
 
 Format (version 2)::
 
@@ -19,6 +20,8 @@ Format (version 2)::
       - keyword: "RE*"
         folder: rechnungen
         account: "2"
+        print: true
+        printer: "1"
 
 The old flat `keyword: folder` format is still read: it is migrated in
 memory, longest keyword first, which is exactly the priority that version
@@ -87,11 +90,29 @@ class Rule:
     keyword: str
     folder: str
     account: str = ALL_ACCOUNTS  # ALL_ACCOUNTS or an account id as a string
+    # Print the attachments this rule matches. The printer is optional: an
+    # empty string means "whatever the mailbox is set to".
+    print_attachments: bool = False
+    printer: str = ""
     _matcher: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
-    def create(cls, keyword: str, folder: str, account: str = ALL_ACCOUNTS) -> "Rule":
-        return cls(keyword, folder, account or ALL_ACCOUNTS, _compile(keyword))
+    def create(
+        cls,
+        keyword: str,
+        folder: str,
+        account: str = ALL_ACCOUNTS,
+        print_attachments: bool = False,
+        printer: str = "",
+    ) -> "Rule":
+        return cls(
+            keyword,
+            folder,
+            account or ALL_ACCOUNTS,
+            bool(print_attachments),
+            str(printer or ""),
+            _compile(keyword),
+        )
 
     @property
     def has_wildcard(self) -> bool:
@@ -107,11 +128,29 @@ class Rule:
             return self._matcher.search(haystack[:MAX_MATCH_LENGTH]) is not None
         return self.keyword.lower() in haystack_lower
 
-    def as_dict(self) -> dict[str, str]:
-        data = {"keyword": self.keyword, "folder": self.folder}
+    def as_dict(self) -> dict[str, object]:
+        # Only what differs from the default is written, so a file that never
+        # used printing stays exactly as short as it was.
+        data: dict[str, object] = {"keyword": self.keyword, "folder": self.folder}
         if self.account != ALL_ACCOUNTS:
             data["account"] = self.account
+        if self.print_attachments:
+            data["print"] = True
+        if self.printer:
+            data["printer"] = self.printer
         return data
+
+
+def _as_bool(value) -> bool:
+    """Read a flag from a file someone may have edited by hand.
+
+    YAML already turns `true`/`yes` into booleans, but `print: "ja"` is the
+    kind of thing that gets typed - and silently treating it as false would
+    mean paper that never comes out with nothing to explain why.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "ja")
 
 
 def parse_rules(raw) -> list[Rule]:
@@ -132,6 +171,8 @@ def parse_rules(raw) -> list[Rule]:
                     str(entry["keyword"]),
                     str(entry["folder"]),
                     str(entry.get("account", ALL_ACCOUNTS)),
+                    _as_bool(entry.get("print", False)),
+                    str(entry.get("printer", "") or ""),
                 )
             )
         return rules
@@ -235,16 +276,25 @@ class Mapping:
             self._mtime = mtime
         logger.info("Loaded %d mapping rule(s) from %s", len(rules), display_path)
 
-    def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
-        """Return (target_folder, matched_keyword) for the first matching rule."""
+    def match(self, *texts: str, account_id: str | None = None) -> Rule | None:
+        """Return the first rule that matches, or None.
+
+        The whole rule rather than just its folder: the caller also needs to
+        know whether the match should be printed, and on which printer.
+        """
         haystack = " ".join(t for t in texts if t)
         haystack_lower = haystack.lower()
         with self._lock:
             rules = self._rules
         for rule in rules:
             if rule.applies_to(account_id) and rule.matches(haystack_lower, haystack):
-                return rule.folder, rule.keyword
-        return self._fallback_folder, None
+                return rule
+        return None
+
+    def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
+        """Return (target_folder, matched_keyword) for the first matching rule."""
+        rule = self.match(*texts, account_id=account_id)
+        return (rule.folder, rule.keyword) if rule else (self._fallback_folder, None)
 
 
 # --- editing helpers (used by the web UI) ------------------------------------
@@ -316,3 +366,13 @@ def move_rule(rules: list[Rule], index: int, offset: int) -> list[Rule]:
 
 def set_account(rule: Rule, account: str) -> Rule:
     return replace(rule, account=account or ALL_ACCOUNTS)
+
+
+def set_printing(rule: Rule, print_attachments: bool, printer: str) -> Rule:
+    """Change a rule's print settings, dropping the printer when off."""
+    print_attachments = bool(print_attachments)
+    return replace(
+        rule,
+        print_attachments=print_attachments,
+        printer=str(printer or "") if print_attachments else "",
+    )

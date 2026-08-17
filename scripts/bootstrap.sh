@@ -135,6 +135,38 @@ MAX_ATTACHMENTS_PER_MESSAGE=20
 BLOCKED_EXTENSIONS=exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk
 QUARANTINE_FOLDER=quarantaene
 
+# --- Drucken ----------------------------------------------------------------
+# Anhaenge koennen zusaetzlich ausgedruckt werden. WAS gedruckt wird, wird in
+# der Weboberflaeche festgelegt:
+#   * je Postfach: "alle Anhaenge drucken" (optional ohne Ablage im Archiv)
+#   * je Zuordnung: nur was die Regel trifft, z. B. nur Rechnungen
+# Drucker werden dort einmal angelegt und danach ueberall per Auswahlfeld
+# verwendet. Gedruckt wird ueber CUPS (`lp`); im Container steckt nur der
+# Client, kein Druckerdienst.
+#
+# Notausschalter: false schaltet jedes Drucken ab, egal was konfiguriert ist.
+PRINTING_ENABLED=true
+# Pfad zum lp-Binary, falls es nicht im PATH liegt.
+LP_BINARY=lp
+# Nach so vielen Sekunden gilt ein Druckauftrag als gescheitert (der Anhang
+# ist zu dem Zeitpunkt bereits abgelegt).
+PRINT_TIMEOUT_SECONDS=120
+# Nur diese Dateiendungen werden an den Drucker gegeben. Alles andere kaeme
+# als Zeichensalat heraus. Office-Formate fehlen bewusst: dafuer muesste im
+# Container ein Konverter installiert sein.
+PRINTABLE_EXTENSIONS=pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff
+# Optional: EIN Drucker, der beim ersten Start automatisch angelegt wird -
+# fuer Installationen, die alles ueber die .env konfigurieren. Danach ist die
+# Weboberflaeche die Quelle der Wahrheit. Leer lassen = kein Drucker.
+# PRINTER_DESTINATION ist der Name der Warteschlange in CUPS (`lpstat -p`).
+PRINTER_DESTINATION=
+PRINTER_NAME=
+# Leer = lokaler cupsd, sonst z. B. cups.lan:631
+PRINTER_SERVER=
+# Optionen wie fuer `lp -o`, jeweils ohne -o, durch Leerzeichen getrennt.
+PRINTER_OPTIONS=
+PRINTER_COPIES=1
+
 # --- Weboberflaeche fuer das Mapping ---------------------------------------
 # Kleine Oberflaeche zum Zuordnen von Stichwoertern zu Ordnern, damit die
 # mapping.yaml nicht von Hand bearbeitet werden muss. Sie schreibt genau diese
@@ -178,8 +210,12 @@ MAIL2NAS_EOF
 cat > Dockerfile <<'MAIL2NAS_EOF'
 FROM python:3.12-slim
 
+# cups-client provides `lp`, which is how attachments are printed. It is a
+# client only - no printing daemon runs in this container; it talks to the
+# CUPS server named per printer (or to the host's, via CUPS_SERVER).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
+    cups-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -275,6 +311,25 @@ cat > config/mapping.example.yaml <<'MAIL2NAS_EOF'
 # Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
 # "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
 
+# Sobald die Weboberflaeche einmal speichert, wird die Datei ins ausfuehrliche
+# Format ueberfuehrt. Dort ist die Reihenfolge die Prioritaet (die erste
+# passende Regel gewinnt), und dort stehen auch die Postfach- und
+# Druckeinstellungen je Regel:
+#
+#   version: 2
+#   rules:
+#     - keyword: Rechnungskorrektur   # steht VOR "RE", sonst greift "RE" zuerst
+#       folder: korrekturen
+#     - keyword: "Rechnung*"
+#       folder: rechnungen
+#       account: "2"                  # nur fuer dieses Postfach (id aus der UI)
+#       print: true                   # zusaetzlich ausdrucken, nach der Ablage
+#       printer: "1"                  # id eines in der UI angelegten Druckers;
+#                                     # weglassen = Drucker des Postfachs
+#
+# print/printer fehlen = es wird nichts gedruckt. Anhaenge mit gesperrter
+# Dateiendung landen immer in der Quarantaene und werden nie gedruckt.
+
 RE: rechnungen
 Rechnung: rechnungen
 Invoice: rechnungen
@@ -305,6 +360,11 @@ DEFAULT_BLOCKED_EXTENSIONS = (
     "exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,"
     "jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk"
 )
+
+# Formats CUPS prints without help. Office documents are deliberately absent:
+# without a converter installed they come out as pages of raw markup, and
+# installing one is a decision for whoever runs the container.
+DEFAULT_PRINTABLE_EXTENSIONS = "pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff"
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -401,6 +461,20 @@ class Config:
     state_db_path: str
     dry_run: bool
 
+    # Printing. Which attachments get printed, and on which printer, is
+    # configured per mailbox and per mapping rule in the UI - these are the
+    # infrastructure bits behind it plus the optional first printer, so an
+    # install that is driven purely from the .env can set one up too.
+    printing_enabled: bool
+    lp_binary: str
+    print_timeout: int
+    printable_extensions: frozenset[str]
+    printer_name: str
+    printer_destination: str
+    printer_server: str
+    printer_options: str
+    printer_copies: int
+
     # Optional web UI for editing the keyword -> folder mapping.
     web_enabled: bool
     web_host: str
@@ -451,6 +525,17 @@ class Config:
                 quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
                 state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
                 dry_run=_bool("DRY_RUN", False),
+                printing_enabled=_bool("PRINTING_ENABLED", True),
+                lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+                print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
+                printable_extensions=_extension_set(
+                    "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS
+                ),
+                printer_name=os.environ.get("PRINTER_NAME", "").strip(),
+                printer_destination=os.environ.get("PRINTER_DESTINATION", "").strip(),
+                printer_server=os.environ.get("PRINTER_SERVER", "").strip(),
+                printer_options=os.environ.get("PRINTER_OPTIONS", "").strip(),
+                printer_copies=_int("PRINTER_COPIES", "1", minimum=1, maximum=20),
                 web_enabled=_bool("WEB_ENABLED", False),
                 web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip(),
                 web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
@@ -507,6 +592,13 @@ class Account:
     processed_folder: str
     oversized_folder: str
     enabled: bool
+    # Print every attachment from this mailbox, regardless of the rules.
+    print_attachments: bool = False
+    # Printer for this mailbox, as a string key ("" = none configured). A rule
+    # that names its own printer overrides it.
+    printer: str = ""
+    # Off means "print only": attachments are not written to the share.
+    archive_attachments: bool = True
 
     @property
     def key(self) -> str:
@@ -526,6 +618,9 @@ class Account:
             self.processed_folder,
             self.oversized_folder,
             self.enabled,
+            self.print_attachments,
+            self.printer,
+            self.archive_attachments,
         )
 
 
@@ -557,6 +652,7 @@ class AccountStore:
                 "oversized_folder TEXT NOT NULL DEFAULT '', "
                 "enabled INTEGER NOT NULL DEFAULT 1)"
             )
+            _add_missing_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)
@@ -576,11 +672,15 @@ class AccountStore:
             processed_folder=row[9],
             oversized_folder=row[10],
             enabled=bool(row[11]),
+            print_attachments=bool(row[12]),
+            printer=row[13] or "",
+            archive_attachments=bool(row[14]),
         )
 
     _COLUMNS = (
         "id, name, host, port, ssl, user, password, folder, mode, "
-        "processed_folder, oversized_folder, enabled"
+        "processed_folder, oversized_folder, enabled, "
+        "print_attachments, printer, archive_attachments"
     )
 
     def all(self) -> list[Account]:
@@ -603,9 +703,11 @@ class AccountStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO imap_accounts (name, host, port, ssl, user, password, folder, "
-                "mode, processed_folder, oversized_folder, enabled) "
+                "mode, processed_folder, oversized_folder, enabled, print_attachments, "
+                "printer, archive_attachments) "
                 "VALUES (:name, :host, :port, :ssl, :user, :password, :folder, :mode, "
-                ":processed_folder, :oversized_folder, :enabled)",
+                ":processed_folder, :oversized_folder, :enabled, :print_attachments, "
+                ":printer, :archive_attachments)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -627,6 +729,9 @@ class AccountStore:
                 "processed_folder": current.processed_folder,
                 "oversized_folder": current.oversized_folder,
                 "enabled": current.enabled,
+                "print_attachments": current.print_attachments,
+                "printer": current.printer,
+                "archive_attachments": current.archive_attachments,
                 **fields,
             }
         )
@@ -636,13 +741,33 @@ class AccountStore:
                 "UPDATE imap_accounts SET name = :name, host = :host, port = :port, ssl = :ssl, "
                 "user = :user, password = :password, folder = :folder, mode = :mode, "
                 "processed_folder = :processed_folder, oversized_folder = :oversized_folder, "
-                "enabled = :enabled WHERE id = :id",
+                "enabled = :enabled, print_attachments = :print_attachments, "
+                "printer = :printer, archive_attachments = :archive_attachments WHERE id = :id",
                 values,
             )
 
     def delete(self, account_id: int) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM imap_accounts WHERE id = ?", (account_id,))
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to date.
+
+    Printing was added after the table existed, and an update must not require
+    re-entering every mailbox - so the columns are added in place, with
+    defaults that keep an already-configured install behaving exactly as
+    before (nothing printed, everything archived).
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(imap_accounts)")}
+    for column, definition in (
+        ("print_attachments", "INTEGER NOT NULL DEFAULT 0"),
+        ("printer", "TEXT NOT NULL DEFAULT ''"),
+        ("archive_attachments", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE imap_accounts ADD COLUMN {column} {definition}")
+            logger.info("Added the %s column to the account table", column)
 
 
 def _defaults(fields: dict) -> dict:
@@ -658,6 +783,9 @@ def _defaults(fields: dict) -> dict:
         "processed_folder": str(fields.get("processed_folder") or "").strip(),
         "oversized_folder": str(fields.get("oversized_folder") or "").strip(),
         "enabled": 1 if fields.get("enabled", True) else 0,
+        "print_attachments": 1 if fields.get("print_attachments", False) else 0,
+        "printer": str(fields.get("printer") or "").strip(),
+        "archive_attachments": 1 if fields.get("archive_attachments", True) else 0,
     }
 
 
@@ -691,6 +819,492 @@ def seed_from_config(store: AccountStore, settings, config) -> None:
     logger.info("Created the first IMAP account from the configuration (%s)", config.imap_host)
 MAIL2NAS_EOF
 
+# --- mail2nas/printers.py ---
+cat > mail2nas/printers.py <<'MAIL2NAS_EOF'
+"""Printers, stored locally so the web UI can manage them centrally.
+
+A printer is configured once - here - and then only *referenced* everywhere
+else: a mailbox picks one from a dropdown, a mapping rule picks one from a
+dropdown. That way the queue name, the CUPS server and the paper options live
+in exactly one place, and changing them does not mean editing every rule.
+
+Same storage as the IMAP accounts (the SQLite file next to the state), for the
+same reason: it has to be writable, survive updates, and be editable from the
+UI. Unlike the accounts this holds no credentials - printing goes through the
+local CUPS client, which does its own authentication if the server needs any.
+"""
+from __future__ import annotations
+
+import logging
+import shlex
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+SETTING_PRINTERS_SEEDED = "printers_seeded"
+
+MAX_NAME_LENGTH = 80
+MAX_DESTINATION_LENGTH = 128
+MAX_OPTIONS_LENGTH = 200
+MAX_COPIES = 20
+
+
+class PrinterError(ValueError):
+    """A printer the user tried to save is not usable."""
+
+
+@dataclass(frozen=True)
+class Printer:
+    """One print queue."""
+
+    id: int
+    name: str
+    destination: str  # CUPS queue name, i.e. `lp -d <destination>`
+    server: str  # optional CUPS server "host" or "host:port"; empty = local cupsd
+    options: str  # extra lp options, e.g. "media=A4 sides=two-sided-long-edge"
+    copies: int
+    enabled: bool
+
+    @property
+    def key(self) -> str:
+        """Stable identifier, as referenced by an account or a mapping rule."""
+        return str(self.id)
+
+    @property
+    def option_list(self) -> list[str]:
+        """The options as separate `-o` arguments."""
+        return shlex.split(self.options) if self.options.strip() else []
+
+    def label(self) -> str:
+        where = f" @ {self.server}" if self.server else ""
+        return f"{self.name} ({self.destination}{where})"
+
+
+class PrinterStore:
+    """CRUD for the configured printers.
+
+    Opens a short-lived connection per call, like `AccountStore`: the web UI
+    answers requests on a thread pool and the account workers read from their
+    own threads, and one sqlite3 connection must not be shared across threads.
+    """
+
+    _COLUMNS = "id, name, destination, server, options, copies, enabled"
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS printers ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, "
+                "destination TEXT NOT NULL, "
+                "server TEXT NOT NULL DEFAULT '', "
+                "options TEXT NOT NULL DEFAULT '', "
+                "copies INTEGER NOT NULL DEFAULT 1, "
+                "enabled INTEGER NOT NULL DEFAULT 1)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    @staticmethod
+    def _row_to_printer(row) -> Printer:
+        return Printer(
+            id=row[0],
+            name=row[1],
+            destination=row[2],
+            server=row[3],
+            options=row[4],
+            copies=row[5],
+            enabled=bool(row[6]),
+        )
+
+    def all(self) -> list[Printer]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT {self._COLUMNS} FROM printers ORDER BY id").fetchall()
+        return [self._row_to_printer(row) for row in rows]
+
+    def enabled(self) -> list[Printer]:
+        return [printer for printer in self.all() if printer.enabled]
+
+    def get(self, printer_id: int) -> Printer | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM printers WHERE id = ?", (printer_id,)
+            ).fetchone()
+        return self._row_to_printer(row) if row else None
+
+    def by_key(self, key: str) -> Printer | None:
+        """Look a printer up by the string id an account or rule stores."""
+        try:
+            printer_id = int(str(key).strip())
+        except (TypeError, ValueError):
+            return None
+        return self.get(printer_id)
+
+    def add(self, **fields) -> int:
+        values = validate(fields)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO printers (name, destination, server, options, copies, enabled) "
+                "VALUES (:name, :destination, :server, :options, :copies, :enabled)",
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update(self, printer_id: int, **fields) -> None:
+        current = self.get(printer_id)
+        if current is None:
+            raise KeyError(printer_id)
+        values = validate(
+            {
+                "name": current.name,
+                "destination": current.destination,
+                "server": current.server,
+                "options": current.options,
+                "copies": current.copies,
+                "enabled": current.enabled,
+                **fields,
+            }
+        )
+        values["id"] = printer_id
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE printers SET name = :name, destination = :destination, "
+                "server = :server, options = :options, copies = :copies, "
+                "enabled = :enabled WHERE id = :id",
+                values,
+            )
+
+    def delete(self, printer_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM printers WHERE id = ?", (printer_id,))
+
+
+def validate(fields: dict) -> dict:
+    """Check and normalise what the UI (or the environment) supplies.
+
+    The values end up as arguments to the `lp` binary. That call never goes
+    through a shell, so this is not about quoting - it is about catching typos
+    early and refusing values (newlines, leading dashes) that would turn into
+    something other than what was typed.
+    """
+    name = str(fields.get("name") or "").strip()
+    destination = str(fields.get("destination") or "").strip()
+    server = str(fields.get("server") or "").strip()
+    options = " ".join(str(fields.get("options") or "").split())
+
+    if not destination:
+        raise PrinterError("Bitte den Namen der Druckerwarteschlange angeben.")
+    if len(destination) > MAX_DESTINATION_LENGTH:
+        raise PrinterError(f"Die Warteschlange darf hoechstens {MAX_DESTINATION_LENGTH} Zeichen lang sein.")
+    if any(char.isspace() for char in destination) or destination.startswith("-"):
+        raise PrinterError(
+            "Die Warteschlange darf keine Leerzeichen enthalten und nicht mit '-' beginnen "
+            "(so heisst sie auch in CUPS)."
+        )
+    if len(name) > MAX_NAME_LENGTH:
+        raise PrinterError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
+    if any(char.isspace() for char in server) or server.startswith("-"):
+        raise PrinterError("Der CUPS-Server darf keine Leerzeichen enthalten (z. B. cups.lan:631).")
+    if len(options) > MAX_OPTIONS_LENGTH:
+        raise PrinterError(f"Die Optionen duerfen hoechstens {MAX_OPTIONS_LENGTH} Zeichen lang sein.")
+
+    try:
+        option_list = shlex.split(options) if options else []
+    except ValueError as exc:
+        raise PrinterError(f"Die Optionen sind nicht lesbar: {exc}") from None
+    for option in option_list:
+        if option.startswith("-"):
+            raise PrinterError(
+                f"Option {option!r}: nur der Teil hinter -o angeben, z. B. media=A4."
+            )
+
+    try:
+        copies = int(fields.get("copies") or 1)
+    except (TypeError, ValueError):
+        raise PrinterError("Die Anzahl der Kopien muss eine Zahl sein.") from None
+    if not 1 <= copies <= MAX_COPIES:
+        raise PrinterError(f"Die Anzahl der Kopien muss zwischen 1 und {MAX_COPIES} liegen.")
+
+    return {
+        "name": name or destination,
+        "destination": destination,
+        "server": server,
+        "options": options,
+        "copies": copies,
+        "enabled": 1 if fields.get("enabled", True) else 0,
+    }
+
+
+def seed_from_config(store: PrinterStore, settings, config) -> None:
+    """Create the first printer from the environment, once.
+
+    Same deal as the IMAP accounts: an install that configured a printer in
+    the `.env` gets it without re-entering anything, and deleting it in the UI
+    does not resurrect it on the next restart.
+    """
+    if settings.get(SETTING_PRINTERS_SEEDED):
+        return
+    if store.all() or not config.printer_destination:
+        settings.set(SETTING_PRINTERS_SEEDED, "1")
+        return
+
+    try:
+        store.add(
+            name=config.printer_name or config.printer_destination,
+            destination=config.printer_destination,
+            server=config.printer_server,
+            options=config.printer_options,
+            copies=config.printer_copies,
+            enabled=True,
+        )
+    except PrinterError as exc:
+        logger.error("PRINTER_DESTINATION is not usable (%s) - no printer was created", exc)
+        return
+    settings.set(SETTING_PRINTERS_SEEDED, "1")
+    logger.info("Created the first printer from the configuration (%s)", config.printer_destination)
+MAIL2NAS_EOF
+
+# --- mail2nas/printing.py ---
+cat > mail2nas/printing.py <<'MAIL2NAS_EOF'
+"""Sending attachments to a printer.
+
+Printing goes through the `lp` client from CUPS rather than through a Python
+IPP library: every NAS-adjacent printer setup already has a CUPS server (or a
+printer that speaks IPP and can be added to one), `lp` handles the driver and
+format conversion side, and it means no long-lived printer connection has to
+be maintained inside a service whose real job is archiving mail.
+
+Two rules the rest of the code depends on:
+
+* **Nothing is printed that was quarantined.** That decision is made in the
+  archiver; this module only ever sees what it is handed. What it does check
+  is the file type: an unknown format sent to a queue produces a stack of
+  garbage paper, so only known-printable extensions are spooled.
+* **A failing printer never fails the archiving.** Paper is the copy, the
+  share is the archive. Every error is logged and swallowed by
+  `PrintService.send`, so an offline printer cannot stop mail from being
+  filed - or, worse, cause the same mail to be processed again and again.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import tempfile
+
+from .config import DEFAULT_PRINTABLE_EXTENSIONS
+from .filenames import extension_of, sanitize_filename
+from .printers import Printer, PrinterStore
+
+logger = logging.getLogger(__name__)
+
+# The job title shows up in the CUPS queue. Keep it short and free of control
+# characters - it is built from an attacker-supplied filename.
+MAX_TITLE_LENGTH = 80
+
+
+class PrintError(RuntimeError):
+    """A print job could not be handed to CUPS."""
+
+
+def parse_extensions(raw: str) -> frozenset[str]:
+    return frozenset(ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip())
+
+
+def job_title(prefix: str, filename: str) -> str:
+    title = f"{prefix}: {filename}" if prefix else filename
+    title = "".join(char for char in title if char.isprintable())
+    return title[:MAX_TITLE_LENGTH] or "mail2nas"
+
+
+def build_command(printer: Printer, path: str, title: str, lp_binary: str = "lp") -> list[str]:
+    """Build the `lp` invocation for one job.
+
+    Split out from the call so the command can be asserted on in tests without
+    a printer anywhere near. Note the arguments are passed to `lp` directly -
+    there is no shell involved, so nothing here needs quoting.
+    """
+    command = [lp_binary]
+    if printer.server:
+        command += ["-h", printer.server]
+    command += ["-d", printer.destination, "-t", title]
+    if printer.copies > 1:
+        command += ["-n", str(printer.copies)]
+    for option in printer.option_list:
+        command += ["-o", option]
+    # "--" so a filename can never be read as an option, whatever it is called.
+    return [*command, "--", path]
+
+
+class Spooler:
+    """Hands bytes to CUPS, one temporary file per job."""
+
+    def __init__(
+        self,
+        lp_binary: str = "lp",
+        timeout: int = 120,
+        printable_extensions: frozenset[str] = frozenset(),
+        dry_run: bool = False,
+    ):
+        self._lp_binary = lp_binary
+        self._timeout = timeout
+        self._printable = printable_extensions or parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS)
+        self._dry_run = dry_run
+
+    @property
+    def printable_extensions(self) -> frozenset[str]:
+        return self._printable
+
+    def can_print(self, filename: str) -> bool:
+        return extension_of(sanitize_filename(filename)) in self._printable
+
+    def print_bytes(self, printer: Printer, data: bytes, filename: str, title: str = "") -> str:
+        """Spool `data` to `printer`. Returns what `lp` reported, for the log.
+
+        Raises PrintError for anything that went wrong, including a missing
+        `lp` binary - which is the most likely failure on a container that was
+        built before printing existed.
+        """
+        extension = extension_of(sanitize_filename(filename))
+        return self._spool(printer, data, extension, title or job_title("", filename))
+
+    def print_test_page(self, printer: Printer) -> str:
+        """Print a page that says where it came from, to verify a queue."""
+        page = (
+            "mail2nas - Testseite\n"
+            "====================\n\n"
+            f"Drucker: {printer.label()}\n"
+            f"Optionen: {printer.options or '(keine)'}\n"
+            f"Kopien: {printer.copies}\n\n"
+            "Kommt diese Seite an, funktioniert die Warteschlange.\n"
+        )
+        return self._spool(printer, page.encode("utf-8"), "txt", "mail2nas Testseite")
+
+    def _spool(self, printer: Printer, data: bytes, extension: str, title: str) -> str:
+        if self._dry_run:
+            logger.info("[dry-run] would print %r on %s", title, printer.label())
+            return "dry-run"
+
+        suffix = f".{extension}" if extension else ""
+        handle, path = tempfile.mkstemp(prefix="mail2nas-print-", suffix=suffix)
+        try:
+            # The attachment is untrusted content sitting in a shared temp
+            # directory until CUPS has picked it up, so nobody else may read it.
+            os.chmod(path, 0o600)
+            with os.fdopen(handle, "wb") as fh:
+                fh.write(data)
+            return self._run(build_command(printer, path, title, self._lp_binary))
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:  # pragma: no cover - only if something else removed it
+                logger.debug("Could not remove the temporary print file %s", path, exc_info=True)
+
+    def _run(self, command: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=self._timeout, check=False
+            )
+        except FileNotFoundError:
+            raise PrintError(
+                f"{self._lp_binary} nicht gefunden - im Container fehlt das Paket cups-client "
+                "(oder LP_BINARY zeigt auf den falschen Pfad)."
+            ) from None
+        except subprocess.TimeoutExpired:
+            raise PrintError(
+                f"Der Druckauftrag wurde nach {self._timeout}s abgebrochen - "
+                "antwortet der CUPS-Server?"
+            ) from None
+        except OSError as exc:
+            raise PrintError(f"Druckauftrag fehlgeschlagen: {exc}") from exc
+
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            raise PrintError(message or f"{self._lp_binary} endete mit Code {result.returncode}")
+        return (result.stdout or "").strip()
+
+
+class PrintService:
+    """Which printer a job goes to, and the promise that it never raises.
+
+    `printer_for` implements the precedence the UI documents: the most
+    specific setting wins. A mapping rule that names a printer beats the
+    mailbox default, which beats "no printer configured" (nothing is printed,
+    and it is logged - silently dropping paper someone asked for is worse than
+    a log line).
+    """
+
+    def __init__(self, printers: PrinterStore, spooler: Spooler):
+        self._printers = printers
+        self._spooler = spooler
+
+    @property
+    def spooler(self) -> Spooler:
+        return self._spooler
+
+    def configured(self) -> bool:
+        return bool(self._printers.enabled())
+
+    def printer_for(self, *keys: str) -> Printer | None:
+        """First enabled printer among `keys`, which may contain blanks."""
+        for key in keys:
+            if not key or str(key) in ("0", "None"):
+                continue
+            printer = self._printers.by_key(key)
+            if printer is None:
+                logger.warning("Printer %r is configured somewhere but no longer exists", key)
+                continue
+            if not printer.enabled:
+                logger.warning("Printer %r is paused - not printing on it", printer.label())
+                continue
+            return printer
+        return None
+
+    def send(self, printer: Printer, data: bytes, filename: str, title: str = "") -> bool:
+        """Print, reporting failures rather than raising them.
+
+        Returns True if CUPS accepted the job. The archiver treats a False as
+        "the paper copy did not happen" and carries on: the attachment is
+        already on the share, and re-processing the mail to retry the print
+        would duplicate the archived file.
+        """
+        if not self._spooler.can_print(filename):
+            logger.warning(
+                "Not printing %r on %s: %s is not in PRINTABLE_EXTENSIONS",
+                filename,
+                printer.label(),
+                extension_of(sanitize_filename(filename)) or "(no extension)",
+            )
+            return False
+        try:
+            reply = self._spooler.print_bytes(printer, data, filename, title)
+        except PrintError as exc:
+            logger.error("Printing %r on %s failed: %s", filename, printer.label(), exc)
+            return False
+        logger.info("Printed %r on %s%s", filename, printer.label(), f" ({reply})" if reply else "")
+        return True
+
+
+def from_config(config, printers: PrinterStore) -> PrintService:
+    """Build the print service described by the configuration."""
+    return PrintService(
+        printers,
+        Spooler(
+            lp_binary=config.lp_binary,
+            timeout=config.print_timeout,
+            printable_extensions=config.printable_extensions,
+            dry_run=config.dry_run,
+        ),
+    )
+MAIL2NAS_EOF
+
 # --- mail2nas/runtime.py ---
 cat > mail2nas/runtime.py <<'MAIL2NAS_EOF'
 """The objects the archiver and the web UI both work on.
@@ -716,13 +1330,19 @@ SETTING_MAPPING_PATH = "mapping_path"
 class Runtime:
     """Shared handles, plus the mapping-file location that can move."""
 
-    def __init__(self, config, storage, mapping, store, settings, accounts):
+    def __init__(
+        self, config, storage, mapping, store, settings, accounts, printers=None, printing=None
+    ):
         self.config = config
         self.storage = storage
         self.mapping = mapping
         self.store = store
         self.settings = settings
         self.accounts = accounts
+        # Optional so a caller that does not care about printing (tests, and
+        # the archiver before printers existed) can leave them out.
+        self.printers = printers
+        self.printing = printing
         # Set by the web UI, consumed by the supervisor loop: the archiver
         # threads must not read a half-changed path.
         self.mapping_path_changed = threading.Event()
@@ -1267,6 +1887,7 @@ and the target folder:
   relying on it happening to be the longer word.
 * **Which mailbox a rule applies to**, once more than one IMAP account is
   configured.
+* **Whether the match is printed**, and on which of the configured printers.
 
 Format (version 2)::
 
@@ -1277,6 +1898,8 @@ Format (version 2)::
       - keyword: "RE*"
         folder: rechnungen
         account: "2"
+        print: true
+        printer: "1"
 
 The old flat `keyword: folder` format is still read: it is migrated in
 memory, longest keyword first, which is exactly the priority that version
@@ -1345,11 +1968,29 @@ class Rule:
     keyword: str
     folder: str
     account: str = ALL_ACCOUNTS  # ALL_ACCOUNTS or an account id as a string
+    # Print the attachments this rule matches. The printer is optional: an
+    # empty string means "whatever the mailbox is set to".
+    print_attachments: bool = False
+    printer: str = ""
     _matcher: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
-    def create(cls, keyword: str, folder: str, account: str = ALL_ACCOUNTS) -> "Rule":
-        return cls(keyword, folder, account or ALL_ACCOUNTS, _compile(keyword))
+    def create(
+        cls,
+        keyword: str,
+        folder: str,
+        account: str = ALL_ACCOUNTS,
+        print_attachments: bool = False,
+        printer: str = "",
+    ) -> "Rule":
+        return cls(
+            keyword,
+            folder,
+            account or ALL_ACCOUNTS,
+            bool(print_attachments),
+            str(printer or ""),
+            _compile(keyword),
+        )
 
     @property
     def has_wildcard(self) -> bool:
@@ -1365,11 +2006,29 @@ class Rule:
             return self._matcher.search(haystack[:MAX_MATCH_LENGTH]) is not None
         return self.keyword.lower() in haystack_lower
 
-    def as_dict(self) -> dict[str, str]:
-        data = {"keyword": self.keyword, "folder": self.folder}
+    def as_dict(self) -> dict[str, object]:
+        # Only what differs from the default is written, so a file that never
+        # used printing stays exactly as short as it was.
+        data: dict[str, object] = {"keyword": self.keyword, "folder": self.folder}
         if self.account != ALL_ACCOUNTS:
             data["account"] = self.account
+        if self.print_attachments:
+            data["print"] = True
+        if self.printer:
+            data["printer"] = self.printer
         return data
+
+
+def _as_bool(value) -> bool:
+    """Read a flag from a file someone may have edited by hand.
+
+    YAML already turns `true`/`yes` into booleans, but `print: "ja"` is the
+    kind of thing that gets typed - and silently treating it as false would
+    mean paper that never comes out with nothing to explain why.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "ja")
 
 
 def parse_rules(raw) -> list[Rule]:
@@ -1390,6 +2049,8 @@ def parse_rules(raw) -> list[Rule]:
                     str(entry["keyword"]),
                     str(entry["folder"]),
                     str(entry.get("account", ALL_ACCOUNTS)),
+                    _as_bool(entry.get("print", False)),
+                    str(entry.get("printer", "") or ""),
                 )
             )
         return rules
@@ -1493,16 +2154,25 @@ class Mapping:
             self._mtime = mtime
         logger.info("Loaded %d mapping rule(s) from %s", len(rules), display_path)
 
-    def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
-        """Return (target_folder, matched_keyword) for the first matching rule."""
+    def match(self, *texts: str, account_id: str | None = None) -> Rule | None:
+        """Return the first rule that matches, or None.
+
+        The whole rule rather than just its folder: the caller also needs to
+        know whether the match should be printed, and on which printer.
+        """
         haystack = " ".join(t for t in texts if t)
         haystack_lower = haystack.lower()
         with self._lock:
             rules = self._rules
         for rule in rules:
             if rule.applies_to(account_id) and rule.matches(haystack_lower, haystack):
-                return rule.folder, rule.keyword
-        return self._fallback_folder, None
+                return rule
+        return None
+
+    def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
+        """Return (target_folder, matched_keyword) for the first matching rule."""
+        rule = self.match(*texts, account_id=account_id)
+        return (rule.folder, rule.keyword) if rule else (self._fallback_folder, None)
 
 
 # --- editing helpers (used by the web UI) ------------------------------------
@@ -1574,6 +2244,16 @@ def move_rule(rules: list[Rule], index: int, offset: int) -> list[Rule]:
 
 def set_account(rule: Rule, account: str) -> Rule:
     return replace(rule, account=account or ALL_ACCOUNTS)
+
+
+def set_printing(rule: Rule, print_attachments: bool, printer: str) -> Rule:
+    """Change a rule's print settings, dropping the printer when off."""
+    print_attachments = bool(print_attachments)
+    return replace(
+        rule,
+        print_attachments=print_attachments,
+        printer=str(printer or "") if print_attachments else "",
+    )
 MAIL2NAS_EOF
 
 # --- mail2nas/filenames.py ---
@@ -1600,6 +2280,13 @@ def sanitize_filename(name: str) -> str:
     name = unicodedata.normalize("NFKD", name)
     name = _UNSAFE.sub("_", name).strip("._")
     return name or "attachment"
+
+
+def extension_of(filename: str) -> str:
+    """Lower-cased extension without the dot, or "" if there is none."""
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].strip().lower()
 
 
 def sanitize_path_segment(segment: str) -> str:
@@ -1815,6 +2502,7 @@ from __future__ import annotations
 
 import email
 import logging
+from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
@@ -1823,8 +2511,10 @@ from imapclient import IMAPClient
 
 from .accounts import Account
 from .config import Config
-from .filenames import safe_relative_parts, sanitize_filename
-from .mapping import Mapping
+from .filenames import extension_of, safe_relative_parts, sanitize_filename
+from .mapping import Mapping, Rule
+from .printers import Printer
+from .printing import PrintService, job_title
 from .state import ProcessedStore
 from .storage import Storage
 
@@ -1846,10 +2536,20 @@ def _message_id(msg: Message, uid: int, account_key: str) -> str:
     return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
-def _extension_of(filename: str) -> str:
-    if "." not in filename:
-        return ""
-    return filename.rsplit(".", 1)[-1].strip().lower()
+@dataclass(frozen=True)
+class AttachmentPlan:
+    """What is to happen with one attachment, decided before anything happens.
+
+    Filing and printing are two independent answers to the same question, and
+    both depend on the same rule match - so they are worked out together and
+    then carried out, rather than being re-derived at each step.
+    """
+
+    folder: str
+    keyword: str | None
+    quarantined: bool
+    archive: bool
+    printer: Printer | None
 
 
 class Archiver:
@@ -1860,12 +2560,14 @@ class Archiver:
         store: ProcessedStore,
         storage: Storage,
         account: Account,
+        printing: PrintService | None = None,
     ):
         self.config = config
         self.mapping = mapping
         self.store = store
         self.storage = storage
         self.account = account
+        self.printing = printing
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -1873,10 +2575,10 @@ class Archiver:
         client.select_folder(self.account.folder)
         return client
 
-    def _resolve(self, *texts: str) -> tuple[str, str | None]:
+    def _match(self, *texts: str) -> Rule | None:
         # Rules can be limited to a single mailbox, so the account has to be
         # part of every lookup.
-        return self.mapping.resolve(*texts, account_id=self.account.key)
+        return self.mapping.match(*texts, account_id=self.account.key)
 
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
@@ -1927,7 +2629,7 @@ class Archiver:
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
-        mail_folder, mail_keyword = self._resolve(subject, body)
+        mail_rule = self._match(subject, body)
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -1960,31 +2662,56 @@ class Archiver:
                     )
                     continue
 
-                folder_name, matched_keyword, quarantined = self._resolve_attachment_folder(
-                    filename, mail_folder, mail_keyword
-                )
-                target_parts = self._target_parts(folder_name)
+                plan = self._plan_attachment(filename, mail_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
-                if self.config.dry_run:
+                if plan.archive:
+                    target_parts = self._target_parts(plan.folder)
+                    if self.config.dry_run:
+                        logger.info(
+                            "[dry-run] would save %s -> %s",
+                            out_name,
+                            self.storage.display(target_parts),
+                        )
+                    else:
+                        out_path = self.storage.save_unique(target_parts, out_name, payload)
+                        saved.append(out_path)
+                        logger.info(
+                            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+                            uid,
+                            subject,
+                            filename,
+                            plan.keyword or "<fallback>",
+                            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
+                            out_path,
+                        )
+                elif plan.printer is not None:
                     logger.info(
-                        "[dry-run] would save %s -> %s",
-                        out_name,
-                        self.storage.display(target_parts),
+                        "UID %s '%s': attachment '%s' is printed only, not archived",
+                        uid,
+                        subject,
+                        filename,
                     )
-                    continue
+                else:
+                    # Neither filed nor printed - that is a configuration
+                    # mistake rather than an intention, and the attachment is
+                    # gone once the mail is marked as read.
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' was neither archived nor printed - "
+                        "the mailbox is set to print only but nothing prints it",
+                        uid,
+                        subject,
+                        filename,
+                    )
 
-                out_path = self.storage.save_unique(target_parts, out_name, payload)
-                saved.append(out_path)
-                logger.info(
-                    "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
-                    uid,
-                    subject,
-                    filename,
-                    matched_keyword or "<fallback>",
-                    " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
-                    out_path,
-                )
+                # Printing comes after filing, deliberately: the share is the
+                # archive and paper is the copy, so a printer that is offline
+                # or out of paper must never be the reason an attachment was
+                # not stored.
+                if plan.printer is not None:
+                    self.printing.send(
+                        plan.printer, payload, out_name, job_title(subject, filename)
+                    )
 
         if not self.config.dry_run:
             self.store.mark_processed(message_id)
@@ -2013,10 +2740,8 @@ class Archiver:
             return target
         raise ValueError("No usable target folder inside the archive root")
 
-    def _resolve_attachment_folder(
-        self, filename: str, mail_folder: str, mail_keyword: str | None
-    ) -> tuple[str, str | None, bool]:
-        """Decide the target folder for a single attachment.
+    def _plan_attachment(self, filename: str, mail_rule: Rule | None) -> AttachmentPlan:
+        """Decide where a single attachment is filed, and whether it is printed.
 
         The attachment's own filename is checked against the mapping first,
         so multiple differently-named attachments on the same mail can land
@@ -2026,17 +2751,57 @@ class Archiver:
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
         """
-        folder_name, matched_keyword = self._resolve(filename)
-        if matched_keyword is None:
-            folder_name, matched_keyword = mail_folder, mail_keyword
+        rule = self._match(filename) or mail_rule
 
         # Check both the name as received and the name actually written to
         # disk: sanitizing can change the trailing extension, and only the
         # latter is what a file manager will act on when someone opens it.
-        extensions = {_extension_of(filename), _extension_of(sanitize_filename(_decode(filename)))}
-        if extensions & self.config.blocked_extensions:
-            return self.config.quarantine_folder, matched_keyword, True
-        return folder_name, matched_keyword, False
+        extensions = {extension_of(filename), extension_of(sanitize_filename(_decode(filename)))}
+        quarantined = bool(extensions & self.config.blocked_extensions)
+
+        return AttachmentPlan(
+            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule),
+            keyword=rule.keyword if rule else None,
+            quarantined=quarantined,
+            # "Print only" still files anything quarantined: it cannot be
+            # printed either, and dropping it without a trace would hide
+            # exactly the attachment somebody may need to look at.
+            archive=self.account.archive_attachments or quarantined,
+            printer=self._printer_for(rule, quarantined),
+        )
+
+    def _folder_of(self, rule: Rule | None) -> str:
+        return rule.folder if rule else self.config.fallback_folder
+
+    def _printer_for(self, rule: Rule | None, quarantined: bool) -> Printer | None:
+        """Which printer this attachment goes to, if any.
+
+        Printing is requested either by the mailbox ("print everything that
+        arrives here") or by the matched rule ("print invoices"). The printer
+        is then the most specific one configured: the rule's own choice beats
+        the mailbox default.
+        """
+        if self.printing is None or not self.config.printing_enabled:
+            return None
+        if quarantined:
+            # A blocked attachment is a suspected executable. It is neither
+            # printable nor something to hand to a printer driver.
+            return None
+
+        by_rule = rule is not None and rule.print_attachments
+        if not (self.account.print_attachments or by_rule):
+            return None
+
+        printer = self.printing.printer_for(
+            rule.printer if by_rule else "", self.account.printer
+        )
+        if printer is None:
+            logger.warning(
+                "Printing is enabled for %s but no usable printer is configured - "
+                "nothing was printed",
+                f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}",
+            )
+        return printer
 
     @staticmethod
     def _date_prefix(msg: Message) -> str:
@@ -2138,9 +2903,12 @@ from .mapping import (
     move_rule,
     save_rules,
     set_account,
+    set_printing,
     validate_folder,
     validate_keyword,
 )
+from .printers import PrinterError
+from .printing import PrintError
 
 logger = logging.getLogger(__name__)
 
@@ -2329,6 +3097,18 @@ MAPPING_BODY = """
         </select>
       </div>
       {% endif %}
+      {% if printers %}
+      <div class="field">
+        <label for="printer">Drucken</label>
+        <select id="printer" name="printer">
+          <option value="">nicht drucken</option>
+          <option value="account">drucken, Drucker des Postfachs</option>
+          {% for printer in printers %}
+            <option value="{{ printer.key }}">drucken auf {{ printer.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       <button type="submit">Hinzufuegen</button>
     </div>
   </form>
@@ -2336,6 +3116,12 @@ MAPPING_BODY = """
   viele Zeichen, <code>?</code> fuer genau eines - <code>RE*2026</code> passt also auf
   &bdquo;RE-4711 vom 03.2026&ldquo;. Aenderungen wirken beim naechsten Durchlauf,
   ein Neustart ist nicht noetig.</p>
+  {% if printers %}
+  <p class="hint">Mit <em>Drucken</em> wird jeder Anhang, den diese Zuordnung trifft,
+  zusaetzlich ausgedruckt - z. B. nur Rechnungen. Gedruckt wird erst, nachdem der
+  Anhang abgelegt wurde. Drucker werden unter
+  <a href="{{ url_for('config_page') }}">Konfiguration</a> angelegt.</p>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -2346,7 +3132,9 @@ MAPPING_BODY = """
   <div class="table-wrap">
   <table>
     <tr>
-      <th>Prio</th><th>Stichwort</th><th>Ziel{% if accounts|length > 1 %} und Postfach{% endif %}</th><th></th>
+      <th>Prio</th><th>Stichwort</th>
+      <th>Ziel{% if accounts|length > 1 %}, Postfach{% endif %}{% if printers %} und Druck{% endif %}</th>
+      <th></th>
     </tr>
     {% for rule in rules %}
     <tr>
@@ -2384,6 +3172,21 @@ MAPPING_BODY = """
             {% endfor %}
             {% if rule.account not in account_keys %}
               <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
+          {% if printers %}
+          <input type="hidden" name="print_fields" value="1">
+          <select name="printer" title="Anhaenge dieser Zuordnung drucken">
+            <option value="" {% if not rule.print_attachments %}selected{% endif %}>nicht drucken</option>
+            <option value="account"
+              {% if rule.print_attachments and not rule.printer %}selected{% endif %}>drucken, Drucker des Postfachs</option>
+            {% for printer in printers %}
+              <option value="{{ printer.key }}"
+                {% if rule.print_attachments and rule.printer == printer.key %}selected{% endif %}>drucken auf {{ printer.name }}</option>
+            {% endfor %}
+            {% if rule.printer and rule.printer not in printer_keys %}
+              <option value="{{ rule.printer }}" selected>(geloeschter Drucker)</option>
             {% endif %}
           </select>
           {% endif %}
@@ -2445,6 +3248,39 @@ CONFIG_BODY = """
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_account') }}">
     <button type="button">Postfach hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Drucker</h2>
+  {% if printers %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
+    {% for printer in printers %}
+    <tr>
+      <td class="keyword">{{ printer.name }}</td>
+      <td>{{ printer.destination }}{% if printer.server %}<br>
+        <span class="hint">auf {{ printer.server }}</span>{% endif %}</td>
+      <td>{{ printer.options or '-' }}{% if printer.copies > 1 %}
+        <span class="hint">&middot; {{ printer.copies }} Kopien</span>{% endif %}</td>
+      <td>{% if printer.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_printer', printer_id=printer.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Einmal angelegt, dann ueberall per Auswahlfeld verwendbar: je
+  Postfach (alles drucken) und je Zuordnung (z. B. nur Rechnungen).</p>
+  {% elif printing_enabled %}
+  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
+  CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
+  {% else %}
+  <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_printer') }}">
+    <button type="button">Drucker hinzufuegen</button></a></p>
 </div>
 
 <div class="card">
@@ -2544,6 +3380,41 @@ ACCOUNT_BODY = """
       <label><input type="checkbox" name="enabled" value="1"
         {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
     </p>
+
+    {% if printers %}
+    <input type="hidden" name="print_fields" value="1">
+    <h2>Drucken und Ablegen</h2>
+    <div class="row">
+      <div class="field">
+        <label for="account_printer">Drucker fuer dieses Postfach</label>
+        <select id="account_printer" name="printer">
+          <option value="">kein Drucker</option>
+          {% for printer in printers %}
+            <option value="{{ printer.key }}"
+              {% if account and account.printer == printer.key %}selected{% endif %}>{{ printer.name }}</option>
+          {% endfor %}
+          {% if account and account.printer and account.printer not in printer_keys %}
+            <option value="{{ account.printer }}" selected>(geloeschter Drucker)</option>
+          {% endif %}
+        </select>
+      </div>
+    </div>
+    <p style="margin:.6rem 0 .2rem">
+      <label><input type="checkbox" name="print_attachments" value="1"
+        {% if account and account.print_attachments %}checked{% endif %}>
+        Alle Anhaenge dieses Postfachs drucken</label>
+    </p>
+    <p style="margin:.2rem 0 .2rem">
+      <label><input type="checkbox" name="archive_attachments" value="1"
+        {% if not account or account.archive_attachments %}checked{% endif %}>
+        Anhaenge im Archiv ablegen</label>
+    </p>
+    <p class="hint">Ohne Haken bei &bdquo;ablegen&ldquo; wird nur gedruckt und nichts
+    gespeichert. Anhaenge mit gesperrter Dateiendung landen trotzdem im
+    Quarantaene-Ordner - gedruckt werden sie nie. Einzelne Zuordnungen koennen
+    zusaetzlich drucken, auch auf einem anderen Drucker.</p>
+    {% endif %}
+
     <div class="row" style="margin-top:.6rem">
       <button type="submit">Speichern</button>
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
@@ -2561,6 +3432,82 @@ ACCOUNT_BODY = """
     <button class="danger" type="submit">Dieses Postfach loeschen</button>
     <p class="hint">Zuordnungen, die nur fuer dieses Postfach gelten, bleiben
     bestehen und greifen dann nicht mehr.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+PRINTER_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Drucker bearbeiten' if printer else 'Drucker hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ printer.name if printer else '' }}"
+               placeholder="z. B. Buero EG" required>
+      </div>
+      <div class="field">
+        <label for="destination">Warteschlange in CUPS</label>
+        <input id="destination" name="destination" type="text"
+               value="{{ printer.destination if printer else '' }}"
+               placeholder="z. B. Kyocera_M2540" required>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="server">CUPS-Server (optional)</label>
+        <input id="server" name="server" type="text" value="{{ printer.server if printer else '' }}"
+               placeholder="leer = lokaler cupsd, sonst z. B. cups.lan:631">
+      </div>
+      <div class="field">
+        <label for="copies">Kopien</label>
+        <input id="copies" name="copies" type="text" value="{{ printer.copies if printer else '1' }}">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="options">Druckoptionen (optional)</label>
+        <input id="options" name="options" type="text"
+               value="{{ printer.options if printer else '' }}"
+               placeholder="z. B. media=A4 sides=two-sided-long-edge">
+      </div>
+    </div>
+    <p style="margin:.8rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not printer or printer.enabled %}checked{% endif %}> Drucker aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Die Warteschlange ist der Name, unter dem der Drucker in CUPS
+  bekannt ist (<code>lpstat -p</code>). Die Optionen sind genau die, die
+  <code>lp -o</code> versteht - jeweils ohne <code>-o</code>, mehrere durch
+  Leerzeichen getrennt.</p>
+</div>
+
+{% if printer %}
+<div class="card">
+  <h2 style="margin-top:0">Testdruck</h2>
+  <form method="post" action="{{ url_for('test_printer', printer_id=printer.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Testseite drucken</button>
+    <p class="hint">Druckt eine Seite mit den Einstellungen dieses Druckers - so
+    laesst sich pruefen, ob die Warteschlange stimmt, bevor die erste Rechnung
+    ankommt.</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Drucker loeschen</h2>
+  <form method="post" action="{{ url_for('delete_printer', printer_id=printer.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diesen Drucker loeschen</button>
+    <p class="hint">Postfaecher und Zuordnungen, die auf ihn zeigen, drucken danach
+    nicht mehr - das steht dann im Log.</p>
   </form>
 </div>
 {% endif %}
@@ -2709,6 +3656,23 @@ def create_app(runtime) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _printers() -> list:
+        """The printers offered in the dropdowns, or none if printing is off."""
+        if runtime.printers is None or not config.printing_enabled:
+            return []
+        return runtime.printers.all()
+
+    def _print_choice(value: str) -> tuple[bool, str]:
+        """Read the "Drucken" dropdown: off, mailbox printer, or a named one."""
+        value = (value or "").strip()
+        if not value:
+            return False, ""
+        if value == "account":
+            return True, ""
+        if value not in {printer.key for printer in _printers()}:
+            raise MappingError("Diesen Drucker gibt es nicht.")
+        return True, value
+
     def _rules() -> list[Rule]:
         return load_rules(storage, runtime.mapping_path)
 
@@ -2746,6 +3710,7 @@ def create_app(runtime) -> Flask:
             return sorted({*folders, current}) if current else folders
 
         accounts = runtime.accounts.all()
+        printers = _printers()
         return render(
             MAPPING_BODY,
             "Zuordnungen",
@@ -2754,6 +3719,8 @@ def create_app(runtime) -> Flask:
             folder_options=folder_options,
             accounts=accounts,
             account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
+            printers=printers,
+            printer_keys=[printer.key for printer in printers],
             storage_description=storage.description,
             mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
@@ -2771,9 +3738,10 @@ def create_app(runtime) -> Flask:
             keyword = validate_keyword(request.form.get("keyword", ""), rules)
             folder = validate_folder(chosen)
             account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
+            printing, printer = _print_choice(request.form.get("printer", ""))
             if new_folder:
                 storage.create_folder(folder)
-            rules.append(Rule.create(keyword, folder, account))
+            rules.append(Rule.create(keyword, folder, account, printing, printer))
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -2803,7 +3771,14 @@ def create_app(runtime) -> Flask:
             rule = rules[index]
             folder = validate_folder(request.form.get("folder", ""))
             account = _account_choice(request.form.get("account", rule.account))
-            rules[index] = set_account(Rule.create(rule.keyword, folder, account), account)
+            # The print controls are only rendered when a printer exists, so
+            # their absence means "leave as is" rather than "switch off".
+            if request.form.get("print_fields"):
+                printing, printer = _print_choice(request.form.get("printer", ""))
+            else:
+                printing, printer = rule.print_attachments, rule.printer
+            updated = Rule.create(rule.keyword, folder, account, printing, printer)
+            rules[index] = set_printing(set_account(updated, account), printing, printer)
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -2866,6 +3841,8 @@ def create_app(runtime) -> Flask:
             CONFIG_BODY,
             "Konfiguration",
             accounts=runtime.accounts.all(),
+            printers=_printers(),
+            printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
             storage_description=storage.description,
             storage_backend=config.storage_backend,
@@ -2909,7 +3886,25 @@ def create_app(runtime) -> Flask:
             raise MappingError("Bitte einen Benutzernamen angeben.")
         if not password:
             raise MappingError("Bitte ein Passwort angeben.")
+        if request.form.get("print_fields"):
+            printer = request.form.get("printer", "").strip()
+            if printer and printer not in {p.key for p in _printers()}:
+                raise MappingError("Diesen Drucker gibt es nicht.")
+            printing = {
+                "print_attachments": bool(request.form.get("print_attachments")),
+                "printer": printer,
+                "archive_attachments": bool(request.form.get("archive_attachments")),
+            }
+        elif account is not None:
+            printing = {
+                "print_attachments": account.print_attachments,
+                "printer": account.printer,
+                "archive_attachments": account.archive_attachments,
+            }
+        else:
+            printing = {}
         return {
+            **printing,
             "name": request.form.get("name", ""),
             "host": request.form.get("host", ""),
             "port": port,
@@ -2936,7 +3931,7 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ACCOUNT_BODY, "Postfach", account=None)
+        return render(ACCOUNT_BODY, "Postfach", account=None, **_printer_context())
 
     @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
     @login_required
@@ -2957,7 +3952,7 @@ def create_app(runtime) -> Flask:
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             account = runtime.accounts.get(account_id)
-        return render(ACCOUNT_BODY, "Postfach", account=account)
+        return render(ACCOUNT_BODY, "Postfach", account=account, **_printer_context())
 
     @app.post("/config/accounts/<int:account_id>/delete")
     @login_required
@@ -2966,6 +3961,99 @@ def create_app(runtime) -> Flask:
         runtime.accounts.delete(account_id)
         logger.info("Web UI: deleted IMAP account %s", account_id)
         flash("Postfach geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
+    # --- printers ---------------------------------------------------------
+
+    def _printer_context() -> dict:
+        printers = _printers()
+        return {"printers": printers, "printer_keys": [printer.key for printer in printers]}
+
+    def _printer_form() -> dict:
+        return {
+            "name": request.form.get("name", ""),
+            "destination": request.form.get("destination", ""),
+            "server": request.form.get("server", ""),
+            "options": request.form.get("options", ""),
+            "copies": request.form.get("copies", "1").strip() or "1",
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    def _require_printers():
+        """The printer pages only exist when there is a store behind them."""
+        if runtime.printers is None:
+            abort(404)
+        return runtime.printers
+
+    @app.route("/config/printers/new", methods=["GET", "POST"])
+    @login_required
+    def new_printer():
+        printers = _require_printers()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                printers.add(**_printer_form())
+            except PrinterError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added printer %r", request.form.get("destination"))
+                flash("Drucker angelegt. Ein Testdruck zeigt, ob er erreichbar ist.", "ok")
+                return redirect(url_for("config_page"))
+        return render(PRINTER_BODY, "Drucker", printer=None)
+
+    @app.route("/config/printers/<int:printer_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_printer(printer_id: int):
+        printers = _require_printers()
+        printer = printers.get(printer_id)
+        if printer is None:
+            flash("Diesen Drucker gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                printers.update(printer_id, **_printer_form())
+            except PrinterError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated printer %s", printer_id)
+                flash("Drucker gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            printer = printers.get(printer_id)
+        return render(PRINTER_BODY, "Drucker", printer=printer)
+
+    @app.post("/config/printers/<int:printer_id>/test")
+    @login_required
+    def test_printer(printer_id: int):
+        require_csrf()
+        printers = _require_printers()
+        printer = printers.get(printer_id)
+        if printer is None or runtime.printing is None:
+            flash("Diesen Drucker gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            runtime.printing.spooler.print_test_page(printer)
+        except PrintError as exc:
+            flash(f"Testdruck fehlgeschlagen: {exc}", "error")
+        except Exception as exc:  # noqa: BLE001 - surface anything else in the UI too
+            logger.exception("Web UI: test print failed")
+            flash(f"Testdruck fehlgeschlagen: {exc}", "error")
+        else:
+            flash("Testseite an die Warteschlange uebergeben.", "ok")
+        return redirect(url_for("edit_printer", printer_id=printer_id))
+
+    @app.post("/config/printers/<int:printer_id>/delete")
+    @login_required
+    def delete_printer(printer_id: int):
+        require_csrf()
+        _require_printers().delete(printer_id)
+        logger.info("Web UI: deleted printer %s", printer_id)
+        flash(
+            "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "
+            "drucken nicht mehr.",
+            "ok",
+        )
         return redirect(url_for("config_page"))
 
     @app.route("/password", methods=["GET", "POST"])
@@ -3068,11 +4156,14 @@ import os
 import sys
 import threading
 
+from . import printing as printing_module
 from . import storage as storage_module
 from .accounts import AccountStore, seed_from_config
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
+from .printers import PrinterStore
+from .printers import seed_from_config as seed_printer_from_config
 from .runtime import SETTING_MAPPING_PATH, Runtime
 from .state import ProcessedStore, SettingsStore
 
@@ -3103,10 +4194,16 @@ def main() -> None:
     _protect_state_file(config.state_db_path)
     seed_from_config(accounts, settings, config)
 
+    printers = PrinterStore(config.state_db_path)
+    seed_printer_from_config(printers, settings, config)
+    printing = printing_module.from_config(config, printers)
+
     mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
     mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    runtime = Runtime(config, storage, mapping, store, settings, accounts)
+    runtime = Runtime(
+        config, storage, mapping, store, settings, accounts, printers=printers, printing=printing
+    )
 
     if config.web_enabled:
         # Imported lazily so the archiver still runs if the web dependencies
@@ -3116,10 +4213,11 @@ def main() -> None:
         web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: storage=%s (%s) mapping=%s dry_run=%s",
+        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d dry_run=%s",
         storage.description,
         config.storage_backend,
         mapping_path,
+        len(printers.enabled()) if config.printing_enabled else 0,
         config.dry_run,
     )
 
@@ -3172,6 +4270,7 @@ class _Worker:
             self._runtime.store,
             self._runtime.storage,
             self.account,
+            self._runtime.printing,
         )
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(
@@ -3312,6 +4411,7 @@ from mail2nas.mapping import (
     load_rules,
     move_rule,
     save_rules,
+    set_printing,
     validate_keyword,
 )
 from mail2nas.storage import LocalStorage
@@ -3597,6 +4697,77 @@ def test_matching_a_huge_body_stays_bounded(tmp_path):
     folder, _ = mapping.resolve("Rechnung " + ("x" * 2_000_000))
     assert folder == "unsorted"
     assert time.monotonic() - started < 5
+
+
+# --- printing per rule ------------------------------------------------------------
+
+
+def test_a_rule_carries_its_print_settings(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
+        version: 2
+        rules:
+          - keyword: Rechnung
+            folder: rechnungen
+            print: true
+            printer: "3"
+    """)
+
+    rule = _mapping(tmp_path).match("Rechnung 4711")
+
+    assert (rule.folder, rule.print_attachments, rule.printer) == ("rechnungen", True, "3")
+
+
+def test_a_rule_without_print_settings_prints_nothing(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
+
+    rule = _mapping(tmp_path).match("RE-1")
+
+    assert rule.print_attachments is False
+    assert rule.printer == ""
+
+
+def test_print_settings_survive_a_save_and_reload(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "all", True, "2")])
+
+    reloaded = load_rules(storage, "mapping.yaml")[0]
+
+    assert (reloaded.print_attachments, reloaded.printer) == (True, "2")
+
+
+def test_a_file_that_never_used_printing_stays_unchanged(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen")])
+
+    text = storage.read_text("mapping.yaml")
+
+    assert "print" not in text
+    assert "printer" not in text
+
+
+def test_a_hand_written_yes_is_read_as_printing(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
+        version: 2
+        rules:
+          - keyword: RE
+            folder: rechnungen
+            print: "ja"
+    """)
+
+    assert _mapping(tmp_path).match("RE-1").print_attachments is True
+
+
+def test_switching_printing_off_drops_the_printer(tmp_path):
+    rule = Rule.create("RE", "rechnungen", "all", True, "2")
+
+    assert set_printing(rule, False, "2").printer == ""
+    assert set_printing(rule, True, "5").printer == "5"
+
+
+def test_match_returns_nothing_when_no_rule_applies(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
+
+    assert _mapping(tmp_path).match("Newsletter") is None
 MAIL2NAS_EOF
 
 # --- tests/test_filenames.py ---
@@ -3750,10 +4921,21 @@ import textwrap
 from email.message import EmailMessage
 
 from mail2nas.archiver import Archiver
-from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
+from mail2nas.config import (
+    DEFAULT_BLOCKED_EXTENSIONS,
+    DEFAULT_PRINTABLE_EXTENSIONS,
+    Config,
+)
 from mail2nas.mapping import Mapping
 from mail2nas.state import ProcessedStore
 from mail2nas.accounts import Account
+from mail2nas.printers import PrinterStore
+from mail2nas.printing import (
+    PrintError,
+    PrintService,
+    Spooler,
+    parse_extensions,
+)
 from mail2nas.storage import LocalStorage
 
 TEST_ACCOUNT = Account(
@@ -3803,6 +4985,17 @@ def _make_config(tmp_path, **overrides) -> Config:
         quarantine_folder="quarantaene",
         state_db_path=str(tmp_path / "state.db"),
         dry_run=False,
+        printing_enabled=True,
+        lp_binary="lp",
+        print_timeout=120,
+        printable_extensions=frozenset(
+            e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
+        ),
+        printer_name="",
+        printer_destination="",
+        printer_server="",
+        printer_options="",
+        printer_copies=1,
         web_enabled=False,
         web_host="127.0.0.1",
         web_port=8080,
@@ -3818,7 +5011,11 @@ def _write_mapping(path, content: str) -> None:
 
 
 def _make_archiver(
-    tmp_path, mapping_content: str | None = None, account: Account | None = None, **config_overrides
+    tmp_path,
+    mapping_content: str | None = None,
+    account: Account | None = None,
+    printing=None,
+    **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
     mapping_path = tmp_path / "mapping.yaml"
@@ -3827,7 +5024,7 @@ def _make_archiver(
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT)
+    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT, printing)
 
 
 class FakeIMAPClient:
@@ -3923,7 +5120,7 @@ def test_build_filename_date_only_prefix(tmp_path):
 # --- per-attachment folder resolution ----------------------------------------
 
 
-def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject(tmp_path):
+def test_plan_prefers_attachment_filename_over_mail_subject(tmp_path):
     archiver = _make_archiver(
         tmp_path,
         mapping_content="""
@@ -3933,40 +5130,34 @@ def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject
     )
     # Mail-level match would be "rechnungen" (subject contains RE), but this
     # specific attachment's own filename literally says "Lieferschein".
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
+    mail_rule = archiver.mapping.match("RE-2024-001 mit Lieferschein")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Lieferschein_4711.pdf", mail_folder, mail_keyword
-    )
+    plan = archiver._plan_attachment("Lieferschein_4711.pdf", mail_rule)
 
-    assert folder == "lieferscheine"
-    assert keyword == "Lieferschein"
-    assert quarantined is False
+    assert plan.folder == "lieferscheine"
+    assert plan.keyword == "Lieferschein"
+    assert plan.quarantined is False
 
 
-def test_resolve_attachment_folder_falls_back_to_mail_level_match(tmp_path):
+def test_plan_falls_back_to_mail_level_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001")
+    mail_rule = archiver.mapping.match("RE-2024-001")
 
     # "anhang1.pdf" itself does not match any keyword.
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "anhang1.pdf", mail_folder, mail_keyword
-    )
+    plan = archiver._plan_attachment("anhang1.pdf", mail_rule)
 
-    assert folder == "rechnungen"
-    assert keyword == "RE"
-    assert quarantined is False
+    assert plan.folder == "rechnungen"
+    assert plan.keyword == "RE"
+    assert plan.quarantined is False
 
 
-def test_resolve_attachment_folder_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
+def test_plan_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Rechnung.exe", "unsorted", None
-    )
+    plan = archiver._plan_attachment("Rechnung.exe", None)
 
-    assert folder == "quarantaene"
-    assert quarantined is True
+    assert plan.folder == "quarantaene"
+    assert plan.quarantined is True
 
 
 # --- full message processing (size/count limits, quarantine, mail-level) ----
@@ -4125,6 +5316,214 @@ def test_attachments_are_written_atomically_without_temp_leftovers(tmp_path):
     names = [p.name for p in (tmp_path / "rechnungen").iterdir()]
     assert len(names) == 1
     assert not any(n.startswith(".mail2nas-tmp-") for n in names)
+
+
+# --- printing ----------------------------------------------------------------
+
+
+class RecordingSpooler(Spooler):
+    """A spooler that remembers jobs instead of handing them to CUPS."""
+
+    def __init__(self, **kwargs):
+        super().__init__(printable_extensions=parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS))
+        self.jobs: list[tuple[str, str]] = []
+
+    def print_bytes(self, printer, data, filename, title=""):
+        self.jobs.append((printer.destination, filename))
+        return "queued"
+
+    @property
+    def printed_on(self) -> list[str]:
+        return [destination for destination, _ in self.jobs]
+
+
+def _make_printing(tmp_path, *queues: str):
+    """A print service with one printer per given queue name."""
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    ids = [str(store.add(name=queue, destination=queue)) for queue in queues]
+    spooler = RecordingSpooler()
+    return PrintService(store, spooler), spooler, ids
+
+
+def test_a_mailbox_can_print_every_attachment(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+    )
+    raw = _build_message("Newsletter", [("prospekt.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert spooler.printed_on == ["drucker_a"]
+    # still archived: printing is an addition, not a replacement
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_a_rule_can_print_only_what_it_matches(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_b")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+                printer: "{printer_id}"
+              - keyword: Lieferschein
+                folder: lieferscheine
+        """,
+        printing=printing,
+    )
+    raw = _build_message(
+        "Bestellung 42",
+        [("Rechnung_42.pdf", b"invoice"), ("Lieferschein_42.pdf", b"delivery")],
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=raw), 2)
+
+    assert [name for _, name in spooler.jobs] == [
+        "unknown-date_lieferant_example.com_Rechnung_42.pdf"
+    ]
+    assert spooler.printed_on == ["drucker_b"]
+
+
+def test_the_rule_printer_wins_over_the_mailbox_printer(tmp_path):
+    printing, spooler, (rule_printer, account_printer) = _make_printing(
+        tmp_path, "drucker_regel", "drucker_konto"
+    )
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+                printer: "{rule_printer}"
+        """,
+        account=_account(print_attachments=True, printer=account_printer),
+        printing=printing,
+    )
+    raw = _build_message("Rechnung 1", [("Rechnung_1.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert spooler.printed_on == ["drucker_regel"]
+
+
+def test_a_rule_without_its_own_printer_uses_the_mailbox_one(tmp_path):
+    printing, spooler, (account_printer,) = _make_printing(tmp_path, "drucker_konto")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - keyword: Rechnung
+                folder: rechnungen
+                print: true
+        """,
+        account=_account(printer=account_printer),
+        printing=printing,
+    )
+    raw = _build_message("Rechnung 1", [("Rechnung_1.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=raw), 4)
+
+    assert spooler.printed_on == ["drucker_konto"]
+
+
+def test_print_only_mailboxes_do_not_write_to_the_share(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+
+    assert spooler.printed_on == ["drucker_a"]
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_a_blocked_attachment_is_quarantined_and_never_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        # print everything, archive nothing - the executable must still be
+        # kept, and must still not reach the printer.
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=6, raw=raw), 6)
+
+    assert spooler.jobs == []
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_nothing_is_printed_without_a_printer(tmp_path, caplog):
+    printing, spooler, _ = _make_printing(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    with caplog.at_level("WARNING"):
+        archiver._process_message(FakeIMAPClient(uid=7, raw=raw), 7)
+
+    assert spooler.jobs == []
+    assert "no usable printer" in caplog.text
+    # the attachment is still filed - printing is the part that failed
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_printing_can_be_switched_off_globally(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+        printing_enabled=False,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=8, raw=raw), 8)
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_a_failing_printer_does_not_stop_the_archiving(tmp_path):
+    class BrokenSpooler(RecordingSpooler):
+        def print_bytes(self, printer, data, filename, title=""):
+            raise PrintError("Drucker offline")
+
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = str(store.add(name="Kaputt", destination="drucker_a"))
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=PrintService(store, BrokenSpooler()),
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=9, raw=raw), 9)
+
+    assert any((tmp_path / "rechnungen").glob("*"))
 MAIL2NAS_EOF
 
 # --- tests/test_config.py ---
@@ -4472,6 +5871,8 @@ import pytest
 
 from mail2nas.accounts import AccountStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
+from mail2nas.printers import PrinterStore
+from mail2nas.printing import from_config as printing_from_config
 from mail2nas.runtime import Runtime
 from mail2nas.state import ProcessedStore, SettingsStore
 from mail2nas.storage import LocalStorage
@@ -4494,8 +5895,16 @@ def env(tmp_path):
     settings = SettingsStore(config.state_db_path)
     accounts = AccountStore(config.state_db_path)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    printers = PrinterStore(config.state_db_path)
     runtime = Runtime(
-        config, storage, mapping, ProcessedStore(config.state_db_path), settings, accounts
+        config,
+        storage,
+        mapping,
+        ProcessedStore(config.state_db_path),
+        settings,
+        accounts,
+        printers=printers,
+        printing=printing_from_config(config, printers),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -5060,6 +6469,233 @@ def test_the_stored_account_password_is_never_sent_to_the_browser(client, env):
     html = client.get(f"/config/accounts/{account_id}").get_data(as_text=True)
 
     assert "streng-geheim" not in html
+
+
+# --- printers -----------------------------------------------------------------------
+
+
+def _add_printer(runtime, **fields):
+    defaults = dict(name="Buero EG", destination="Kyocera_M2540")
+    defaults.update(fields)
+    return runtime.printers.add(**defaults)
+
+
+def test_config_page_lists_the_printers(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime, server="cups.lan:631")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Buero EG" in html
+    assert "Kyocera_M2540" in html
+    assert "cups.lan:631" in html
+
+
+def test_creating_a_printer_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/printers/new", data={
+        "name": "Buchhaltung", "destination": "HP_LJ", "server": "", "copies": "2",
+        "options": "media=A4 sides=two-sided-long-edge", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/printers/new")})
+
+    printers = runtime.printers.all()
+    assert [(p.name, p.destination, p.copies) for p in printers] == [("Buchhaltung", "HP_LJ", 2)]
+    assert printers[0].option_list == ["media=A4", "sides=two-sided-long-edge"]
+
+
+def test_an_unusable_queue_name_is_rejected_with_a_message(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/printers/new", data={
+        "name": "Kaputt", "destination": "zwei woerter", "copies": "1", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/printers/new")}, follow_redirects=True)
+
+    assert "Leerzeichen" in response.get_data(as_text=True)
+    assert runtime.printers.all() == []
+
+
+def test_editing_a_printer(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}", data={
+        "name": "Buero OG", "destination": "Kyocera_M2540", "copies": "1", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/printers/{printer_id}")})
+
+    printer = runtime.printers.get(printer_id)
+    assert printer.name == "Buero OG"
+    assert printer.enabled is False
+
+
+def test_deleting_a_printer(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.printers.all() == []
+
+
+def test_a_test_print_reports_a_failing_queue(client, env, monkeypatch):
+    import subprocess
+
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess([], 1, "", "lp: Kein Drucker"),
+    )
+
+    response = client.post(
+        f"/config/printers/{printer_id}/test",
+        data={"csrf_token": _csrf(client, f"/config/printers/{printer_id}")},
+        follow_redirects=True,
+    )
+
+    assert "Testdruck fehlgeschlagen" in response.get_data(as_text=True)
+
+
+def test_a_test_print_confirms_a_working_queue(client, env, monkeypatch):
+    import subprocess
+
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess([], 0, "request id is q-1", "")
+    )
+
+    response = client.post(
+        f"/config/printers/{printer_id}/test",
+        data={"csrf_token": _csrf(client, f"/config/printers/{printer_id}")},
+        follow_redirects=True,
+    )
+
+    assert "Testseite" in response.get_data(as_text=True)
+
+
+def test_the_print_settings_of_a_mailbox_are_saved(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    account_id = _add_account(runtime)
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "user": "u",
+        "password": "", "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "print_fields": "1", "print_attachments": "1", "printer": str(printer_id),
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    account = runtime.accounts.get(account_id)
+    assert account.print_attachments is True
+    assert account.printer == str(printer_id)
+    # the "archive" box was not ticked, so this mailbox prints only
+    assert account.archive_attachments is False
+
+
+def test_a_mailbox_cannot_reference_an_unknown_printer(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime)
+    account_id = _add_account(runtime)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}", data={
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "user": "u",
+        "password": "", "folder": "INBOX", "mode": "poll", "ssl": "1", "enabled": "1",
+        "print_fields": "1", "print_attachments": "1", "printer": "999",
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
+
+    assert "Drucker" in response.get_data(as_text=True)
+    assert runtime.accounts.get(account_id).print_attachments is False
+
+
+def test_a_rule_can_be_set_to_print_on_a_specific_printer(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": str(printer_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is True
+    assert rule.printer == str(printer_id)
+
+
+def test_a_rule_can_print_on_the_mailbox_printer(client, env):
+    _, storage, _, config, runtime = env
+    _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "account",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is True
+    assert rule.printer == ""
+
+
+def test_a_rule_cannot_reference_an_unknown_printer(client, env):
+    _, storage, _, config, runtime = env
+    _add_printer(runtime)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "999",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert load_rules(storage, config.mapping_path) == []
+
+
+def test_changing_a_rules_folder_keeps_its_print_settings(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    _login(client)
+
+    client.post("/mapping/update", data={
+        "index": "0", "folder": "belege", "print_fields": "1", "printer": str(printer_id),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.folder == "belege"
+    assert (rule.print_attachments, rule.printer) == (True, str(printer_id))
+
+
+def test_printing_can_be_switched_off_for_a_rule(client, env):
+    _, storage, _, config, runtime = env
+    printer_id = _add_printer(runtime)
+    save_rules(storage, config.mapping_path,
+               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    _login(client)
+
+    client.post("/mapping/update", data={
+        "index": "0", "folder": "rechnungen", "print_fields": "1", "printer": "",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rule = load_rules(storage, config.mapping_path)[0]
+    assert rule.print_attachments is False
+    assert rule.printer == ""
+
+
+def test_without_a_printer_the_print_controls_stay_hidden(client, env):
+    _login(client)
+
+    html = client.get("/mapping").get_data(as_text=True)
+
+    assert "nicht drucken" not in html
 MAIL2NAS_EOF
 
 # --- tests/test_accounts.py ---
@@ -5179,6 +6815,449 @@ def test_deleting_the_last_account_does_not_resurrect_it_from_the_env(tmp_path):
 
     assert store.all() == []
     assert settings.get(SETTING_ACCOUNTS_SEEDED) == "1"
+MAIL2NAS_EOF
+
+# --- tests/test_printers.py ---
+cat > tests/test_printers.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from mail2nas.accounts import AccountStore
+from mail2nas.printers import (
+    PrinterError,
+    PrinterStore,
+    seed_from_config,
+)
+from mail2nas.state import SettingsStore
+from tests.test_archiver import _make_config
+
+
+@pytest.fixture
+def store(tmp_path):
+    return PrinterStore(str(tmp_path / "state.db"))
+
+
+def _add(store, **overrides) -> int:
+    fields = {"name": "Buero", "destination": "Kyocera_M2540"}
+    fields.update(overrides)
+    return store.add(**fields)
+
+
+# --- storage ------------------------------------------------------------------
+
+
+def test_add_and_read_back_a_printer(store):
+    printer_id = _add(store, server="cups.lan:631", options="media=A4", copies=2)
+
+    printer = store.get(printer_id)
+
+    assert (printer.name, printer.destination) == ("Buero", "Kyocera_M2540")
+    assert (printer.server, printer.options, printer.copies) == ("cups.lan:631", "media=A4", 2)
+    assert printer.enabled is True
+
+
+def test_update_changes_only_what_is_passed(store):
+    printer_id = _add(store, options="media=A4")
+
+    store.update(printer_id, name="Buchhaltung")
+
+    printer = store.get(printer_id)
+    assert printer.name == "Buchhaltung"
+    assert printer.options == "media=A4"
+
+
+def test_paused_printers_are_kept_but_not_offered(store):
+    _add(store, name="Aktiv")
+    _add(store, name="Pausiert", enabled=False)
+
+    assert [p.name for p in store.all()] == ["Aktiv", "Pausiert"]
+    assert [p.name for p in store.enabled()] == ["Aktiv"]
+
+
+def test_delete_removes_the_printer(store):
+    printer_id = _add(store)
+
+    store.delete(printer_id)
+
+    assert store.get(printer_id) is None
+
+
+def test_lookup_by_the_key_a_rule_stores(store):
+    printer_id = _add(store)
+
+    assert store.by_key(str(printer_id)).id == printer_id
+    assert store.by_key("") is None
+    assert store.by_key("keine-zahl") is None
+    assert store.by_key("9999") is None
+
+
+def test_options_are_split_into_separate_arguments(store):
+    printer = store.get(_add(store, options="media=A4  sides=two-sided-long-edge"))
+
+    assert printer.option_list == ["media=A4", "sides=two-sided-long-edge"]
+
+
+# --- validation ---------------------------------------------------------------
+
+
+def test_a_queue_name_is_required(store):
+    with pytest.raises(PrinterError):
+        store.add(name="Ohne Ziel", destination="")
+
+
+@pytest.mark.parametrize("destination", ["zwei woerter", "-d"])
+def test_an_unusable_queue_name_is_refused(store, destination):
+    with pytest.raises(PrinterError):
+        _add(store, destination=destination)
+
+
+def test_an_option_that_looks_like_a_flag_is_refused(store):
+    # "-o media=A4" would be passed on as two arguments and silently do
+    # something else than what was typed.
+    with pytest.raises(PrinterError):
+        _add(store, options="-o media=A4")
+
+
+@pytest.mark.parametrize("copies", ["null", "0", "999"])
+def test_an_unusable_copy_count_is_refused(store, copies):
+    with pytest.raises(PrinterError):
+        _add(store, copies=copies)
+
+
+def test_the_name_defaults_to_the_queue(store):
+    printer = store.get(_add(store, name=""))
+
+    assert printer.name == "Kyocera_M2540"
+
+
+# --- seeding from the environment ---------------------------------------------
+
+
+def _seed_env(tmp_path, **overrides):
+    config = _make_config(tmp_path, **overrides)
+    settings = SettingsStore(config.state_db_path)
+    store = PrinterStore(config.state_db_path)
+    seed_from_config(store, settings, config)
+    return store
+
+
+def test_the_first_printer_is_created_from_the_configuration(tmp_path):
+    store = _seed_env(
+        tmp_path, printer_destination="Kyocera_M2540", printer_name="Buero", printer_copies=2
+    )
+
+    assert [(p.name, p.destination, p.copies) for p in store.all()] == [
+        ("Buero", "Kyocera_M2540", 2)
+    ]
+
+
+def test_nothing_is_created_without_a_configured_queue(tmp_path):
+    assert _seed_env(tmp_path).all() == []
+
+
+def test_deleting_the_seeded_printer_does_not_resurrect_it(tmp_path):
+    config = _make_config(tmp_path, printer_destination="Kyocera_M2540")
+    settings = SettingsStore(config.state_db_path)
+    store = PrinterStore(config.state_db_path)
+    seed_from_config(store, settings, config)
+    store.delete(store.all()[0].id)
+
+    seed_from_config(store, settings, config)
+
+    assert store.all() == []
+
+
+# --- upgrading an existing installation ---------------------------------------
+
+
+def test_printing_columns_are_added_to_an_existing_account_table(tmp_path):
+    """An update must not require re-entering every mailbox."""
+    db_path = str(tmp_path / "state.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE imap_accounts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host TEXT NOT NULL, "
+            "port INTEGER NOT NULL DEFAULT 993, ssl INTEGER NOT NULL DEFAULT 1, "
+            "user TEXT NOT NULL, password TEXT NOT NULL, folder TEXT NOT NULL DEFAULT 'INBOX', "
+            "mode TEXT NOT NULL DEFAULT 'poll', processed_folder TEXT NOT NULL DEFAULT '', "
+            "oversized_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute(
+            "INSERT INTO imap_accounts (name, host, user, password) VALUES ('Alt', 'h', 'u', 'p')"
+        )
+
+    account = AccountStore(db_path).all()[0]
+
+    assert account.name == "Alt"
+    # Defaults keep the existing behaviour: nothing printed, everything filed.
+    assert account.print_attachments is False
+    assert account.printer == ""
+    assert account.archive_attachments is True
+MAIL2NAS_EOF
+
+# --- tests/test_printing.py ---
+cat > tests/test_printing.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from mail2nas.printers import Printer, PrinterStore
+from mail2nas.printing import (
+    PrintError,
+    PrintService,
+    Spooler,
+    build_command,
+    job_title,
+    parse_extensions,
+)
+
+PRINTABLE = parse_extensions("pdf,txt,png")
+
+
+def _printer(**overrides) -> Printer:
+    fields = dict(
+        id=1, name="Buero", destination="Kyocera_M2540", server="", options="", copies=1,
+        enabled=True,
+    )
+    fields.update(overrides)
+    return Printer(**fields)
+
+
+class FakeRun:
+    """Stands in for subprocess.run, recording what it was asked to run."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "request id is q-1", stderr: str = ""):
+        self.calls: list[list[str]] = []
+        self._result = subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(list(command))
+        self.kwargs = kwargs
+        return self._result
+
+
+def _spooler(monkeypatch, run=None, **overrides) -> tuple[Spooler, FakeRun]:
+    run = run or FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    options = dict(printable_extensions=PRINTABLE)
+    options.update(overrides)
+    return Spooler(**options), run
+
+
+# --- the lp command -----------------------------------------------------------
+
+
+def test_the_command_names_the_queue_and_the_job():
+    command = build_command(_printer(), "/tmp/x.pdf", "Rechnung 4711")
+
+    assert command[0] == "lp"
+    assert command[command.index("-d") + 1] == "Kyocera_M2540"
+    assert command[command.index("-t") + 1] == "Rechnung 4711"
+    assert command[-2:] == ["--", "/tmp/x.pdf"]
+
+
+def test_a_remote_cups_server_is_passed_with_h():
+    command = build_command(_printer(server="cups.lan:631"), "/tmp/x.pdf", "t")
+
+    assert command[command.index("-h") + 1] == "cups.lan:631"
+
+
+def test_each_option_becomes_its_own_o_argument():
+    command = build_command(
+        _printer(options="media=A4 sides=two-sided-long-edge"), "/tmp/x.pdf", "t"
+    )
+
+    assert command.count("-o") == 2
+    assert "media=A4" in command and "sides=two-sided-long-edge" in command
+
+
+def test_a_single_copy_needs_no_n_argument():
+    assert "-n" not in build_command(_printer(), "/tmp/x.pdf", "t")
+    assert build_command(_printer(copies=3), "/tmp/x.pdf", "t").count("-n") == 1
+
+
+def test_the_binary_can_be_pointed_somewhere_else():
+    assert build_command(_printer(), "/tmp/x.pdf", "t", lp_binary="/usr/bin/lp")[0] == "/usr/bin/lp"
+
+
+def test_the_job_title_stays_short_and_printable():
+    title = job_title("Betreff\nmit Umbruch", "rechnung.pdf")
+
+    assert "\n" not in title
+    assert len(title) <= 80
+    assert "rechnung.pdf" in title
+
+
+# --- spooling ------------------------------------------------------------------
+
+
+def test_printing_writes_the_payload_and_calls_lp(monkeypatch, tmp_path):
+    seen = {}
+    run = FakeRun()
+
+    def record(command, **kwargs):
+        # The temporary file must still exist - and hold the payload - at the
+        # moment lp is called.
+        with open(command[-1], "rb") as fh:
+            seen["data"] = fh.read()
+        seen["suffix"] = command[-1].rsplit(".", 1)[-1]
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    spooler = Spooler(printable_extensions=PRINTABLE)
+
+    spooler.print_bytes(_printer(), b"%PDF-1.4 fake", "rechnung.pdf")
+
+    assert seen["data"] == b"%PDF-1.4 fake"
+    assert seen["suffix"] == "pdf"
+
+
+def test_the_temporary_file_is_removed_afterwards(monkeypatch):
+    paths = []
+    run = FakeRun()
+
+    def record(command, **kwargs):
+        paths.append(command[-1])
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+
+    Spooler(printable_extensions=PRINTABLE).print_bytes(_printer(), b"x", "a.pdf")
+
+    import os
+
+    assert paths and not os.path.exists(paths[0])
+
+
+def test_a_failing_lp_reports_what_it_said(monkeypatch):
+    spooler, _ = _spooler(monkeypatch, run=FakeRun(returncode=1, stderr="lp: Kein Drucker"))
+
+    with pytest.raises(PrintError, match="Kein Drucker"):
+        spooler.print_bytes(_printer(), b"x", "a.pdf")
+
+
+def test_a_missing_lp_binary_says_which_package_is_missing(monkeypatch):
+    def missing(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(subprocess, "run", missing)
+
+    with pytest.raises(PrintError, match="cups-client"):
+        Spooler(printable_extensions=PRINTABLE).print_bytes(_printer(), b"x", "a.pdf")
+
+
+def test_a_hanging_printer_is_given_up_on(monkeypatch):
+    def hang(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, 1)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    with pytest.raises(PrintError, match="abgebrochen"):
+        Spooler(printable_extensions=PRINTABLE, timeout=1).print_bytes(_printer(), b"x", "a.pdf")
+
+
+def test_dry_run_does_not_touch_the_printer(monkeypatch):
+    spooler, run = _spooler(monkeypatch, dry_run=True)
+
+    spooler.print_bytes(_printer(), b"x", "a.pdf")
+
+    assert run.calls == []
+
+
+def test_the_test_page_says_where_it_came_from(monkeypatch):
+    printed = {}
+    run = FakeRun()
+
+    def record(command, **kwargs):
+        with open(command[-1], encoding="utf-8") as fh:
+            printed["text"] = fh.read()
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+
+    Spooler(printable_extensions=PRINTABLE).print_test_page(_printer())
+
+    assert "Kyocera_M2540" in printed["text"]
+
+
+@pytest.mark.parametrize(
+    "filename,printable",
+    [("rechnung.pdf", True), ("BELEG.PDF", True), ("notiz.txt", True),
+     ("rechnung.docx", False), ("ohne-endung", False)],
+)
+def test_only_known_formats_are_spooled(filename, printable):
+    assert Spooler(printable_extensions=PRINTABLE).can_print(filename) is printable
+
+
+# --- routing --------------------------------------------------------------------
+
+
+@pytest.fixture
+def service(tmp_path, monkeypatch):
+    store = PrinterStore(str(tmp_path / "state.db"))
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    service = PrintService(store, Spooler(printable_extensions=PRINTABLE))
+    return service, store, run
+
+
+def test_the_first_configured_printer_in_the_chain_wins(service):
+    printing, store, _ = service
+    rule_printer = store.add(name="Regel", destination="q1")
+    account_printer = store.add(name="Konto", destination="q2")
+
+    chosen = printing.printer_for(str(rule_printer), str(account_printer))
+
+    assert chosen.name == "Regel"
+
+
+def test_an_empty_choice_falls_through_to_the_next(service):
+    printing, store, _ = service
+    account_printer = store.add(name="Konto", destination="q2")
+
+    assert printing.printer_for("", str(account_printer)).name == "Konto"
+
+
+def test_a_deleted_printer_falls_through_instead_of_failing(service):
+    printing, store, _ = service
+    account_printer = store.add(name="Konto", destination="q2")
+
+    assert printing.printer_for("9999", str(account_printer)).name == "Konto"
+
+
+def test_a_paused_printer_is_skipped(service):
+    printing, store, _ = service
+    paused = store.add(name="Pausiert", destination="q1", enabled=False)
+
+    assert printing.printer_for(str(paused)) is None
+
+
+def test_nothing_configured_means_no_printer(service):
+    printing, _, _ = service
+
+    assert printing.printer_for("", "") is None
+    assert printing.configured() is False
+
+
+def test_sending_reports_failures_instead_of_raising(tmp_path, monkeypatch):
+    store = PrinterStore(str(tmp_path / "state.db"))
+    monkeypatch.setattr(subprocess, "run", FakeRun(returncode=1, stderr="offline"))
+    printing = PrintService(store, Spooler(printable_extensions=PRINTABLE))
+
+    # A dead printer must never take the archiving down with it.
+    assert printing.send(_printer(), b"x", "rechnung.pdf") is False
+
+
+def test_an_unprintable_format_is_not_sent(service):
+    printing, _, run = service
+
+    assert printing.send(_printer(), b"MZ", "setup.docx") is False
+    assert run.calls == []
 MAIL2NAS_EOF
 
 # --- tests/test_main.py ---

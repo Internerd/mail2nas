@@ -21,13 +21,19 @@ SETTING_MAPPING_PATH = "mapping_path"
 class Runtime:
     """Shared handles, plus the mapping-file location that can move."""
 
-    def __init__(self, config, storage, mapping, store, settings, accounts):
+    def __init__(
+        self, config, storage, mapping, store, settings, accounts, printers=None, printing=None
+    ):
         self.config = config
         self.storage = storage
         self.mapping = mapping
         self.store = store
         self.settings = settings
         self.accounts = accounts
+        # Optional so a caller that does not care about printing (tests, and
+        # the archiver before printers existed) can leave them out.
+        self.printers = printers
+        self.printing = printing
         # Set by the web UI, consumed by the supervisor loop: the archiver
         # threads must not read a half-changed path.
         self.mapping_path_changed = threading.Event()

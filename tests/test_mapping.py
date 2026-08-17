@@ -12,6 +12,7 @@ from mail2nas.mapping import (
     load_rules,
     move_rule,
     save_rules,
+    set_printing,
     validate_keyword,
 )
 from mail2nas.storage import LocalStorage
@@ -297,3 +298,74 @@ def test_matching_a_huge_body_stays_bounded(tmp_path):
     folder, _ = mapping.resolve("Rechnung " + ("x" * 2_000_000))
     assert folder == "unsorted"
     assert time.monotonic() - started < 5
+
+
+# --- printing per rule ------------------------------------------------------------
+
+
+def test_a_rule_carries_its_print_settings(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
+        version: 2
+        rules:
+          - keyword: Rechnung
+            folder: rechnungen
+            print: true
+            printer: "3"
+    """)
+
+    rule = _mapping(tmp_path).match("Rechnung 4711")
+
+    assert (rule.folder, rule.print_attachments, rule.printer) == ("rechnungen", True, "3")
+
+
+def test_a_rule_without_print_settings_prints_nothing(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
+
+    rule = _mapping(tmp_path).match("RE-1")
+
+    assert rule.print_attachments is False
+    assert rule.printer == ""
+
+
+def test_print_settings_survive_a_save_and_reload(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "all", True, "2")])
+
+    reloaded = load_rules(storage, "mapping.yaml")[0]
+
+    assert (reloaded.print_attachments, reloaded.printer) == (True, "2")
+
+
+def test_a_file_that_never_used_printing_stays_unchanged(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen")])
+
+    text = storage.read_text("mapping.yaml")
+
+    assert "print" not in text
+    assert "printer" not in text
+
+
+def test_a_hand_written_yes_is_read_as_printing(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
+        version: 2
+        rules:
+          - keyword: RE
+            folder: rechnungen
+            print: "ja"
+    """)
+
+    assert _mapping(tmp_path).match("RE-1").print_attachments is True
+
+
+def test_switching_printing_off_drops_the_printer(tmp_path):
+    rule = Rule.create("RE", "rechnungen", "all", True, "2")
+
+    assert set_printing(rule, False, "2").printer == ""
+    assert set_printing(rule, True, "5").printer == "5"
+
+
+def test_match_returns_nothing_when_no_rule_applies(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
+
+    assert _mapping(tmp_path).match("Newsletter") is None

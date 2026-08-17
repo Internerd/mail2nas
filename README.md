@@ -16,6 +16,7 @@ genauso als einfacher systemd-Service laufen.
 - [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
 - [Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift)
 - [Weboberflaeche](#weboberflaeche)
+- [Drucken](#drucken)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -43,6 +44,9 @@ genauso als einfacher systemd-Service laufen.
    (Default: `unsorted/`).
 4. Anhaenge werden mit Datums-/Absender-Praefix gespeichert, Namenskollisionen
    werden automatisch durch einen Zaehler-Suffix vermieden.
+   Auf Wunsch werden sie zusaetzlich **ausgedruckt** - entweder alles, was in
+   einem bestimmten Postfach ankommt, oder nur das, was eine bestimmte
+   Zuordnung trifft (z. B. nur Rechnungen). Siehe [Drucken](#drucken).
 5. Die Mail wird als gelesen markiert (und optional in einen
    `IMAP_PROCESSED_FOLDER` verschoben). Zusaetzlich wird die Message-ID in
    einer lokalen SQLite-Datenbank vermerkt, damit nichts doppelt verarbeitet
@@ -66,6 +70,9 @@ Proxmox-Host. Warum das so ist und welche Alternative es gibt, steht unter
   entweder Docker+Compose oder Python 3.11+ verfuegbar ist.
 - Fuer die Weboberflaeche: ein freier Port (Default 8080) und ein Browser im
   selben Netz. Sie ist optional (`WEB_ENABLED=false`).
+- Fuers [Drucken](#drucken) (ebenfalls optional): ein Drucker an einem
+  CUPS-Server, der aus dem Container erreichbar ist. Der CUPS-*Client* `lp`
+  ist im Image enthalten, ein Druckerdienst laeuft dort nicht.
 - **Kein** Mount und damit auch kein `cifs-utils` noetig - mail2nas spricht
   SMB selbst. Nur beim optionalen `STORAGE_BACKEND=local` muss das Share
   vorher vom Betriebssystem eingebunden sein.
@@ -433,7 +440,10 @@ Was sie kann:
 - **Postfach je Zuordnung**: sobald mehr als ein Postfach eingerichtet ist,
   hat jede Zeile zusaetzlich ein Auswahlfeld - „alle Postfaecher" oder genau
   eines.
-- **Konfiguration**: Postfaecher anlegen/aendern/loeschen und die
+- **Drucken je Zuordnung**: pro Zeile ein Auswahlfeld „nicht drucken /
+  drucken auf ..." - so wird z. B. nur ausgedruckt, was als Rechnung erkannt
+  wurde. Siehe [Drucken](#drucken).
+- **Konfiguration**: Postfaecher und Drucker anlegen/aendern/loeschen und die
   Mapping-Datei verschieben, siehe unten.
 - **Passwort aendern**: nach dem Login unter „Passwort". Dabei werden alle
   anderen angemeldeten Sitzungen abgemeldet.
@@ -537,6 +547,102 @@ ist dann wieder ausschliesslich von Hand zu pflegen.
 `GET /healthz` antwortet ohne Anmeldung mit `ok` - praktisch fuer ein
 Monitoring-Check.
 
+## Drucken
+
+Anhaenge koennen zusaetzlich zur Ablage ausgedruckt werden. Alles daran wird
+in der Weboberflaeche eingestellt; in der `.env` steht nur, ob und womit
+ueberhaupt gedruckt werden darf.
+
+### Drucker einmal anlegen, ueberall auswaehlen
+
+Unter **Konfiguration → Drucker** wird jeder Drucker genau einmal eingetragen:
+
+| Feld | Bedeutung |
+|---|---|
+| Anzeigename | wie er in den Auswahlfeldern erscheint, z. B. „Buero EG" |
+| Warteschlange in CUPS | der Queue-Name, wie ihn `lpstat -p` zeigt |
+| CUPS-Server | leer = lokaler `cupsd`, sonst z. B. `cups.lan:631` |
+| Kopien | 1-20 |
+| Druckoptionen | wie bei `lp -o`, jeweils ohne `-o`, durch Leerzeichen getrennt: `media=A4 sides=two-sided-long-edge` |
+| Aktiv | pausierte Drucker bleiben gespeichert, es geht nichts an sie raus |
+
+Danach taucht der Drucker ueberall als Auswahlfeld auf - beim Postfach und bei
+jeder Zuordnung. Aendert sich der Queue-Name, wird er an dieser einen Stelle
+korrigiert.
+
+Der Knopf **Testseite drucken** schickt eine Seite mit den Einstellungen
+dieses Druckers an die Warteschlange. Damit laesst sich pruefen, ob alles
+stimmt, bevor die erste Rechnung ankommt - Fehlermeldungen von CUPS erscheinen
+direkt auf der Seite.
+
+### Wann gedruckt wird
+
+Zwei Schalter, die sich kombinieren lassen:
+
+- **Je Postfach** (Konfiguration → Postfach bearbeiten): „Alle Anhaenge dieses
+  Postfachs drucken". Damit geht alles, was in diesem Postfach ankommt, aufs
+  Papier - unabhaengig von den Stichwoertern.
+- **Je Zuordnung** (Zuordnungen): das Auswahlfeld in der Zeile. Gedruckt wird
+  dann nur, was diese Regel trifft, also z. B. nur Rechnungen. Die Regel wird
+  wie gewohnt zuerst gegen den Dateinamen des Anhangs und dann gegen den
+  Betreff geprueft.
+
+**Welcher Drucker es wird**, entscheidet sich von speziell nach allgemein:
+
+1. der Drucker, den die passende Zuordnung nennt,
+2. sonst der Drucker des Postfachs,
+3. sonst wird nicht gedruckt (und das steht als Warnung im Log).
+
+Damit laesst sich genau das Beispiel abbilden, fuer das die Funktion gebaut
+wurde:
+
+| Postfach | Einstellung | Ergebnis |
+|---|---|---|
+| A | „alle Anhaenge drucken" auf Drucker A, „im Archiv ablegen" aus | jeder Anhang kommt sofort auf Drucker A, nichts landet auf dem NAS |
+| B | Postfach ohne „alles drucken", Zuordnung `Rechnung` mit Drucker B | Anhaenge werden normal abgelegt, aber nur die Rechnungen kommen zusaetzlich auf Drucker B |
+
+### Nur drucken, nicht ablegen
+
+Der Haken **„Anhaenge im Archiv ablegen"** je Postfach laesst sich abschalten.
+Dann wird nur gedruckt und nichts gespeichert. Zwei Ausnahmen, damit daraus
+kein stiller Datenverlust wird:
+
+- Anhaenge mit **gesperrter Dateiendung** landen weiterhin im
+  Quarantaene-Ordner. Sie koennen ohnehin nicht gedruckt werden, und sie
+  wortlos wegzuwerfen waere genau der falsche Umgang mit dem einen Anhang, den
+  sich jemand ansehen sollte.
+- Wuerde ein Anhang **weder abgelegt noch gedruckt** (z. B. weil kein Drucker
+  konfiguriert ist), steht das als Warnung im Log.
+
+### Was gedruckt wird - und was nicht
+
+- Gedruckt wird **erst nach der Ablage**. Das Archiv ist das Original, das
+  Papier die Kopie: ein Drucker ohne Papier darf nie der Grund sein, dass ein
+  Anhang nicht gespeichert wurde. Scheitert ein Druckauftrag, steht er im Log
+  und die Mail gilt trotzdem als verarbeitet - sonst wuerde bei jedem Versuch
+  eine weitere Kopie im Archiv landen.
+- **Anhaenge in Quarantaene werden nie gedruckt.** Eine `.exe` an einen
+  Druckertreiber zu geben ist nichts, was passieren soll.
+- Es gehen nur Formate raus, die CUPS selbst versteht (`PRINTABLE_EXTENSIONS`,
+  Default: PDF, PostScript, Text, Bilder). Ein `.docx` an eine Warteschlange
+  zu schicken produziert einen Stapel Zeichensalat, deshalb steht es nicht in
+  der Liste. Wer Office-Dateien drucken will, braucht im Container einen
+  Konverter und traegt die Endung dann selbst nach.
+
+### Voraussetzung: CUPS
+
+Gedruckt wird ueber den CUPS-Client `lp`. Der steckt im Container-Image
+(Paket `cups-client`), ein **Druckerdienst laeuft dort aber nicht**. Der
+Drucker muss also entweder
+
+- an einem CUPS-Server im Netz haengen, der beim Drucker unter „CUPS-Server"
+  eingetragen wird (`cups.lan:631`), oder
+- an einem `cupsd` auf dem Docker-Host, der fuer den Container erreichbar ist.
+
+Fehlt `lp` (z. B. in einem selbst gebauten aelteren Image), sagt das die
+Fehlermeldung beim Testdruck genau so. Ganz abschalten laesst sich das Ganze
+mit `PRINTING_ENABLED=false` - dann verschwinden auch die Auswahlfelder.
+
 ## Konfiguration (Environment-Variablen)
 
 | Variable | Beschreibung | Default |
@@ -567,6 +673,12 @@ Monitoring-Check.
 | `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
 | `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
+| `PRINTING_ENABLED` | [Drucken](#drucken) ueberhaupt zulassen; `false` ist der Notausschalter | `true` |
+| `LP_BINARY` | Pfad zum `lp`-Client, falls nicht im `PATH` | `lp` |
+| `PRINT_TIMEOUT_SECONDS` | Danach gilt ein Druckauftrag als gescheitert | `120` |
+| `PRINTABLE_EXTENSIONS` | Komma-Liste der Dateiendungen, die an einen Drucker gegeben werden | siehe `.env.example` |
+| `PRINTER_DESTINATION` | Optional: CUPS-Warteschlange, aus der beim ersten Start **ein** Drucker angelegt wird; danach in der Oberflaeche gepflegt | leer (keiner) |
+| `PRINTER_NAME` / `PRINTER_SERVER` / `PRINTER_OPTIONS` / `PRINTER_COPIES` | Anzeigename, CUPS-Server, `lp -o`-Optionen und Kopien dieses ersten Druckers | Warteschlange / leer / leer / `1` |
 | `WEB_ENABLED` | [Weboberflaeche](#weboberflaeche) zum Pflegen der Zuordnungen starten | `false` |
 | `WEB_HOST` / `WEB_PORT` | Adresse und Port der Weboberflaeche | `0.0.0.0` / `8080` |
 | `WEB_PASSWORD` | Startpasswort (mind. 8 Zeichen); nur bis zur ersten Aenderung in der Oberflaeche relevant | - |
@@ -577,8 +689,8 @@ Monitoring-Check.
 **Die `IMAP_*`-Variablen sind Startwerte.** Beim allerersten Start wird daraus
 das erste Postfach angelegt; danach gilt die in der Oberflaeche gepflegte
 Konfiguration und die Variablen werden ignoriert. Dasselbe gilt fuer
-`WEB_PASSWORD` und `MAPPING_PATH`. Alles andere in dieser Tabelle wird bei
-jedem Start aus der `.env` gelesen.
+`WEB_PASSWORD`, `MAPPING_PATH` und die `PRINTER_*`-Variablen. Alles andere in
+dieser Tabelle wird bei jedem Start aus der `.env` gelesen.
 
 **Zum Default von `STORAGE_BACKEND`:** Der Default ist bewusst `local`, damit
 eine bestehende Installation, deren `.env` diese Variable noch nicht kennt,
@@ -608,12 +720,19 @@ rules:
   - keyword: Bestellung
     folder: einkauf
     account: "2"        # nur fuer Postfach mit dieser ID
+  - keyword: Rechnung
+    folder: rechnungen
+    print: true         # zusaetzlich ausdrucken (nach der Ablage)
+    printer: "1"        # ID eines angelegten Druckers; weglassen = Drucker
+                        # des Postfachs
 ```
 
 Die Liste wird von oben nach unten geprueft, die erste passende Zuordnung
-gewinnt. `account` ist optional; fehlt es, gilt die Zuordnung fuer alle
-Postfaecher. Zu Platzhaltern und Reihenfolge siehe
-[Weboberflaeche](#stichwoerter-reihenfolge-und-platzhalter).
+gewinnt. `account`, `print` und `printer` sind optional; fehlt `account`, gilt
+die Zuordnung fuer alle Postfaecher, und ohne `print` wird nichts gedruckt.
+Zu Platzhaltern und Reihenfolge siehe
+[Weboberflaeche](#stichwoerter-reihenfolge-und-platzhalter), zum Drucken
+[Drucken](#drucken).
 
 **Aeltere Dateien werden weiter gelesen.** Das frueheres Flachformat
 
@@ -676,6 +795,12 @@ damit um:
   Rechnungsordner zu schleusen. Die Datei wird dabei nicht geloescht,
   sondern bleibt fuer eine manuelle Pruefung erhalten - **niemals von dort
   oeffnen/ausfuehren**, ohne den Inhalt vorher zu verifizieren.
+- **Nichts Gesperrtes geht an einen Drucker**: Anhaenge in Quarantaene werden
+  nie gedruckt, auch nicht bei „alle Anhaenge drucken" - eine vermutete
+  ausfuehrbare Datei hat an einem Druckertreiber nichts verloren. Ebenso
+  werden nur Formate gespoolt, die in `PRINTABLE_EXTENSIONS` stehen. Die
+  Druckdatei liegt waehrend der Uebergabe an CUPS als temporaere Datei mit
+  Rechten `0600` und wird danach sofort geloescht.
 - **Kein automatisches Entpacken/Ausfuehren**: mail2nas speichert Anhaenge
   ausschliesslich als Rohbytes. ZIP-/Office-/PDF-Inhalte werden nicht
   entpackt, geparst oder ausgefuehrt - das eliminiert ganze Klassen von
@@ -756,6 +881,16 @@ Mailserver/ClamAV) einplanen.
   Zuordnung auf ein anderes Postfach eingeschraenkt ist.
 - **`No enabled IMAP account configured`**: es ist kein Postfach aktiv - in der
   Oberflaeche unter „Konfiguration" eines anlegen oder aktivieren.
+- **Es wird nichts gedruckt**: zuerst den Testdruck beim Drucker ausloesen -
+  dessen Fehlermeldung kommt direkt von CUPS. Im Log stehen die haeufigen
+  Faelle im Klartext:
+  - `lp nicht gefunden` -> das Image ist aelter als die Druckfunktion, neu
+    bauen (`docker compose build --pull`).
+  - `no usable printer is configured` -> das Postfach bzw. die Zuordnung soll
+    drucken, es ist aber kein (aktiver) Drucker ausgewaehlt.
+  - `is not in PRINTABLE_EXTENSIONS` -> das Format wird bewusst nicht
+    gespoolt, siehe [Drucken](#drucken).
+  - Nichts davon im Log -> `PRINTING_ENABLED` steht auf `false`.
 - **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
   selbst ab.
 
@@ -944,6 +1079,11 @@ wie viele Zuordnungen geladen wurden und welche Postfaecher ueberwacht werden.
 - **Das erste Postfach** wird beim ersten Start nach dem Update aus den
   `IMAP_*`-Variablen der bestehenden `.env` angelegt. Es ist danach unter
   „Konfiguration" sichtbar und wird ab dann von dort gepflegt.
+- **Die Druckeinstellungen** kommen als neue Spalten in die bestehende
+  Postfach-Tabelle, mit Defaults, die nichts aendern: es wird nichts gedruckt
+  und weiterhin alles abgelegt. Kein Postfach muss neu eingegeben werden.
+  Wer drucken will, legt unter „Konfiguration → Drucker" einen Drucker an -
+  erst dann erscheinen die Auswahlfelder, siehe [Drucken](#drucken).
 - **Neue Konfigurationsvariablen** greifen mit ihren Defaults; eine alte `.env`
   bleibt gueltig. Insbesondere bleibt `WEB_ENABLED` ohne Eintrag auf `false` -
   wer die Weboberflaeche will, ergaenzt nach dem Update:
