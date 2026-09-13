@@ -17,6 +17,8 @@ genauso als einfacher systemd-Service laufen.
 - [Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift)
 - [Weboberflaeche](#weboberflaeche)
 - [Drucken](#drucken)
+  - [Drucker im Netzwerk finden](#drucker-im-netzwerk-finden)
+  - [Drucken per Mail-Adresse (Zustelladressen)](#drucken-per-mail-adresse-zustelladressen)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -44,9 +46,10 @@ genauso als einfacher systemd-Service laufen.
    (Default: `unsorted/`).
 4. Anhaenge werden mit Datums-/Absender-Praefix gespeichert, Namenskollisionen
    werden automatisch durch einen Zaehler-Suffix vermieden.
-   Auf Wunsch werden sie zusaetzlich **ausgedruckt** - entweder alles, was in
-   einem bestimmten Postfach ankommt, oder nur das, was eine bestimmte
-   Zuordnung trifft (z. B. nur Rechnungen). Siehe [Drucken](#drucken).
+   Auf Wunsch werden sie zusaetzlich **ausgedruckt** - alles, was an eine
+   dafuer eingerichtete Adresse geschickt wurde (`drucker@firma.de`), alles
+   aus einem bestimmten Postfach, oder nur das, was eine bestimmte Zuordnung
+   trifft (z. B. nur Rechnungen). Siehe [Drucken](#drucken).
 5. Die Mail wird als gelesen markiert (und optional in einen
    `IMAP_PROCESSED_FOLDER` verschoben). Zusaetzlich wird die Message-ID in
    einer lokalen SQLite-Datenbank vermerkt, damit nichts doppelt verarbeitet
@@ -575,10 +578,77 @@ dieses Druckers an die Warteschlange. Damit laesst sich pruefen, ob alles
 stimmt, bevor die erste Rechnung ankommt - Fehlermeldungen von CUPS erscheinen
 direkt auf der Seite.
 
+### Drucker im Netzwerk finden
+
+Unter **Konfiguration → Im Netzwerk suchen** sucht mail2nas Drucker, statt sie
+abtippen zu lassen. Zwei Quellen:
+
+- **Warteschlangen eines CUPS-Servers** (`lpstat -v` gegen den eingetragenen
+  Server). Die sind sofort verwendbar: „Uebernehmen" fuellt das
+  Drucker-Formular vor, speichern, Testseite drucken, fertig.
+- **Geraete, die sich im Netz selbst ankuendigen** (mDNS/DNS-SD, also
+  AirPrint bzw. „driverless"). Die werden mit Modellname und IPP-Adresse
+  angezeigt - sie sind aber noch keine Warteschlange. Dafuer steht der
+  passende `lpadmin`-Befehl direkt daneben:
+
+  ```bash
+  lpadmin -p Kyocera_M2540 -v ipp://192.168.1.50:631/ipp/print -E -m everywhere
+  ```
+
+Beides ist Zusatz, kein Muss: ein Drucker laesst sich weiterhin von Hand
+eintragen. Zwei Einschraenkungen, die man kennen sollte:
+
+- **mDNS braucht Multicast.** In einem normalen Docker-Bridge-Netz kommt davon
+  nichts an, dann bleibt die Liste leer (die Seite sagt das auch). Wer die
+  Suche dort braucht, startet den Container mit `network_mode: host` - oder
+  nutzt einfach den CUPS-Server, der ueber die normale Route erreichbar ist.
+- Gesucht wird nur auf Knopfdruck, nichts laeuft im Hintergrund.
+
+### Drucken per Mail-Adresse (Zustelladressen)
+
+Der direkteste Weg zu einem Ausdruck: **eine Mail mit Anhang an eine dafuer
+eingerichtete Adresse schicken.** Unter **Konfiguration → Zustelladressen**
+wird festgelegt, was mit Mail an eine bestimmte Adresse passiert:
+
+| Feld | Bedeutung |
+|---|---|
+| Empfaengeradresse | `drucker@firma.de` (genau diese), `@firma.de` (ganze Domain) oder `drucker-*@firma.de` (Platzhalter) |
+| Nur von diesem Absender | optional, gleiche Schreibweise. Leer = von jedem |
+| Anhaenge drucken | an/aus, dazu der Drucker |
+| Anhaenge per SMB ablegen | an/aus, dazu optional ein fester Zielordner |
+
+Typischer Aufbau: beim Mailanbieter ein **Alias** `drucker-buero@firma.de`
+anlegen, das in das ohnehin ueberwachte Archiv-Postfach zugestellt wird. Ein
+eigenes IMAP-Konto pro Drucker braucht es dafuer nicht.
+
+**Erkannt wird die Adresse an den Kopfzeilen** `Delivered-To`,
+`X-Original-To`, `Envelope-To`, `To`, `Cc` und `Resent-To`. Damit wird ein
+Alias auch dann gefunden, wenn im `To:` etwas anderes steht - genau das
+passiert bei Weiterleitungen und Verteilern.
+
+**Sind Empfaenger- und Absenderadresse gesetzt, muessen beide passen.** Der
+Absender ist damit ein Zugriffsschutz: „drucken darf nur, wer aus unserer
+Domain schreibt". Weil ein Ausdruck Papier und Toner kostet, ist das die
+sichere Richtung - nicht „eines von beiden genuegt".
+
+Drei Beispiele:
+
+| Zustelladresse | Drucken | Ablegen | Wirkung |
+|---|---|---|---|
+| `drucker-buero@firma.de`, Absender `@firma.de` | ja, Buero EG | nein | Kollegen mailen einen Anhang hin, er kommt aus dem Drucker, das NAS bleibt sauber |
+| `rechnungen@firma.de` | nein | ja, Ordner `rechnungen` | reine Ablage, ohne dass ein Stichwort passen muss |
+| `alles@firma.de` | ja, Buero EG | ja | Papier **und** Archiv |
+
+Die **erste passende Zustelladresse gewinnt** (wie bei den Zuordnungen). Sie
+entscheidet dann ueber Drucken und Ablegen; die Stichwort-Zuordnungen
+bestimmen nur noch den Zielordner, falls die Adresse keinen vorgibt.
+
 ### Wann gedruckt wird
 
-Zwei Schalter, die sich kombinieren lassen:
+Drei Schalter, die sich kombinieren lassen:
 
+- **Je Zustelladresse**: siehe oben - die spezifischste Aussage, weil jemand
+  die Adresse bewusst adressiert hat.
 - **Je Postfach** (Konfiguration → Postfach bearbeiten): „Alle Anhaenge dieses
   Postfachs drucken". Damit geht alles, was in diesem Postfach ankommt, aufs
   Papier - unabhaengig von den Stichwoertern.
@@ -589,9 +659,14 @@ Zwei Schalter, die sich kombinieren lassen:
 
 **Welcher Drucker es wird**, entscheidet sich von speziell nach allgemein:
 
-1. der Drucker, den die passende Zuordnung nennt,
-2. sonst der Drucker des Postfachs,
-3. sonst wird nicht gedruckt (und das steht als Warnung im Log).
+1. der Drucker der passenden Zustelladresse,
+2. sonst der Drucker, den die passende Zuordnung nennt,
+3. sonst der Drucker des Postfachs,
+4. sonst wird nicht gedruckt (und das steht als Warnung im Log).
+
+Passt eine Zustelladresse, hat sie auch das letzte Wort darueber, **ob**
+gedruckt wird: steht dort „nicht drucken", bleibt es dabei, auch wenn das
+Postfach oder eine Zuordnung drucken wollte.
 
 Damit laesst sich genau das Beispiel abbilden, fuer das die Funktion gebaut
 wurde:
@@ -675,6 +750,7 @@ mit `PRINTING_ENABLED=false` - dann verschwinden auch die Auswahlfelder.
 | `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
 | `PRINTING_ENABLED` | [Drucken](#drucken) ueberhaupt zulassen; `false` ist der Notausschalter | `true` |
 | `LP_BINARY` | Pfad zum `lp`-Client, falls nicht im `PATH` | `lp` |
+| `LPSTAT_BINARY` | Pfad zu `lpstat` (nur fuer die Druckersuche) | neben `LP_BINARY` |
 | `PRINT_TIMEOUT_SECONDS` | Danach gilt ein Druckauftrag als gescheitert | `120` |
 | `PRINTABLE_EXTENSIONS` | Komma-Liste der Dateiendungen, die an einen Drucker gegeben werden | siehe `.env.example` |
 | `PRINTER_DESTINATION` | Optional: CUPS-Warteschlange, aus der beim ersten Start **ein** Drucker angelegt wird; danach in der Oberflaeche gepflegt | leer (keiner) |
@@ -894,6 +970,24 @@ Mailserver/ClamAV) einplanen.
 - **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
   selbst ab.
 
+### Es wird nicht gedruckt, obwohl an die Adresse gemailt wurde
+
+Der Reihe nach:
+
+1. Steht im Log `is addressed to ...`? Dann hat die Zustelladresse gepasst und
+   das Problem liegt weiter hinten (Drucker, CUPS).
+2. Steht es nicht da, wurde die Adresse nicht erkannt. Haeufigster Grund: die
+   Mail wurde ueber ein Alias zugestellt, das im Postfach nur noch in
+   `Delivered-To` steht - und dort ist eine andere Schreibweise drin als
+   eingetragen. Die Kopfzeilen der Mail im Mailprogramm ansehen
+   („Original anzeigen") und die Adresse genau so eintragen, oder mit
+   `@firma.de` bzw. `drucker-*@firma.de` arbeiten.
+3. Ist zusaetzlich eine **Absenderadresse** hinterlegt, muss auch die passen -
+   sonst wird bewusst nicht gedruckt.
+4. Passt eine andere Zustelladresse weiter oben? Die erste passende gewinnt.
+5. Ist die Dateiendung ueberhaupt druckbar (`PRINTABLE_EXTENSIONS`) und nicht
+   in Quarantaene? Beides steht sonst als Warnung im Log.
+
 ## Tests
 
 ```bash
@@ -1084,6 +1178,10 @@ wie viele Zuordnungen geladen wurden und welche Postfaecher ueberwacht werden.
   und weiterhin alles abgelegt. Kein Postfach muss neu eingegeben werden.
   Wer drucken will, legt unter „Konfiguration → Drucker" einen Drucker an -
   erst dann erscheinen die Auswahlfelder, siehe [Drucken](#drucken).
+- **Die Zustelladressen** bekommen eine eigene, zunaechst leere Tabelle in
+  derselben Datenbank. Solange dort nichts steht, aendert sich nichts am
+  Verhalten - die Funktion ist ausschliesslich das, was man dort eintraegt,
+  siehe [Drucken per Mail-Adresse](#drucken-per-mail-adresse-zustelladressen).
 - **Neue Konfigurationsvariablen** greifen mit ihren Defaults; eine alte `.env`
   bleibt gueltig. Insbesondere bleibt `WEB_ENABLED` ohne Eintrag auf `false` -
   wer die Weboberflaeche will, ergaenzt nach dem Update:

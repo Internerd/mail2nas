@@ -5,11 +5,12 @@ import logging
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
 
 from .accounts import Account
+from .addresses import AddressRule, AddressStore
 from .config import Config
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
 from .mapping import Mapping, Rule
@@ -20,6 +21,25 @@ from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
+# Where the address a mail was actually delivered to can be found. The
+# envelope headers come first: an alias like "drucker@firma.de" is usually
+# delivered into a shared mailbox, and then only the delivery headers still
+# name the alias - To: may say something else entirely (or nothing, for Bcc).
+RECIPIENT_HEADERS = (
+    "Delivered-To",
+    "X-Original-To",
+    "Envelope-To",
+    "X-Envelope-To",
+    "X-RcptTo",
+    "To",
+    "Cc",
+    "Resent-To",
+    "X-Forwarded-To",
+)
+# A mail may legitimately carry a few dozen recipients; thousands are either a
+# mistake or an attempt to make matching expensive.
+MAX_RECIPIENTS = 50
+
 
 def _decode(value: str | None) -> str:
     if not value:
@@ -28,6 +48,27 @@ def _decode(value: str | None) -> str:
         return str(make_header(decode_header(value)))
     except Exception:
         return value
+
+
+def recipients_of(msg: Message) -> list[str]:
+    """Every address this message was addressed or delivered to, lowercased."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for header in RECIPIENT_HEADERS:
+        for raw in msg.get_all(header, []):
+            for _, address in getaddresses([_decode(raw)]):
+                address = address.strip().lower()
+                if not address or address in seen:
+                    continue
+                seen.add(address)
+                found.append(address)
+                if len(found) >= MAX_RECIPIENTS:
+                    logger.warning(
+                        "Message has more than %d recipients - only those are matched",
+                        MAX_RECIPIENTS,
+                    )
+                    return found
+    return found
 
 
 def _message_id(msg: Message, uid: int, account_key: str) -> str:
@@ -50,6 +91,7 @@ class AttachmentPlan:
     quarantined: bool
     archive: bool
     printer: Printer | None
+    address: AddressRule | None = None
 
 
 class Archiver:
@@ -61,6 +103,7 @@ class Archiver:
         storage: Storage,
         account: Account,
         printing: PrintService | None = None,
+        addresses: AddressStore | None = None,
     ):
         self.config = config
         self.mapping = mapping
@@ -68,6 +111,9 @@ class Archiver:
         self.storage = storage
         self.account = account
         self.printing = printing
+        # Optional, like `printing`: an installation without address rules
+        # behaves exactly as before.
+        self.addresses = addresses
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -130,6 +176,15 @@ class Archiver:
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
         mail_rule = self._match(subject, body)
+        address_rule = self._address_rule(msg, sender_addr)
+        if address_rule is not None:
+            logger.info(
+                "UID %s '%s' is addressed to %s (%s)",
+                uid,
+                subject,
+                address_rule.recipient or address_rule.sender,
+                address_rule.name,
+            )
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -162,7 +217,7 @@ class Archiver:
                     )
                     continue
 
-                plan = self._plan_attachment(filename, mail_rule)
+                plan = self._plan_attachment(filename, mail_rule, address_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if plan.archive:
@@ -198,10 +253,13 @@ class Archiver:
                     # gone once the mail is marked as read.
                     logger.warning(
                         "UID %s '%s': attachment '%s' was neither archived nor printed - "
-                        "the mailbox is set to print only but nothing prints it",
+                        "%s is set to print only but nothing prints it",
                         uid,
                         subject,
                         filename,
+                        f"the address rule {plan.address.name!r}"
+                        if plan.address is not None
+                        else "the mailbox",
                     )
 
                 # Printing comes after filing, deliberately: the share is the
@@ -240,7 +298,21 @@ class Archiver:
             return target
         raise ValueError("No usable target folder inside the archive root")
 
-    def _plan_attachment(self, filename: str, mail_rule: Rule | None) -> AttachmentPlan:
+    def _address_rule(self, msg: Message, sender_addr: str) -> AddressRule | None:
+        """The configured address this mail was sent to, if any."""
+        if self.addresses is None:
+            return None
+        try:
+            return self.addresses.match(recipients_of(msg), sender_addr)
+        except Exception:
+            # Routing is a convenience; a broken lookup must not stop the mail
+            # from being archived the ordinary way.
+            logger.exception("Could not match the delivery address - continuing without it")
+            return None
+
+    def _plan_attachment(
+        self, filename: str, mail_rule: Rule | None, address_rule: AddressRule | None = None
+    ) -> AttachmentPlan:
         """Decide where a single attachment is filed, and whether it is printed.
 
         The attachment's own filename is checked against the mapping first,
@@ -250,6 +322,11 @@ class Archiver:
         blocked extension are always quarantined, regardless of any keyword
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
+
+        An address rule outranks both. Somebody who sends a document to
+        `drucker-buero@firma.de` has said what should happen with it more
+        clearly than any keyword can; the keywords then only still decide the
+        folder, and only if the address rule names none.
         """
         rule = self._match(filename) or mail_rule
 
@@ -260,26 +337,41 @@ class Archiver:
         quarantined = bool(extensions & self.config.blocked_extensions)
 
         return AttachmentPlan(
-            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule),
+            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
             # "Print only" still files anything quarantined: it cannot be
             # printed either, and dropping it without a trace would hide
             # exactly the attachment somebody may need to look at.
-            archive=self.account.archive_attachments or quarantined,
-            printer=self._printer_for(rule, quarantined),
+            archive=self._archives(address_rule) or quarantined,
+            printer=self._printer_for(rule, quarantined, address_rule),
+            address=address_rule,
         )
 
-    def _folder_of(self, rule: Rule | None) -> str:
+    def _archives(self, address_rule: AddressRule | None) -> bool:
+        if address_rule is not None:
+            return address_rule.archive_attachments
+        return self.account.archive_attachments
+
+    def _folder_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
+        if address_rule is not None and address_rule.folder:
+            return address_rule.folder
         return rule.folder if rule else self.config.fallback_folder
 
-    def _printer_for(self, rule: Rule | None, quarantined: bool) -> Printer | None:
+    def _printer_for(
+        self, rule: Rule | None, quarantined: bool, address_rule: AddressRule | None = None
+    ) -> Printer | None:
         """Which printer this attachment goes to, if any.
 
-        Printing is requested either by the mailbox ("print everything that
-        arrives here") or by the matched rule ("print invoices"). The printer
-        is then the most specific one configured: the rule's own choice beats
-        the mailbox default.
+        Printing is requested by the address it was sent to ("everything for
+        drucker-buero@ goes on the office printer"), by the mailbox ("print
+        everything that arrives here") or by the matched rule ("print
+        invoices"). The printer is then the most specific one configured:
+        address before rule before mailbox.
+
+        A matching address rule also has the last word on *whether* to print.
+        Its whole purpose is to say what happens to mail sent there, so an
+        address set to "only file" is not overruled by a keyword rule.
         """
         if self.printing is None or not self.config.printing_enabled:
             return None
@@ -289,17 +381,23 @@ class Archiver:
             return None
 
         by_rule = rule is not None and rule.print_attachments
-        if not (self.account.print_attachments or by_rule):
-            return None
+        if address_rule is not None:
+            if not address_rule.print_attachments:
+                return None
+            keys = (address_rule.printer, rule.printer if by_rule else "", self.account.printer)
+            wanted_by = f"address {address_rule.name!r}"
+        else:
+            if not (self.account.print_attachments or by_rule):
+                return None
+            keys = (rule.printer if by_rule else "", self.account.printer)
+            wanted_by = f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}"
 
-        printer = self.printing.printer_for(
-            rule.printer if by_rule else "", self.account.printer
-        )
+        printer = self.printing.printer_for(*keys)
         if printer is None:
             logger.warning(
                 "Printing is enabled for %s but no usable printer is configured - "
                 "nothing was printed",
-                f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}",
+                wanted_by,
             )
         return printer
 

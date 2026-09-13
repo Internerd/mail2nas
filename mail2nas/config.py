@@ -74,6 +74,15 @@ def _required(name: str, because: str) -> str:
     return value
 
 
+def _lpstat_binary() -> str:
+    """Where `lpstat` is, defaulting to `lp`'s directory."""
+    explicit = os.environ.get("LPSTAT_BINARY", "").strip()
+    if explicit:
+        return explicit
+    lp = os.environ.get("LP_BINARY", "lp").strip() or "lp"
+    return lp[:-2] + "lpstat" if lp.endswith("lp") else "lpstat"
+
+
 @dataclass(frozen=True)
 class Config:
     imap_host: str
@@ -121,6 +130,9 @@ class Config:
     # install that is driven purely from the .env can set one up too.
     printing_enabled: bool
     lp_binary: str
+    # `lpstat` is only used to list a CUPS server's queues for the printer
+    # search; it sits next to `lp`, so it is derived from it unless overridden.
+    lpstat_binary: str
     print_timeout: int
     printable_extensions: frozenset[str]
     printer_name: str
@@ -181,6 +193,7 @@ class Config:
                 dry_run=_bool("DRY_RUN", False),
                 printing_enabled=_bool("PRINTING_ENABLED", True),
                 lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+                lpstat_binary=_lpstat_binary(),
                 print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
                 printable_extensions=_extension_set(
                     "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS

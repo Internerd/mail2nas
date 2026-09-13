@@ -148,6 +148,9 @@ QUARANTINE_FOLDER=quarantaene
 PRINTING_ENABLED=true
 # Pfad zum lp-Binary, falls es nicht im PATH liegt.
 LP_BINARY=lp
+# Nur fuer die Druckersuche im Webinterface ("Im Netzwerk suchen"). Ohne
+# Eintrag wird lpstat neben LP_BINARY erwartet.
+# LPSTAT_BINARY=lpstat
 # Nach so vielen Sekunden gilt ein Druckauftrag als gescheitert (der Anhang
 # ist zu dem Zeitpunkt bereits abgelegt).
 PRINT_TIMEOUT_SECONDS=120
@@ -420,6 +423,15 @@ def _required(name: str, because: str) -> str:
     return value
 
 
+def _lpstat_binary() -> str:
+    """Where `lpstat` is, defaulting to `lp`'s directory."""
+    explicit = os.environ.get("LPSTAT_BINARY", "").strip()
+    if explicit:
+        return explicit
+    lp = os.environ.get("LP_BINARY", "lp").strip() or "lp"
+    return lp[:-2] + "lpstat" if lp.endswith("lp") else "lpstat"
+
+
 @dataclass(frozen=True)
 class Config:
     imap_host: str
@@ -467,6 +479,9 @@ class Config:
     # install that is driven purely from the .env can set one up too.
     printing_enabled: bool
     lp_binary: str
+    # `lpstat` is only used to list a CUPS server's queues for the printer
+    # search; it sits next to `lp`, so it is derived from it unless overridden.
+    lpstat_binary: str
     print_timeout: int
     printable_extensions: frozenset[str]
     printer_name: str
@@ -527,6 +542,7 @@ class Config:
                 dry_run=_bool("DRY_RUN", False),
                 printing_enabled=_bool("PRINTING_ENABLED", True),
                 lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+                lpstat_binary=_lpstat_binary(),
                 print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
                 printable_extensions=_extension_set(
                     "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS
@@ -817,6 +833,303 @@ def seed_from_config(store: AccountStore, settings, config) -> None:
     )
     settings.set(SETTING_ACCOUNTS_SEEDED, "1")
     logger.info("Created the first IMAP account from the configuration (%s)", config.imap_host)
+MAIL2NAS_EOF
+
+# --- mail2nas/addresses.py ---
+cat > mail2nas/addresses.py <<'MAIL2NAS_EOF'
+"""Routing by mail address: what happens to mail sent *to* a given address.
+
+The mapping rules answer "what kind of document is this?" by looking at
+keywords. This answers a different question - "who was it sent to, and by
+whom?" - and that is what makes a print-by-mail address work: an alias like
+`drucker-buero@firma.de` is delivered into the archive mailbox, and everything
+addressed to it is printed on the printer that belongs to that alias.
+
+Deliberately independent of the IMAP accounts: aliases usually land in one
+mailbox, so a separate account per address would mean a separate IMAP login
+per printer. Matching happens on the message instead.
+
+Stored in the same SQLite file as the accounts and printers - the UI has to
+be able to edit it, and it references printer ids.
+"""
+from __future__ import annotations
+
+import fnmatch
+import logging
+import sqlite3
+import threading
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from .filenames import safe_relative_parts
+
+logger = logging.getLogger(__name__)
+
+MAX_NAME_LENGTH = 80
+MAX_PATTERN_LENGTH = 200
+# Same reasoning as the mapping keywords: the text being matched comes from
+# outside, so the pattern may not turn into something expensive.
+MAX_WILDCARDS = 5
+
+
+class AddressError(ValueError):
+    """An address rule the user tried to save is not usable."""
+
+
+def matches_address(pattern: str, address: str) -> bool:
+    """True if `address` is covered by `pattern`.
+
+    Three notations, in the order people reach for them:
+
+    * `drucker@firma.de` - exactly this address.
+    * `@drucker.firma.de` - every address in that domain.
+    * `drucker-*@firma.de` - wildcards, `*` and `?` as usual.
+
+    Case is irrelevant, as it is for mail addresses in practice.
+    """
+    pattern = (pattern or "").strip().lower()
+    address = (address or "").strip().lower()
+    if not pattern or not address:
+        return False
+    if "*" in pattern or "?" in pattern:
+        if pattern.count("*") > MAX_WILDCARDS:
+            logger.warning("Address pattern %r has too many wildcards - ignoring it", pattern)
+            return False
+        return fnmatch.fnmatchcase(address, pattern)
+    if pattern.startswith("@"):
+        return address.endswith(pattern)
+    return address == pattern
+
+
+@dataclass(frozen=True)
+class AddressRule:
+    """One "mail to this address is handled like this" entry."""
+
+    id: int
+    name: str
+    recipient: str  # empty = any recipient (then `sender` alone decides)
+    sender: str  # empty = any sender
+    print_attachments: bool
+    printer: str  # printer key; "" = whatever the mailbox is set to
+    archive_attachments: bool
+    folder: str  # "" = let the keyword rules decide
+    enabled: bool
+
+    @property
+    def key(self) -> str:
+        return str(self.id)
+
+    def label(self) -> str:
+        where = self.recipient or "(jede Empfaengeradresse)"
+        if self.sender:
+            where += f" von {self.sender}"
+        return f"{self.name} - {where}"
+
+    def matches(self, recipients: Sequence[str], sender: str) -> bool:
+        """Does this rule apply to a message?
+
+        Both patterns have to fit when both are set. That is the safe
+        direction for something that consumes paper: naming a sender turns
+        the rule into "only these people may print here", not into a second,
+        independent way to trigger it.
+        """
+        if self.recipient and not any(matches_address(self.recipient, to) for to in recipients):
+            return False
+        if self.sender and not matches_address(self.sender, sender):
+            return False
+        # A rule with neither pattern would match every mail; validate()
+        # rejects it, but a hand-edited database must not print everything.
+        return bool(self.recipient or self.sender)
+
+
+class AddressStore:
+    """CRUD for the address rules.
+
+    Short-lived connection per call, like the other stores: the web UI and the
+    account workers are different threads, and one sqlite3 connection must not
+    be shared between them.
+    """
+
+    _COLUMNS = (
+        "id, name, recipient, sender, print_attachments, printer, "
+        "archive_attachments, folder, enabled"
+    )
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS address_rules ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, "
+                "recipient TEXT NOT NULL DEFAULT '', "
+                "sender TEXT NOT NULL DEFAULT '', "
+                "print_attachments INTEGER NOT NULL DEFAULT 1, "
+                "printer TEXT NOT NULL DEFAULT '', "
+                "archive_attachments INTEGER NOT NULL DEFAULT 1, "
+                "folder TEXT NOT NULL DEFAULT '', "
+                "enabled INTEGER NOT NULL DEFAULT 1)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    @staticmethod
+    def _row_to_rule(row) -> AddressRule:
+        return AddressRule(
+            id=row[0],
+            name=row[1],
+            recipient=row[2],
+            sender=row[3],
+            print_attachments=bool(row[4]),
+            printer=row[5] or "",
+            archive_attachments=bool(row[6]),
+            folder=row[7] or "",
+            enabled=bool(row[8]),
+        )
+
+    def all(self) -> list[AddressRule]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT {self._COLUMNS} FROM address_rules ORDER BY id").fetchall()
+        return [self._row_to_rule(row) for row in rows]
+
+    def enabled(self) -> list[AddressRule]:
+        return [rule for rule in self.all() if rule.enabled]
+
+    def get(self, rule_id: int) -> AddressRule | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM address_rules WHERE id = ?", (rule_id,)
+            ).fetchone()
+        return self._row_to_rule(row) if row else None
+
+    def match(self, recipients: Iterable[str], sender: str) -> AddressRule | None:
+        """The first enabled rule that fits, or None.
+
+        First match wins, like the mapping rules: two aliases that both cover
+        a mail is a configuration decision, and printing twice because of it
+        would be a surprise.
+        """
+        addresses = [str(a) for a in recipients]
+        for rule in self.enabled():
+            if rule.matches(addresses, sender):
+                return rule
+        return None
+
+    def add(self, **fields) -> int:
+        values = validate(fields)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO address_rules (name, recipient, sender, print_attachments, "
+                "printer, archive_attachments, folder, enabled) "
+                "VALUES (:name, :recipient, :sender, :print_attachments, :printer, "
+                ":archive_attachments, :folder, :enabled)",
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update(self, rule_id: int, **fields) -> None:
+        current = self.get(rule_id)
+        if current is None:
+            raise KeyError(rule_id)
+        values = validate(
+            {
+                "name": current.name,
+                "recipient": current.recipient,
+                "sender": current.sender,
+                "print_attachments": current.print_attachments,
+                "printer": current.printer,
+                "archive_attachments": current.archive_attachments,
+                "folder": current.folder,
+                "enabled": current.enabled,
+                **fields,
+            }
+        )
+        values["id"] = rule_id
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE address_rules SET name = :name, recipient = :recipient, "
+                "sender = :sender, print_attachments = :print_attachments, "
+                "printer = :printer, archive_attachments = :archive_attachments, "
+                "folder = :folder, enabled = :enabled WHERE id = :id",
+                values,
+            )
+
+    def delete(self, rule_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM address_rules WHERE id = ?", (rule_id,))
+
+    def clear_printer(self, printer_key: str) -> int:
+        """Drop references to a printer that was deleted.
+
+        Without this the rule would keep pointing at a queue that no longer
+        exists and quietly stop printing.
+        """
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE address_rules SET printer = '' WHERE printer = ?", (str(printer_key),)
+            )
+            return cursor.rowcount or 0
+
+
+def validate(fields: dict) -> dict:
+    """Check and normalise what the UI supplies."""
+    name = str(fields.get("name") or "").strip()
+    recipient = str(fields.get("recipient") or "").strip().lower()
+    sender = str(fields.get("sender") or "").strip().lower()
+    folder = str(fields.get("folder") or "").strip()
+
+    if not recipient and not sender:
+        raise AddressError(
+            "Bitte mindestens eine Empfaengeradresse angeben (oder eine Absenderadresse)."
+        )
+    for pattern, what in ((recipient, "Empfaengeradresse"), (sender, "Absenderadresse")):
+        if not pattern:
+            continue
+        if len(pattern) > MAX_PATTERN_LENGTH:
+            raise AddressError(f"Die {what} darf hoechstens {MAX_PATTERN_LENGTH} Zeichen lang sein.")
+        if any(char.isspace() for char in pattern) or "," in pattern:
+            raise AddressError(
+                f"Die {what} darf nur eine einzelne Adresse enthalten "
+                "(z. B. drucker@firma.de, @firma.de oder drucker-*@firma.de)."
+            )
+        if pattern.count("*") > MAX_WILDCARDS:
+            raise AddressError(f"Die {what} hat zu viele Platzhalter.")
+        if "@" not in pattern:
+            raise AddressError(
+                f"Die {what} sieht nicht nach einer Adresse aus - das @ fehlt "
+                "(eine ganze Domain schreibt man als @firma.de)."
+            )
+    if len(name) > MAX_NAME_LENGTH:
+        raise AddressError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
+
+    if folder:
+        try:
+            folder = "/".join(safe_relative_parts(folder))
+        except ValueError as exc:
+            raise AddressError(f"Der Zielordner ist nicht zulaessig: {exc}") from None
+
+    print_attachments = bool(fields.get("print_attachments", False))
+    archive_attachments = bool(fields.get("archive_attachments", True))
+    if not print_attachments and not archive_attachments:
+        raise AddressError(
+            "Ohne Drucken und ohne Ablegen wuerde der Anhang verworfen - "
+            "bitte mindestens eines auswaehlen."
+        )
+
+    return {
+        "name": name or recipient or sender,
+        "recipient": recipient,
+        "sender": sender,
+        "print_attachments": 1 if print_attachments else 0,
+        "printer": str(fields.get("printer") or "").strip(),
+        "archive_attachments": 1 if archive_attachments else 0,
+        "folder": folder,
+        "enabled": 1 if fields.get("enabled", True) else 0,
+    }
 MAIL2NAS_EOF
 
 # --- mail2nas/printers.py ---
@@ -1305,6 +1618,356 @@ def from_config(config, printers: PrinterStore) -> PrintService:
     )
 MAIL2NAS_EOF
 
+# --- mail2nas/discovery.py ---
+cat > mail2nas/discovery.py <<'MAIL2NAS_EOF'
+"""Finding printers that are already on the network.
+
+Two sources, because there are two kinds of "printer" in this context:
+
+* **Queues on a CUPS server** (`lpstat -v`). These are ready to use: their
+  name is exactly what goes into a printer's "Warteschlange", and printing
+  works the moment it is saved.
+* **Devices advertising themselves via mDNS/DNS-SD** (`_ipp._tcp` and
+  friends), which is how AirPrint/driverless printers announce their
+  presence. These are found even when nothing has been set up yet - but a
+  raw device is not a CUPS queue, so the UI says how to turn it into one.
+
+Everything here is best-effort and bounded: discovery runs inside a web
+request, and an unreachable CUPS server or a network that swallows multicast
+must return an empty list quickly rather than hang the page.
+"""
+from __future__ import annotations
+
+import logging
+import socket
+import struct
+import subprocess
+import time
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+MDNS_ADDRESS = "224.0.0.251"
+MDNS_PORT = 5353
+# The services a network printer announces itself under. _pdl-datastream is
+# raw port-9100 printing, which many devices offer alongside IPP.
+MDNS_SERVICES = ("_ipp._tcp.local", "_ipps._tcp.local", "_pdl-datastream._tcp.local")
+MAX_RESPONSE_BYTES = 9000
+MAX_NAME_JUMPS = 20
+
+TYPE_A = 1
+TYPE_PTR = 12
+TYPE_TXT = 16
+TYPE_SRV = 33
+# Unicast-response bit (RFC 6762 5.4): without it responders answer by
+# multicast to port 5353, which a one-shot client is not listening on.
+QCLASS_IN_UNICAST = 0x8001
+
+
+@dataclass(frozen=True)
+class Found:
+    """One discovered printer, in the terms the printer form needs."""
+
+    name: str
+    destination: str  # queue name / IPP resource
+    server: str  # "host" or "host:port"; empty = the local CUPS server
+    source: str  # "cups" or "mdns"
+    detail: str = ""  # device URI or model, shown to the user
+
+    @property
+    def ready_to_use(self) -> bool:
+        """True if this can be printed on as-is (a real CUPS queue)."""
+        return self.source == "cups"
+
+    def lpadmin_command(self) -> str:
+        """How to turn a discovered device into a CUPS queue, for copy & paste."""
+        uri = self.detail or f"ipp://{self.server}/{self.destination}"
+        queue = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.name) or "drucker"
+        return f"lpadmin -p {queue} -v {uri} -E -m everywhere"
+
+
+# --- CUPS ------------------------------------------------------------------
+
+
+def cups_queues(server: str = "", lpstat_binary: str = "lpstat", timeout: int = 10) -> list[Found]:
+    """Ask a CUPS server which queues it has.
+
+    `lpstat -v` is used rather than `-e`: it names the device behind each
+    queue, which is what tells two similarly named queues apart.
+    """
+    command = [lpstat_binary]
+    if server.strip():
+        command += ["-h", server.strip()]
+    command += ["-v"]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except FileNotFoundError:
+        raise DiscoveryError(
+            f"{lpstat_binary} nicht gefunden - im Container fehlt das Paket cups-client."
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise DiscoveryError(
+            f"Der CUPS-Server hat nicht innerhalb von {timeout}s geantwortet."
+        ) from None
+    except OSError as exc:
+        raise DiscoveryError(f"CUPS-Abfrage fehlgeschlagen: {exc}") from exc
+
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        raise DiscoveryError(message or f"{lpstat_binary} endete mit Code {result.returncode}")
+
+    return parse_lpstat(result.stdout or "", server.strip())
+
+
+def parse_lpstat(output: str, server: str = "") -> list[Found]:
+    """Turn `lpstat -v` output into printers.
+
+    Lines look like::
+
+        device for Buero_MFP: ipp://192.168.1.50:631/ipp/print
+        Gerät für Flur: socket://192.168.1.51:9100
+
+    The prefix is localised, so the colon is what is parsed, not the words.
+    """
+    found: list[Found] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        head, _, uri = line.partition(":")
+        # "device for NAME" / "Gerät für NAME" - the queue is the last word.
+        queue = head.split()[-1] if head.split() else ""
+        uri = uri.strip()
+        if not queue or not uri:
+            continue
+        found.append(
+            Found(name=queue, destination=queue, server=server, source="cups", detail=uri)
+        )
+    return found
+
+
+class DiscoveryError(RuntimeError):
+    """Discovery could not be carried out (as opposed to finding nothing)."""
+
+
+# --- mDNS / DNS-SD ----------------------------------------------------------
+
+
+def _encode_name(name: str) -> bytes:
+    parts = [label.encode("utf-8") for label in name.strip(".").split(".")]
+    return b"".join(bytes([len(p)]) + p for p in parts) + b"\x00"
+
+
+def _query(service: str) -> bytes:
+    header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    return header + _encode_name(service) + struct.pack(">HH", TYPE_PTR, QCLASS_IN_UNICAST)
+
+
+def _read_name(data: bytes, offset: int) -> tuple[str, int]:
+    """Decode a (possibly compressed) DNS name. Returns (name, offset after it)."""
+    labels: list[str] = []
+    jumps = 0
+    after: int | None = None
+    while True:
+        if offset >= len(data):
+            raise ValueError("truncated name")
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            break
+        if length & 0xC0 == 0xC0:  # compression pointer
+            if offset + 1 >= len(data):
+                raise ValueError("truncated pointer")
+            pointer = ((length & 0x3F) << 8) | data[offset + 1]
+            if after is None:
+                after = offset + 2
+            jumps += 1
+            if jumps > MAX_NAME_JUMPS or pointer >= len(data):
+                raise ValueError("name pointer loop")
+            offset = pointer
+            continue
+        start = offset + 1
+        offset = start + length
+        if offset > len(data):
+            raise ValueError("truncated label")
+        labels.append(data[start:offset].decode("utf-8", "replace"))
+    return ".".join(labels), (after if after is not None else offset)
+
+
+def _read_records(data: bytes) -> list[tuple[str, int, bytes, int]]:
+    """Every resource record as (name, type, rdata, rdata offset)."""
+    if len(data) < 12:
+        return []
+    _, _, questions, answers, authority, additional = struct.unpack(">HHHHHH", data[:12])
+    offset = 12
+    for _ in range(questions):
+        _, offset = _read_name(data, offset)
+        offset += 4
+    records = []
+    for _ in range(answers + authority + additional):
+        name, offset = _read_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlength = struct.unpack(">HHIH", data[offset : offset + 10])
+        offset += 10
+        rdata = data[offset : offset + rdlength]
+        records.append((name, rtype, rdata, offset))
+        offset += rdlength
+    return records
+
+
+def _parse_txt(rdata: bytes) -> dict[str, str]:
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(rdata):
+        length = rdata[index]
+        index += 1
+        chunk = rdata[index : index + length].decode("utf-8", "replace")
+        index += length
+        key, _, value = chunk.partition("=")
+        if key:
+            values[key.lower()] = value
+    return values
+
+
+def parse_responses(packets: list[bytes]) -> list[Found]:
+    """Build the printer list from raw mDNS response packets.
+
+    Split out from the socket handling so the parsing - the part with the
+    interesting edge cases - can be tested without a network.
+    """
+    services: dict[str, dict] = {}
+    hosts: dict[str, str] = {}
+
+    for data in packets:
+        try:
+            records = _read_records(data)
+        except (ValueError, struct.error):
+            logger.debug("Ignoring an unparsable mDNS packet", exc_info=True)
+            continue
+        for name, rtype, rdata, rdata_offset in records:
+            try:
+                if rtype == TYPE_SRV and len(rdata) >= 7:
+                    _, _, port = struct.unpack(">HHH", rdata[:6])
+                    target, _ = _read_name(data, rdata_offset + 6)
+                    entry = services.setdefault(name, {})
+                    entry["host"] = target.rstrip(".")
+                    entry["port"] = port
+                elif rtype == TYPE_TXT:
+                    services.setdefault(name, {})["txt"] = _parse_txt(rdata)
+                elif rtype == TYPE_A and len(rdata) == 4:
+                    hosts[name.rstrip(".")] = socket.inet_ntoa(rdata)
+            except (ValueError, struct.error):
+                logger.debug("Ignoring an unparsable mDNS record", exc_info=True)
+
+    found: list[Found] = []
+    for service_name, entry in services.items():
+        host = entry.get("host")
+        if not host:
+            continue
+        txt = entry.get("txt", {})
+        port = entry.get("port", 631)
+        address = hosts.get(host, host)
+        instance = service_name.split("._")[0].replace("\\032", " ")
+        label = txt.get("ty") or txt.get("product", "").strip("()") or instance
+        queue = (txt.get("rp") or "ipp/print").lstrip("/")
+        server = address if port in (631, 0) else f"{address}:{port}"
+        found.append(
+            Found(
+                name=label or instance,
+                destination=queue,
+                server=server,
+                source="mdns",
+                detail=f"ipp://{address}:{port}/{queue}",
+            )
+        )
+    return found
+
+
+def mdns_printers(timeout: float = 3.0) -> list[Found]:
+    """One-shot DNS-SD query for the usual printer services.
+
+    Returns an empty list rather than raising when multicast is unavailable:
+    inside a bridged container that is the normal case, not an error worth
+    failing the page over.
+    """
+    packets: list[bytes] = []
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as exc:
+        logger.info("No mDNS discovery: %s", exc)
+        return []
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        sock.bind(("", 0))
+        for service in MDNS_SERVICES:
+            try:
+                sock.sendto(_query(service), (MDNS_ADDRESS, MDNS_PORT))
+            except OSError as exc:
+                logger.info("Could not send the mDNS query for %s: %s", service, exc)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, _sender = sock.recvfrom(MAX_RESPONSE_BYTES)
+            except (TimeoutError, socket.timeout):
+                break
+            except OSError as exc:
+                logger.info("mDNS discovery stopped: %s", exc)
+                break
+            packets.append(data)
+    finally:
+        sock.close()
+    return parse_responses(packets)
+
+
+# --- both -------------------------------------------------------------------
+
+
+def discover(
+    server: str = "",
+    lpstat_binary: str = "lpstat",
+    timeout: int = 10,
+    mdns_timeout: float = 3.0,
+    include_mdns: bool = True,
+) -> tuple[list[Found], list[str]]:
+    """Everything that could be found, plus the problems worth telling about.
+
+    The queues of a CUPS server come first - they are the ones that can be
+    used straight away - followed by devices that only announced themselves.
+    A device already backing a queue is dropped from the second list.
+    """
+    found: list[Found] = []
+    problems: list[str] = []
+
+    try:
+        found.extend(cups_queues(server, lpstat_binary=lpstat_binary, timeout=timeout))
+    except DiscoveryError as exc:
+        problems.append(f"CUPS ({server or 'lokal'}): {exc}")
+
+    if include_mdns:
+        known = {(entry.detail or "").lower() for entry in found}
+        for entry in mdns_printers(timeout=mdns_timeout):
+            if entry.detail.lower() in known:
+                continue
+            found.append(entry)
+        if not any(entry.source == "mdns" for entry in found):
+            problems.append(
+                "Per mDNS wurde nichts gefunden. In einem Docker-Netz ist Multicast "
+                "normalerweise nicht erreichbar - dann hilft nur der CUPS-Server oben "
+                "oder das Geraet von Hand einzutragen."
+            )
+
+    return found, problems
+MAIL2NAS_EOF
+
 # --- mail2nas/runtime.py ---
 cat > mail2nas/runtime.py <<'MAIL2NAS_EOF'
 """The objects the archiver and the web UI both work on.
@@ -1331,7 +1994,16 @@ class Runtime:
     """Shared handles, plus the mapping-file location that can move."""
 
     def __init__(
-        self, config, storage, mapping, store, settings, accounts, printers=None, printing=None
+        self,
+        config,
+        storage,
+        mapping,
+        store,
+        settings,
+        accounts,
+        printers=None,
+        printing=None,
+        addresses=None,
     ):
         self.config = config
         self.storage = storage
@@ -1343,6 +2015,7 @@ class Runtime:
         # the archiver before printers existed) can leave them out.
         self.printers = printers
         self.printing = printing
+        self.addresses = addresses
         # Set by the web UI, consumed by the supervisor loop: the archiver
         # threads must not read a half-changed path.
         self.mapping_path_changed = threading.Event()
@@ -2505,11 +3178,12 @@ import logging
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
 
 from .accounts import Account
+from .addresses import AddressRule, AddressStore
 from .config import Config
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
 from .mapping import Mapping, Rule
@@ -2520,6 +3194,25 @@ from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
+# Where the address a mail was actually delivered to can be found. The
+# envelope headers come first: an alias like "drucker@firma.de" is usually
+# delivered into a shared mailbox, and then only the delivery headers still
+# name the alias - To: may say something else entirely (or nothing, for Bcc).
+RECIPIENT_HEADERS = (
+    "Delivered-To",
+    "X-Original-To",
+    "Envelope-To",
+    "X-Envelope-To",
+    "X-RcptTo",
+    "To",
+    "Cc",
+    "Resent-To",
+    "X-Forwarded-To",
+)
+# A mail may legitimately carry a few dozen recipients; thousands are either a
+# mistake or an attempt to make matching expensive.
+MAX_RECIPIENTS = 50
+
 
 def _decode(value: str | None) -> str:
     if not value:
@@ -2528,6 +3221,27 @@ def _decode(value: str | None) -> str:
         return str(make_header(decode_header(value)))
     except Exception:
         return value
+
+
+def recipients_of(msg: Message) -> list[str]:
+    """Every address this message was addressed or delivered to, lowercased."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for header in RECIPIENT_HEADERS:
+        for raw in msg.get_all(header, []):
+            for _, address in getaddresses([_decode(raw)]):
+                address = address.strip().lower()
+                if not address or address in seen:
+                    continue
+                seen.add(address)
+                found.append(address)
+                if len(found) >= MAX_RECIPIENTS:
+                    logger.warning(
+                        "Message has more than %d recipients - only those are matched",
+                        MAX_RECIPIENTS,
+                    )
+                    return found
+    return found
 
 
 def _message_id(msg: Message, uid: int, account_key: str) -> str:
@@ -2550,6 +3264,7 @@ class AttachmentPlan:
     quarantined: bool
     archive: bool
     printer: Printer | None
+    address: AddressRule | None = None
 
 
 class Archiver:
@@ -2561,6 +3276,7 @@ class Archiver:
         storage: Storage,
         account: Account,
         printing: PrintService | None = None,
+        addresses: AddressStore | None = None,
     ):
         self.config = config
         self.mapping = mapping
@@ -2568,6 +3284,9 @@ class Archiver:
         self.storage = storage
         self.account = account
         self.printing = printing
+        # Optional, like `printing`: an installation without address rules
+        # behaves exactly as before.
+        self.addresses = addresses
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -2630,6 +3349,15 @@ class Archiver:
         _, sender_addr = parseaddr(_decode(msg.get("From")))
         body = self._extract_body(msg) if self.config.match_body else ""
         mail_rule = self._match(subject, body)
+        address_rule = self._address_rule(msg, sender_addr)
+        if address_rule is not None:
+            logger.info(
+                "UID %s '%s' is addressed to %s (%s)",
+                uid,
+                subject,
+                address_rule.recipient or address_rule.sender,
+                address_rule.name,
+            )
 
         attachments = list(self._iter_attachments(msg))
         if len(attachments) > self.config.max_attachments_per_message:
@@ -2662,7 +3390,7 @@ class Archiver:
                     )
                     continue
 
-                plan = self._plan_attachment(filename, mail_rule)
+                plan = self._plan_attachment(filename, mail_rule, address_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if plan.archive:
@@ -2698,10 +3426,13 @@ class Archiver:
                     # gone once the mail is marked as read.
                     logger.warning(
                         "UID %s '%s': attachment '%s' was neither archived nor printed - "
-                        "the mailbox is set to print only but nothing prints it",
+                        "%s is set to print only but nothing prints it",
                         uid,
                         subject,
                         filename,
+                        f"the address rule {plan.address.name!r}"
+                        if plan.address is not None
+                        else "the mailbox",
                     )
 
                 # Printing comes after filing, deliberately: the share is the
@@ -2740,7 +3471,21 @@ class Archiver:
             return target
         raise ValueError("No usable target folder inside the archive root")
 
-    def _plan_attachment(self, filename: str, mail_rule: Rule | None) -> AttachmentPlan:
+    def _address_rule(self, msg: Message, sender_addr: str) -> AddressRule | None:
+        """The configured address this mail was sent to, if any."""
+        if self.addresses is None:
+            return None
+        try:
+            return self.addresses.match(recipients_of(msg), sender_addr)
+        except Exception:
+            # Routing is a convenience; a broken lookup must not stop the mail
+            # from being archived the ordinary way.
+            logger.exception("Could not match the delivery address - continuing without it")
+            return None
+
+    def _plan_attachment(
+        self, filename: str, mail_rule: Rule | None, address_rule: AddressRule | None = None
+    ) -> AttachmentPlan:
         """Decide where a single attachment is filed, and whether it is printed.
 
         The attachment's own filename is checked against the mapping first,
@@ -2750,6 +3495,11 @@ class Archiver:
         blocked extension are always quarantined, regardless of any keyword
         match, so a malicious/executable attachment can never be renamed
         into a trusted-looking business folder just by naming it "Rechnung.exe".
+
+        An address rule outranks both. Somebody who sends a document to
+        `drucker-buero@firma.de` has said what should happen with it more
+        clearly than any keyword can; the keywords then only still decide the
+        folder, and only if the address rule names none.
         """
         rule = self._match(filename) or mail_rule
 
@@ -2760,26 +3510,41 @@ class Archiver:
         quarantined = bool(extensions & self.config.blocked_extensions)
 
         return AttachmentPlan(
-            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule),
+            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
             # "Print only" still files anything quarantined: it cannot be
             # printed either, and dropping it without a trace would hide
             # exactly the attachment somebody may need to look at.
-            archive=self.account.archive_attachments or quarantined,
-            printer=self._printer_for(rule, quarantined),
+            archive=self._archives(address_rule) or quarantined,
+            printer=self._printer_for(rule, quarantined, address_rule),
+            address=address_rule,
         )
 
-    def _folder_of(self, rule: Rule | None) -> str:
+    def _archives(self, address_rule: AddressRule | None) -> bool:
+        if address_rule is not None:
+            return address_rule.archive_attachments
+        return self.account.archive_attachments
+
+    def _folder_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
+        if address_rule is not None and address_rule.folder:
+            return address_rule.folder
         return rule.folder if rule else self.config.fallback_folder
 
-    def _printer_for(self, rule: Rule | None, quarantined: bool) -> Printer | None:
+    def _printer_for(
+        self, rule: Rule | None, quarantined: bool, address_rule: AddressRule | None = None
+    ) -> Printer | None:
         """Which printer this attachment goes to, if any.
 
-        Printing is requested either by the mailbox ("print everything that
-        arrives here") or by the matched rule ("print invoices"). The printer
-        is then the most specific one configured: the rule's own choice beats
-        the mailbox default.
+        Printing is requested by the address it was sent to ("everything for
+        drucker-buero@ goes on the office printer"), by the mailbox ("print
+        everything that arrives here") or by the matched rule ("print
+        invoices"). The printer is then the most specific one configured:
+        address before rule before mailbox.
+
+        A matching address rule also has the last word on *whether* to print.
+        Its whole purpose is to say what happens to mail sent there, so an
+        address set to "only file" is not overruled by a keyword rule.
         """
         if self.printing is None or not self.config.printing_enabled:
             return None
@@ -2789,17 +3554,23 @@ class Archiver:
             return None
 
         by_rule = rule is not None and rule.print_attachments
-        if not (self.account.print_attachments or by_rule):
-            return None
+        if address_rule is not None:
+            if not address_rule.print_attachments:
+                return None
+            keys = (address_rule.printer, rule.printer if by_rule else "", self.account.printer)
+            wanted_by = f"address {address_rule.name!r}"
+        else:
+            if not (self.account.print_attachments or by_rule):
+                return None
+            keys = (rule.printer if by_rule else "", self.account.printer)
+            wanted_by = f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}"
 
-        printer = self.printing.printer_for(
-            rule.printer if by_rule else "", self.account.printer
-        )
+        printer = self.printing.printer_for(*keys)
         if printer is None:
             logger.warning(
                 "Printing is enabled for %s but no usable printer is configured - "
                 "nothing was printed",
-                f"rule {rule.keyword!r}" if by_rule else f"mailbox {self.account.name!r}",
+                wanted_by,
             )
         return printer
 
@@ -2880,6 +3651,7 @@ import threading
 import time
 from datetime import timedelta
 from functools import wraps
+from types import SimpleNamespace
 
 from flask import (
     Flask,
@@ -2907,6 +3679,8 @@ from .mapping import (
     validate_folder,
     validate_keyword,
 )
+from .addresses import AddressError
+from .discovery import discover
 from .printers import PrinterError
 from .printing import PrintError
 
@@ -3279,8 +4053,49 @@ CONFIG_BODY = """
   {% else %}
   <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
   {% endif %}
-  <p style="margin-bottom:0"><a href="{{ url_for('new_printer') }}">
-    <button type="button">Drucker hinzufuegen</button></a></p>
+  <p style="margin-bottom:0">
+    <a href="{{ url_for('new_printer') }}">
+      <button type="button">Drucker hinzufuegen</button></a>
+    <a href="{{ url_for('discover_printers') }}">
+      <button class="secondary" type="button">Im Netzwerk suchen</button></a>
+  </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Zustelladressen</h2>
+  {% if address_rules %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Empfaenger</th><th>Absender</th><th>Drucken</th><th>Ablegen</th>
+      <th>Status</th><th></th></tr>
+    {% for entry in address_rules %}
+    <tr>
+      <td class="keyword">{{ entry.name }}</td>
+      <td>{{ entry.recipient or 'alle' }}</td>
+      <td>{{ entry.sender or 'alle' }}</td>
+      <td>{% if entry.print_attachments %}ja{% if entry.printer_label %}
+        <span class="hint">&middot; {{ entry.printer_label }}</span>{% endif %}
+        {% else %}nein{% endif %}</td>
+      <td>{% if entry.archive_attachments %}ja{% if entry.folder %}
+        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}
+        {% else %}nein{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_address', address_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Die erste passende Zustelladresse gewinnt. Sie entscheidet ueber
+  Drucken und Ablegen; die Stichwort-Zuordnungen bestimmen dann nur noch den
+  Zielordner, falls hier keiner steht.</p>
+  {% else %}
+  <p class="hint">Keine Zustelladresse angelegt. Damit wird nur nach Stichwoertern
+  sortiert und nur gedruckt, was ein Postfach oder eine Zuordnung verlangt.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_address') }}">
+    <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
 <div class="card">
@@ -3489,7 +4304,7 @@ PRINTER_BODY = """
   Leerzeichen getrennt.</p>
 </div>
 
-{% if printer %}
+{% if printer and printer.id %}
 <div class="card">
   <h2 style="margin-top:0">Testdruck</h2>
   <form method="post" action="{{ url_for('test_printer', printer_id=printer.id) }}">
@@ -3509,6 +4324,148 @@ PRINTER_BODY = """
     <p class="hint">Postfaecher und Zuordnungen, die auf ihn zeigen, drucken danach
     nicht mehr - das steht dann im Log.</p>
   </form>
+</div>
+{% endif %}
+"""
+
+ADDRESS_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Zustelladresse bearbeiten' if entry else 'Zustelladresse hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ entry.name if entry else '' }}"
+               placeholder="z. B. Drucker Buero">
+      </div>
+      <div class="field">
+        <label for="recipient">Empfaengeradresse</label>
+        <input id="recipient" name="recipient" type="text"
+               value="{{ entry.recipient if entry else '' }}"
+               placeholder="drucker@firma.de, @firma.de oder drucker-*@firma.de">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="sender">Nur von diesem Absender (optional)</label>
+        <input id="sender" name="sender" type="text" value="{{ entry.sender if entry else '' }}"
+               placeholder="leer = von jedem; sonst z. B. @firma.de">
+      </div>
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="print_attachments" value="1"
+        {% if not entry or entry.print_attachments %}checked{% endif %}>
+        Anhaenge drucken</label>
+    </p>
+    <div class="field">
+      <label for="printer">Drucker</label>
+      <select id="printer" name="printer">
+        <option value="">Drucker des Postfachs</option>
+        {% for printer in printers %}
+        <option value="{{ printer.key }}"
+          {% if entry and entry.printer == printer.key %}selected{% endif %}>
+          {{ printer.label() }}</option>
+        {% endfor %}
+        {% if entry and entry.printer and entry.printer not in printer_keys %}
+        <option value="{{ entry.printer }}" selected>(geloeschter Drucker)</option>
+        {% endif %}
+      </select>
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="archive_attachments" value="1"
+        {% if not entry or entry.archive_attachments %}checked{% endif %}>
+        Anhaenge per SMB ablegen</label>
+    </p>
+    <div class="field">
+      <label for="folder">Zielordner (optional)</label>
+      <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
+             placeholder="leer = nach Stichwort-Zuordnungen">
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not entry or entry.enabled %}checked{% endif %}> Aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Gepruefte Kopfzeilen sind Delivered-To, X-Original-To, Envelope-To,
+  To und Cc - ein Alias, das in dieses Postfach zugestellt wird, wird also auch
+  dann erkannt, wenn im To: etwas anderes steht. Sind Empfaenger- und
+  Absenderadresse gesetzt, muessen beide passen; der Absender wirkt dann als
+  Schutz davor, dass Fremde ueber die Adresse drucken koennen.</p>
+</div>
+
+{% if entry %}
+<div class="card">
+  <h2 style="margin-top:0">Zustelladresse loeschen</h2>
+  <form method="post" action="{{ url_for('delete_address', address_id=entry.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diese Zustelladresse loeschen</button>
+    <p class="hint">Mail an diese Adresse wird danach wieder wie jede andere
+    behandelt.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+DISCOVERY_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Drucker im Netzwerk suchen</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="server">CUPS-Server abfragen (optional)</label>
+        <input id="server" name="server" type="text" value="{{ server }}"
+               placeholder="z. B. cups.lan:631 - leer = lokaler cupsd">
+      </div>
+      <button type="submit">Suchen</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
+    </div>
+    <p class="hint" style="margin-bottom:0">Gefragt werden die Warteschlangen des
+    CUPS-Servers und - per mDNS - Geraete, die sich im Netz selbst ankuendigen.</p>
+  </form>
+</div>
+
+{% if searched %}
+<div class="card">
+  <h2 style="margin-top:0">Gefunden</h2>
+  {% if found %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Warteschlange</th><th>Server</th><th>Quelle</th><th></th></tr>
+    {% for item in found %}
+    <tr>
+      <td class="keyword">{{ item.name }}</td>
+      <td>{{ item.destination }}<br><span class="hint">{{ item.detail }}</span></td>
+      <td>{{ item.server or 'lokal' }}</td>
+      <td>{% if item.ready_to_use %}CUPS-Warteschlange{% else %}im Netz gefunden{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('new_printer', name=item.name, destination=item.destination,
+                            server=item.server) }}">Uebernehmen</a>
+      </td>
+    </tr>
+    {% if not item.ready_to_use %}
+    <tr><td colspan="5" class="hint">Noch keine Warteschlange. Zuverlaessig wird daraus
+      eine mit:<br><code>{{ item.lpadmin_command() }}</code></td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">„Uebernehmen" fuellt das Drucker-Formular vor. Danach einmal die
+  Testseite drucken - das ist der schnellste Weg zu wissen, ob der Weg stimmt.</p>
+  {% else %}
+  <p class="hint">Nichts gefunden.</p>
+  {% endif %}
+  {% for problem in problems %}
+  <p class="hint">{{ problem }}</p>
+  {% endfor %}
 </div>
 {% endif %}
 """
@@ -3842,6 +4799,7 @@ def create_app(runtime) -> Flask:
             "Konfiguration",
             accounts=runtime.accounts.all(),
             printers=_printers(),
+            address_rules=_address_rules(),
             printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
             storage_description=storage.description,
@@ -3963,6 +4921,96 @@ def create_app(runtime) -> Flask:
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
 
+    # --- delivery addresses -------------------------------------------------
+
+    def _require_addresses():
+        """The address pages only exist when there is a store behind them."""
+        if runtime.addresses is None:
+            abort(404)
+        return runtime.addresses
+
+    def _address_rules() -> list:
+        """The rules plus the label of the printer each one names, for the list."""
+        if runtime.addresses is None:
+            return []
+        labels = {printer.key: printer.label() for printer in _printers()}
+        rules = []
+        for rule in runtime.addresses.all():
+            rules.append(
+                SimpleNamespace(
+                    id=rule.id,
+                    name=rule.name,
+                    recipient=rule.recipient,
+                    sender=rule.sender,
+                    print_attachments=rule.print_attachments,
+                    printer=rule.printer,
+                    printer_label=labels.get(rule.printer, ""),
+                    archive_attachments=rule.archive_attachments,
+                    folder=rule.folder,
+                    enabled=rule.enabled,
+                )
+            )
+        return rules
+
+    def _address_form() -> dict:
+        return {
+            "name": request.form.get("name", ""),
+            "recipient": request.form.get("recipient", ""),
+            "sender": request.form.get("sender", ""),
+            "print_attachments": bool(request.form.get("print_attachments")),
+            "printer": request.form.get("printer", ""),
+            "archive_attachments": bool(request.form.get("archive_attachments")),
+            "folder": request.form.get("folder", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/addresses/new", methods=["GET", "POST"])
+    @login_required
+    def new_address():
+        addresses = _require_addresses()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                addresses.add(**_address_form())
+            except AddressError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added address rule %r", request.form.get("recipient"))
+                flash("Zustelladresse angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context())
+
+    @app.route("/config/addresses/<int:address_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_address(address_id: int):
+        addresses = _require_addresses()
+        entry = addresses.get(address_id)
+        if entry is None:
+            flash("Diese Zustelladresse gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                addresses.update(address_id, **_address_form())
+            except AddressError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated address rule %s", address_id)
+                flash("Zustelladresse gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            entry = addresses.get(address_id)
+        return render(ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context())
+
+    @app.post("/config/addresses/<int:address_id>/delete")
+    @login_required
+    def delete_address(address_id: int):
+        require_csrf()
+        _require_addresses().delete(address_id)
+        logger.info("Web UI: deleted address rule %s", address_id)
+        flash("Zustelladresse geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
     # --- printers ---------------------------------------------------------
 
     def _printer_context() -> dict:
@@ -3999,7 +5047,20 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added printer %r", request.form.get("destination"))
                 flash("Drucker angelegt. Ein Testdruck zeigt, ob er erreichbar ist.", "ok")
                 return redirect(url_for("config_page"))
-        return render(PRINTER_BODY, "Drucker", printer=None)
+        # A "Uebernehmen" link from the discovery page arrives as query
+        # parameters; they only prefill the form, nothing is saved yet.
+        suggestion = None
+        if request.args.get("destination"):
+            suggestion = SimpleNamespace(
+                name=request.args.get("name", ""),
+                destination=request.args.get("destination", ""),
+                server=request.args.get("server", ""),
+                options="",
+                copies=1,
+                enabled=True,
+                id=None,
+            )
+        return render(PRINTER_BODY, "Drucker", printer=suggestion)
 
     @app.route("/config/printers/<int:printer_id>", methods=["GET", "POST"])
     @login_required
@@ -4043,15 +5104,51 @@ def create_app(runtime) -> Flask:
             flash("Testseite an die Warteschlange uebergeben.", "ok")
         return redirect(url_for("edit_printer", printer_id=printer_id))
 
+    @app.route("/config/printers/discover", methods=["GET", "POST"])
+    @login_required
+    def discover_printers():
+        _require_printers()
+        # Default to the server the printers already use: on a NAS box that is
+        # usually the one CUPS runs on, and typing it again is pointless.
+        configured = next((p.server for p in _printers() if p.server), "")
+        server = request.form.get("server", configured).strip()
+        found: list = []
+        problems: list[str] = []
+        searched = request.method == "POST"
+        if searched:
+            require_csrf()
+            try:
+                found, problems = discover(server, lpstat_binary=config.lpstat_binary)
+            except Exception as exc:  # noqa: BLE001 - the page reports, never 500s
+                logger.exception("Web UI: printer discovery failed")
+                problems = [f"Suche fehlgeschlagen: {exc}"]
+        return render(
+            DISCOVERY_BODY,
+            "Drucker suchen",
+            server=server,
+            found=found,
+            problems=problems,
+            searched=searched,
+        )
+
     @app.post("/config/printers/<int:printer_id>/delete")
     @login_required
     def delete_printer(printer_id: int):
         require_csrf()
         _require_printers().delete(printer_id)
+        # An address rule pointing at a deleted queue would keep asking for a
+        # printer that no longer exists; blank it so it falls back to the
+        # mailbox printer instead of silently printing nothing.
+        unpinned = runtime.addresses.clear_printer(str(printer_id)) if runtime.addresses else 0
         logger.info("Web UI: deleted printer %s", printer_id)
         flash(
             "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "
-            "drucken nicht mehr.",
+            "drucken nicht mehr."
+            + (
+                f" {unpinned} Zustelladresse(n) nutzen jetzt den Drucker des Postfachs."
+                if unpinned
+                else ""
+            ),
             "ok",
         )
         return redirect(url_for("config_page"))
@@ -4159,6 +5256,7 @@ import threading
 from . import printing as printing_module
 from . import storage as storage_module
 from .accounts import AccountStore, seed_from_config
+from .addresses import AddressStore
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
@@ -4197,12 +5295,21 @@ def main() -> None:
     printers = PrinterStore(config.state_db_path)
     seed_printer_from_config(printers, settings, config)
     printing = printing_module.from_config(config, printers)
+    addresses = AddressStore(config.state_db_path)
 
     mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
     mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     runtime = Runtime(
-        config, storage, mapping, store, settings, accounts, printers=printers, printing=printing
+        config,
+        storage,
+        mapping,
+        store,
+        settings,
+        accounts,
+        printers=printers,
+        printing=printing,
+        addresses=addresses,
     )
 
     if config.web_enabled:
@@ -4213,11 +5320,12 @@ def main() -> None:
         web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d dry_run=%s",
+        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d addresses=%d dry_run=%s",
         storage.description,
         config.storage_backend,
         mapping_path,
         len(printers.enabled()) if config.printing_enabled else 0,
+        len(addresses.enabled()),
         config.dry_run,
     )
 
@@ -4271,6 +5379,7 @@ class _Worker:
             self._runtime.storage,
             self.account,
             self._runtime.printing,
+            self._runtime.addresses,
         )
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(
@@ -4917,10 +6026,12 @@ MAIL2NAS_EOF
 cat > tests/test_archiver.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
+import email
 import textwrap
 from email.message import EmailMessage
 
-from mail2nas.archiver import Archiver
+from mail2nas.addresses import AddressStore
+from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
 from mail2nas.config import (
     DEFAULT_BLOCKED_EXTENSIONS,
     DEFAULT_PRINTABLE_EXTENSIONS,
@@ -4987,6 +6098,7 @@ def _make_config(tmp_path, **overrides) -> Config:
         dry_run=False,
         printing_enabled=True,
         lp_binary="lp",
+        lpstat_binary="lpstat",
         print_timeout=120,
         printable_extensions=frozenset(
             e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
@@ -5015,6 +6127,7 @@ def _make_archiver(
     mapping_content: str | None = None,
     account: Account | None = None,
     printing=None,
+    addresses=None,
     **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
@@ -5024,7 +6137,9 @@ def _make_archiver(
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT, printing)
+    return Archiver(
+        config, mapping, store, storage, account or TEST_ACCOUNT, printing, addresses
+    )
 
 
 class FakeIMAPClient:
@@ -5524,6 +6639,307 @@ def test_a_failing_printer_does_not_stop_the_archiving(tmp_path):
     archiver._process_message(FakeIMAPClient(uid=9, raw=raw), 9)
 
     assert any((tmp_path / "rechnungen").glob("*"))
+
+
+# --- printing by the address a mail was sent to ------------------------------
+
+
+def _addressed_message(
+    to: str = "drucker@firma.de",
+    sender: str = "kollege@firma.de",
+    subject: str = "Bitte drucken",
+    filename: str = "vertrag.pdf",
+    extra_headers: dict | None = None,
+) -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to
+    for header, value in (extra_headers or {}).items():
+        msg[header] = value
+    msg.set_content("Anbei.")
+    msg.add_attachment(b"DATA", maintype="application", subtype="pdf", filename=filename)
+    return bytes(msg)
+
+
+def _addresses(tmp_path, **fields) -> AddressStore:
+    """An address store holding one rule, with print-to-a-queue defaults."""
+    store = AddressStore(str(tmp_path / "addresses.db"))
+    values = dict(name="Drucker Buero", recipient="drucker@firma.de", print_attachments=True)
+    values.update(fields)
+    store.add(**values)
+    return store
+
+
+def test_recipients_are_read_from_the_delivery_headers():
+    """An alias only survives in Delivered-To once To: has been rewritten."""
+    raw = _addressed_message(
+        to="liste@firma.de", extra_headers={"Delivered-To": "drucker@firma.de", "Cc": "chef@firma.de"}
+    )
+
+    found = recipients_of(email.message_from_bytes(raw))
+
+    assert "drucker@firma.de" in found
+    assert "liste@firma.de" in found
+    assert "chef@firma.de" in found
+
+
+def test_recipient_extraction_is_bounded(tmp_path):
+    """A mail with thousands of recipients must not make matching expensive."""
+    msg = EmailMessage()
+    msg["Subject"] = "Massenmail"
+    msg["From"] = "a@b.c"
+    msg["To"] = ", ".join(f"user{i}@firma.de" for i in range(200))
+    msg.set_content("x")
+
+    assert len(recipients_of(msg)) == MAX_RECIPIENTS
+
+
+def test_mail_to_the_configured_address_is_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_addressed_message()), 1)
+
+    assert spooler.printed_on == ["buero_eg"]
+
+
+def test_mail_to_another_address_is_not_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=2, raw=_addressed_message(to="archiv@firma.de")), 2
+    )
+
+    assert spooler.printed_on == []
+
+
+def test_an_alias_in_delivered_to_is_enough(tmp_path):
+    """The usual setup: the alias is delivered into a shared mailbox."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+    raw = _addressed_message(
+        to="archiv@firma.de", extra_headers={"Delivered-To": "drucker@firma.de"}
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert spooler.printed_on == ["buero_eg"]
+
+
+def test_a_sender_restriction_keeps_strangers_from_printing(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, sender="@firma.de"),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=4, raw=_addressed_message(sender="fremder@example.com")), 4
+    )
+
+    assert spooler.printed_on == []
+
+
+def test_the_address_decides_the_folder(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=_addresses(tmp_path, print_attachments=False, folder="ausdrucke"),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=5, raw=_addressed_message(filename="Vertrag_7.pdf")), 5
+    )
+
+    assert any((tmp_path / "ausdrucke").glob("*"))
+    assert not (tmp_path / "vertraege").exists()
+
+
+def test_without_a_folder_the_keyword_rules_still_decide(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=_addresses(tmp_path, print_attachments=False),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=6, raw=_addressed_message(filename="Vertrag_7.pdf")), 6
+    )
+
+    assert any((tmp_path / "vertraege").glob("*"))
+
+
+def test_an_address_can_print_without_filing(tmp_path):
+    """A print-only alias: paper comes out, the share stays clean."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, archive_attachments=False),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=7, raw=_addressed_message()), 7)
+
+    assert spooler.printed_on == ["buero_eg"]
+    assert not any(tmp_path.glob("unsorted/*"))
+
+
+def test_an_address_can_file_without_printing(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+        addresses=_addresses(tmp_path, print_attachments=False, folder="nur_ablage"),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=8, raw=_addressed_message()), 8)
+
+    # The address is the more specific statement, so it wins over the mailbox.
+    assert spooler.printed_on == []
+    assert any((tmp_path / "nur_ablage").glob("*"))
+
+
+def test_the_address_printer_beats_the_rule_and_the_mailbox(tmp_path):
+    printing, spooler, (address_printer, rule_printer, mailbox_printer) = _make_printing(
+        tmp_path, "per_adresse", "per_regel", "per_postfach"
+    )
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Vertrag
+                folder: vertraege
+                print: true
+                printer: "{rule_printer}"
+        """,
+        account=_account(print_attachments=True, printer=mailbox_printer),
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=address_printer),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=9, raw=_addressed_message(filename="Vertrag_7.pdf")), 9
+    )
+
+    assert spooler.printed_on == ["per_adresse"]
+
+
+def test_an_address_without_its_own_printer_falls_back_to_the_mailbox(tmp_path):
+    printing, spooler, (mailbox_printer,) = _make_printing(tmp_path, "per_postfach")
+    archiver = _make_archiver(
+        tmp_path,
+        account=_account(printer=mailbox_printer),
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=""),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=10, raw=_addressed_message()), 10)
+
+    assert spooler.printed_on == ["per_postfach"]
+
+
+def test_a_blocked_attachment_is_never_printed_even_for_an_address(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, archive_attachments=False),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=11, raw=_addressed_message(filename="rechnung.exe")), 11
+    )
+
+    assert spooler.printed_on == []
+    # ... and it is filed despite "print only", so it can be looked at
+    assert any((tmp_path / "quarantaene").glob("*"))
+
+
+def test_a_printer_that_is_gone_does_not_stop_the_filing(tmp_path):
+    printing, spooler, _ = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer="999"),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=12, raw=_addressed_message()), 12)
+
+    assert spooler.printed_on == []
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_without_address_rules_nothing_changes(tmp_path):
+    """The feature is opt-in: an install with no rules behaves as before."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(tmp_path, printing=printing, addresses=None)
+
+    archiver._process_message(FakeIMAPClient(uid=13, raw=_addressed_message()), 13)
+
+    assert spooler.printed_on == []
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
+    """The whole chain with no stub in the middle: message in, `lp` called.
+
+    Everything else here fakes the spooler, which is what makes this worth
+    having: it is the only test that proves the address rule, the printer
+    record and the real `lp` argument building fit together.
+    """
+    fake_lp = tmp_path / "lp"
+    log = tmp_path / "lp.log"
+    fake_lp.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> {log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_lp.chmod(0o755)
+
+    printers = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = printers.add(
+        name="Buero", destination="Buero_MFP", server="cups.lan:631", options="media=A4"
+    )
+    config = _make_config(tmp_path, lp_binary=str(fake_lp))
+    printing = PrintService(printers, Spooler(lp_binary=str(fake_lp), timeout=30))
+
+    storage = LocalStorage(config.storage_root)
+    archiver = Archiver(
+        config,
+        Mapping(storage, config.mapping_path, config.fallback_folder),
+        ProcessedStore(config.state_db_path),
+        storage,
+        TEST_ACCOUNT,
+        printing,
+        _addresses(tmp_path, printer=str(printer_id)),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_addressed_message()), 1)
+
+    called = log.read_text(encoding="utf-8")
+    assert "-h cups.lan:631" in called
+    assert "-d Buero_MFP" in called
+    assert "-o media=A4" in called
+    # and the document is on the share as well
+    assert any((tmp_path / "unsorted").glob("*"))
 MAIL2NAS_EOF
 
 # --- tests/test_config.py ---
@@ -5870,6 +7286,7 @@ import re
 import pytest
 
 from mail2nas.accounts import AccountStore
+from mail2nas.addresses import AddressStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import from_config as printing_from_config
@@ -5905,6 +7322,7 @@ def env(tmp_path):
         accounts,
         printers=printers,
         printing=printing_from_config(config, printers),
+        addresses=AddressStore(config.state_db_path),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -6696,6 +8114,221 @@ def test_without_a_printer_the_print_controls_stay_hidden(client, env):
     html = client.get("/mapping").get_data(as_text=True)
 
     assert "nicht drucken" not in html
+
+
+# --- delivery addresses ------------------------------------------------------
+
+
+def _add_address(runtime, **fields) -> int:
+    values = dict(
+        name="Drucker Buero",
+        recipient="drucker@firma.de",
+        print_attachments=True,
+        archive_attachments=True,
+    )
+    values.update(fields)
+    return runtime.addresses.add(**values)
+
+
+@pytest.mark.parametrize("path", ["/config/addresses/new", "/config/addresses/1"])
+def test_address_pages_require_login(client, path):
+    response = client.get(path)
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_config_page_lists_the_addresses(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _add_address(runtime, printer=str(printer_id), folder="ausdrucke")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "drucker@firma.de" in html
+    assert "ausdrucke" in html
+    # the printer is named by its label, not by its bare id
+    assert "Buero EG" in html
+
+
+def test_creating_an_address_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post("/config/addresses/new", data={
+        "name": "Drucker Buero", "recipient": "drucker@firma.de", "sender": "@firma.de",
+        "print_attachments": "1", "printer": str(printer_id),
+        "archive_attachments": "1", "folder": "ausdrucke", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/addresses/new")})
+
+    rules = runtime.addresses.all()
+    assert [(r.recipient, r.sender, r.printer, r.folder) for r in rules] == [
+        ("drucker@firma.de", "@firma.de", str(printer_id), "ausdrucke")
+    ]
+
+
+def test_an_address_without_an_at_sign_is_rejected_with_a_message(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Kaputt", "recipient": "kein-at-zeichen", "print_attachments": "1",
+        "archive_attachments": "1", "csrf_token": _csrf(client, "/config/addresses/new")},
+        follow_redirects=True)
+
+    assert "@" in response.get_data(as_text=True)
+    assert runtime.addresses.all() == []
+
+
+def test_an_address_that_neither_prints_nor_files_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Weg damit", "recipient": "drucker@firma.de",
+        "csrf_token": _csrf(client, "/config/addresses/new")}, follow_redirects=True)
+
+    assert "verworfen" in response.get_data(as_text=True)
+    assert runtime.addresses.all() == []
+
+
+def test_editing_an_address(client, env):
+    _, _, _, _, runtime = env
+    address_id = _add_address(runtime)
+    _login(client)
+
+    client.post(f"/config/addresses/{address_id}", data={
+        "name": "Drucker OG", "recipient": "drucker-og@firma.de", "sender": "",
+        "print_attachments": "1", "printer": "", "archive_attachments": "1",
+        "folder": "", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/addresses/{address_id}")})
+
+    rule = runtime.addresses.get(address_id)
+    assert (rule.name, rule.recipient, rule.enabled) == ("Drucker OG", "drucker-og@firma.de", False)
+
+
+def test_deleting_an_address(client, env):
+    _, _, _, _, runtime = env
+    address_id = _add_address(runtime)
+    _login(client)
+
+    client.post(f"/config/addresses/{address_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.addresses.all() == []
+
+
+def test_opening_a_deleted_address_does_not_500(client, env):
+    _login(client)
+
+    response = client.get("/config/addresses/999", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert "gibt es nicht mehr" in response.get_data(as_text=True)
+
+
+def test_deleting_a_printer_unpins_the_addresses_using_it(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    address_id = _add_address(runtime, printer=str(printer_id))
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.addresses.get(address_id).printer == ""
+
+
+def test_changes_to_addresses_need_a_csrf_token(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Ohne Token", "recipient": "drucker@firma.de", "print_attachments": "1"})
+
+    assert response.status_code == 400
+    assert runtime.addresses.all() == []
+
+
+# --- finding printers on the network -----------------------------------------
+
+
+def test_the_discovery_page_needs_login(client):
+    response = client.get("/config/printers/discover")
+
+    assert response.status_code == 302
+
+
+def test_the_discovery_page_offers_the_configured_cups_server(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime, server="cups.lan:631")
+    _login(client)
+
+    html = client.get("/config/printers/discover").get_data(as_text=True)
+
+    assert 'value="cups.lan:631"' in html
+
+
+def test_searching_lists_what_was_found(client, env, monkeypatch):
+    from mail2nas import web as web_module
+    from mail2nas.discovery import Found
+
+    monkeypatch.setattr(
+        web_module,
+        "discover",
+        lambda server, **kwargs: (
+            [
+                Found("Buero_MFP", "Buero_MFP", "cups.lan", "cups", "ipp://10.0.0.5/ipp/print"),
+                Found("Kyocera M2540", "ipp/print", "10.0.0.6", "mdns", "ipp://10.0.0.6/ipp/print"),
+            ],
+            [],
+        ),
+    )
+    _login(client)
+
+    html = client.post(
+        "/config/printers/discover",
+        data={"server": "cups.lan", "csrf_token": _csrf(client, "/config/printers/discover")},
+    ).get_data(as_text=True)
+
+    assert "Buero_MFP" in html
+    assert "Kyocera M2540" in html
+    # the device without a queue comes with the command that creates one
+    assert "lpadmin -p Kyocera_M2540" in html
+
+
+def test_a_failing_search_reports_instead_of_crashing(client, env, monkeypatch):
+    from mail2nas import web as web_module
+
+    def boom(*args, **kwargs):
+        raise OSError("kaputt")
+
+    monkeypatch.setattr(web_module, "discover", boom)
+    _login(client)
+
+    response = client.post(
+        "/config/printers/discover",
+        data={"csrf_token": _csrf(client, "/config/printers/discover")},
+    )
+
+    assert response.status_code == 200
+    assert "kaputt" in response.get_data(as_text=True)
+
+
+def test_taking_over_a_found_printer_prefills_the_form(client, env):
+    _login(client)
+
+    html = client.get(
+        "/config/printers/new?name=Kyocera&destination=ipp%2Fprint&server=10.0.0.6"
+    ).get_data(as_text=True)
+
+    assert 'value="Kyocera"' in html
+    assert 'value="ipp/print"' in html
+    assert 'value="10.0.0.6"' in html
+    # nothing is stored yet, so there is nothing to test-print or delete
+    assert "Testseite drucken" not in html
 MAIL2NAS_EOF
 
 # --- tests/test_accounts.py ---
@@ -6815,6 +8448,226 @@ def test_deleting_the_last_account_does_not_resurrect_it_from_the_env(tmp_path):
 
     assert store.all() == []
     assert settings.get(SETTING_ACCOUNTS_SEEDED) == "1"
+MAIL2NAS_EOF
+
+# --- tests/test_addresses.py ---
+cat > tests/test_addresses.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.addresses import AddressError, AddressRule, AddressStore, matches_address
+
+
+def _store(tmp_path) -> AddressStore:
+    return AddressStore(str(tmp_path / "state.db"))
+
+
+def _rule(**overrides) -> AddressRule:
+    values = dict(
+        id=1,
+        name="Drucker Buero",
+        recipient="drucker@firma.de",
+        sender="",
+        print_attachments=True,
+        printer="",
+        archive_attachments=True,
+        folder="",
+        enabled=True,
+    )
+    values.update(overrides)
+    return AddressRule(**values)
+
+
+# --- address patterns --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern,address,expected",
+    [
+        ("drucker@firma.de", "drucker@firma.de", True),
+        ("drucker@firma.de", "DRUCKER@Firma.DE", True),
+        ("drucker@firma.de", "chef@firma.de", False),
+        ("@firma.de", "irgendwer@firma.de", True),
+        ("@firma.de", "jemand@fremd.de", False),
+        ("@firma.de", "jemand@subfirma.de", False),
+        ("drucker-*@firma.de", "drucker-eg@firma.de", True),
+        ("drucker-*@firma.de", "buchhaltung@firma.de", False),
+        ("drucker-??@firma.de", "drucker-eg@firma.de", True),
+        ("drucker-??@firma.de", "drucker-erdgeschoss@firma.de", False),
+        ("", "drucker@firma.de", False),
+        ("drucker@firma.de", "", False),
+    ],
+)
+def test_matches_address(pattern, address, expected):
+    assert matches_address(pattern, address) is expected
+
+
+def test_a_pattern_with_absurdly_many_wildcards_is_ignored():
+    """Matching cost is bounded: the text comes from outside."""
+    assert matches_address("a*a*a*a*a*a*a*@firma.de", "aaaaaaaa@firma.de") is False
+
+
+# --- rule matching -----------------------------------------------------------
+
+
+def test_recipient_only_rule_ignores_the_sender():
+    rule = _rule(recipient="drucker@firma.de")
+
+    assert rule.matches(["drucker@firma.de"], "fremder@example.com") is True
+
+
+def test_any_of_the_recipients_may_match():
+    """A mail to several people still counts as addressed to the printer."""
+    rule = _rule(recipient="drucker@firma.de")
+
+    assert rule.matches(["chef@firma.de", "drucker@firma.de"], "a@b.c") is True
+
+
+def test_sender_only_rule_matches_by_sender():
+    rule = _rule(recipient="", sender="scanner@firma.de")
+
+    assert rule.matches(["archiv@firma.de"], "scanner@firma.de") is True
+
+
+def test_both_patterns_have_to_match():
+    """The sender restricts who may print, it is not a second trigger."""
+    rule = _rule(recipient="drucker@firma.de", sender="@firma.de")
+
+    assert rule.matches(["drucker@firma.de"], "kollege@firma.de") is True
+    assert rule.matches(["drucker@firma.de"], "fremder@example.com") is False
+    assert rule.matches(["anderes@firma.de"], "kollege@firma.de") is False
+
+
+def test_a_rule_without_any_pattern_never_matches():
+    """Belt and braces for a hand-edited database: never print everything."""
+    rule = _rule(recipient="", sender="")
+
+    assert rule.matches(["drucker@firma.de"], "chef@firma.de") is False
+
+
+# --- store -------------------------------------------------------------------
+
+
+def test_add_and_read_back(tmp_path):
+    store = _store(tmp_path)
+
+    rule_id = store.add(
+        name="Buero", recipient="drucker@firma.de", print_attachments=True, printer="3"
+    )
+
+    stored = store.get(rule_id)
+    assert (stored.recipient, stored.printer, stored.print_attachments) == (
+        "drucker@firma.de",
+        "3",
+        True,
+    )
+
+
+def test_update_keeps_the_fields_not_sent(tmp_path):
+    store = _store(tmp_path)
+    rule_id = store.add(name="Buero", recipient="drucker@firma.de", folder="ausdrucke")
+
+    store.update(rule_id, name="Buero EG")
+
+    stored = store.get(rule_id)
+    assert (stored.name, stored.folder) == ("Buero EG", "ausdrucke")
+
+
+def test_delete(tmp_path):
+    store = _store(tmp_path)
+    rule_id = store.add(recipient="drucker@firma.de")
+
+    store.delete(rule_id)
+
+    assert store.get(rule_id) is None
+
+
+def test_first_matching_rule_wins(tmp_path):
+    """Two aliases covering one mail must not print it twice."""
+    store = _store(tmp_path)
+    store.add(name="Speziell", recipient="drucker-eg@firma.de")
+    store.add(name="Allgemein", recipient="@firma.de")
+
+    assert store.match(["drucker-eg@firma.de"], "chef@firma.de").name == "Speziell"
+
+
+def test_disabled_rules_are_skipped(tmp_path):
+    store = _store(tmp_path)
+    store.add(name="Aus", recipient="drucker@firma.de", enabled=False)
+
+    assert store.match(["drucker@firma.de"], "chef@firma.de") is None
+
+
+def test_no_match_returns_none(tmp_path):
+    store = _store(tmp_path)
+    store.add(recipient="drucker@firma.de")
+
+    assert store.match(["archiv@firma.de"], "chef@firma.de") is None
+
+
+def test_deleting_a_printer_unpins_the_rules_using_it(tmp_path):
+    store = _store(tmp_path)
+    rule_id = store.add(recipient="drucker@firma.de", print_attachments=True, printer="7")
+    store.add(recipient="anderes@firma.de", print_attachments=True, printer="8")
+
+    assert store.clear_printer("7") == 1
+
+    assert store.get(rule_id).printer == ""
+
+
+def test_the_table_survives_a_second_open(tmp_path):
+    store = _store(tmp_path)
+    store.add(recipient="drucker@firma.de")
+
+    assert len(AddressStore(str(tmp_path / "state.db")).all()) == 1
+
+
+# --- validation --------------------------------------------------------------
+
+
+def test_an_entry_without_any_address_is_rejected(tmp_path):
+    with pytest.raises(AddressError, match="Empfaengeradresse"):
+        _store(tmp_path).add(name="Leer")
+
+
+@pytest.mark.parametrize(
+    "pattern", ["kein-at-zeichen", "zwei@adressen.de, noch@eine.de", "mit leerzeichen@firma.de"]
+)
+def test_unusable_recipient_patterns_are_rejected(tmp_path, pattern):
+    with pytest.raises(AddressError):
+        _store(tmp_path).add(recipient=pattern)
+
+
+def test_neither_printing_nor_filing_is_rejected(tmp_path):
+    """That combination would silently throw the attachment away."""
+    with pytest.raises(AddressError, match="verworfen"):
+        _store(tmp_path).add(
+            recipient="drucker@firma.de", print_attachments=False, archive_attachments=False
+        )
+
+
+def test_a_folder_that_escapes_the_archive_is_rejected(tmp_path):
+    with pytest.raises(AddressError, match="Zielordner"):
+        _store(tmp_path).add(recipient="drucker@firma.de", folder="../woanders")
+
+
+def test_the_address_is_normalised(tmp_path):
+    store = _store(tmp_path)
+
+    rule_id = store.add(recipient="  Drucker@Firma.DE  ", folder="ausdrucke/2026/")
+
+    stored = store.get(rule_id)
+    assert stored.recipient == "drucker@firma.de"
+    assert stored.folder == "ausdrucke/2026"
+
+
+def test_the_name_defaults_to_the_address(tmp_path):
+    store = _store(tmp_path)
+
+    rule_id = store.add(recipient="drucker@firma.de")
+
+    assert store.get(rule_id).name == "drucker@firma.de"
 MAIL2NAS_EOF
 
 # --- tests/test_printers.py ---
@@ -7258,6 +9111,295 @@ def test_an_unprintable_format_is_not_sent(service):
 
     assert printing.send(_printer(), b"MZ", "setup.docx") is False
     assert run.calls == []
+MAIL2NAS_EOF
+
+# --- tests/test_discovery.py ---
+cat > tests/test_discovery.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import socket
+import struct
+import subprocess
+
+import pytest
+
+from mail2nas import discovery
+from mail2nas.discovery import (
+    DiscoveryError,
+    Found,
+    cups_queues,
+    discover,
+    parse_lpstat,
+    parse_responses,
+)
+
+
+# --- CUPS queues -------------------------------------------------------------
+
+
+def test_parse_lpstat_reads_queue_and_device():
+    output = (
+        "device for Buero_MFP: ipp://192.168.1.50:631/ipp/print\n"
+        "device for Lager: socket://192.168.1.51:9100\n"
+    )
+
+    found = parse_lpstat(output, server="cups.lan")
+
+    assert [(f.name, f.destination, f.server) for f in found] == [
+        ("Buero_MFP", "Buero_MFP", "cups.lan"),
+        ("Lager", "Lager", "cups.lan"),
+    ]
+    assert found[0].detail == "ipp://192.168.1.50:631/ipp/print"
+    assert found[0].ready_to_use is True
+
+
+def test_parse_lpstat_survives_a_localised_prefix():
+    """The wording of "device for" depends on the server's locale."""
+    found = parse_lpstat("Gerät für Flur: ipp://10.0.0.9/ipp/print\n")
+
+    assert [f.destination for f in found] == ["Flur"]
+
+
+@pytest.mark.parametrize("output", ["", "\n", "lpstat: keine Ziele\n"])
+def test_parse_lpstat_ignores_noise(output):
+    assert parse_lpstat(output) == [] or all(f.destination for f in parse_lpstat(output))
+
+
+def test_cups_queues_asks_the_named_server(monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        return subprocess.CompletedProcess(command, 0, "device for A: ipp://x/ipp/print\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    found = cups_queues("cups.lan:631", lpstat_binary="lpstat")
+
+    assert seen["command"] == ["lpstat", "-h", "cups.lan:631", "-v"]
+    assert [f.name for f in found] == ["A"]
+
+
+def test_cups_queues_without_a_server_queries_the_local_one(monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    cups_queues("")
+
+    assert "-h" not in seen["command"]
+
+
+def test_a_missing_lpstat_is_reported_usefully(monkeypatch):
+    def fake_run(command, **kwargs):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DiscoveryError, match="cups-client"):
+        cups_queues("")
+
+
+def test_an_unreachable_server_is_reported(monkeypatch):
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "lpstat: Server nicht erreichbar")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DiscoveryError, match="nicht erreichbar"):
+        cups_queues("cups.lan")
+
+
+def test_a_hanging_server_does_not_hang_the_page(monkeypatch):
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DiscoveryError, match="10s"):
+        cups_queues("cups.lan", timeout=10)
+
+
+# --- mDNS --------------------------------------------------------------------
+
+
+def _name(value: str) -> bytes:
+    return b"".join(bytes([len(p)]) + p.encode() for p in value.split(".")) + b"\x00"
+
+
+def _record(name: str, rtype: int, rdata: bytes) -> bytes:
+    return _name(name) + struct.pack(">HHIH", rtype, 1, 120, len(rdata)) + rdata
+
+
+def _txt(**values) -> bytes:
+    out = b""
+    for key, value in values.items():
+        chunk = f"{key}={value}".encode()
+        out += bytes([len(chunk)]) + chunk
+    return out
+
+
+def _response(instance="Kyocera M2540._ipp._tcp.local", host="drucker.local", port=631, **txt):
+    """A realistic mDNS answer: SRV + TXT + A, like a printer sends."""
+    srv = struct.pack(">HHH", 0, 0, port) + _name(host)
+    body = (
+        _record(instance, discovery.TYPE_SRV, srv)
+        + _record(instance, discovery.TYPE_TXT, _txt(**txt))
+        + _record(host, discovery.TYPE_A, socket.inet_aton("192.168.1.50"))
+    )
+    return struct.pack(">HHHHHH", 0, 0x8400, 0, 3, 0, 0) + body
+
+
+def test_parse_responses_builds_a_printer():
+    found = parse_responses([_response(ty="Kyocera ECOSYS M2540", rp="ipp/print")])
+
+    assert len(found) == 1
+    printer = found[0]
+    assert printer.name == "Kyocera ECOSYS M2540"
+    assert printer.destination == "ipp/print"
+    assert printer.server == "192.168.1.50"
+    assert printer.detail == "ipp://192.168.1.50:631/ipp/print"
+    assert printer.ready_to_use is False
+
+
+def test_a_non_standard_port_stays_in_the_server():
+    found = parse_responses([_response(port=6310, rp="ipp/print")])
+
+    assert found[0].server == "192.168.1.50:6310"
+
+
+def test_without_a_queue_in_the_txt_record_the_default_is_used():
+    found = parse_responses([_response(ty="Drucker")])
+
+    assert found[0].destination == "ipp/print"
+
+
+def test_the_instance_name_is_used_when_the_txt_record_has_no_model():
+    found = parse_responses([_response(instance="Flurdrucker._ipp._tcp.local")])
+
+    assert found[0].name == "Flurdrucker"
+
+
+def test_a_service_without_an_srv_record_is_skipped():
+    """TXT alone says nothing about where to reach the device."""
+    body = _record("X._ipp._tcp.local", discovery.TYPE_TXT, _txt(ty="X"))
+    packet = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0) + body
+
+    assert parse_responses([packet]) == []
+
+
+def test_compressed_names_are_followed():
+    """Responders compress repeated names - the parser has to expand them."""
+    header = struct.pack(">HHHHHH", 0, 0x8400, 0, 2, 0, 0)
+    # An SRV record with the full names, then a TXT record whose own name is a
+    # pointer back to the instance name in the first record (offset 12, right
+    # after the header) - exactly what a real responder sends.
+    srv = struct.pack(">HHH", 0, 0, 631) + _name("drucker.local")
+    first = _record("Drucker._ipp._tcp.local", discovery.TYPE_SRV, srv)
+    second = b"\xc0\x0c" + struct.pack(">HHIH", discovery.TYPE_TXT, 1, 120, 0)
+
+    found = parse_responses([header + first + second])
+
+    assert [f.server for f in found] == ["drucker.local"]
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [b"", b"\x00", b"\x00" * 11, b"\xff" * 40, struct.pack(">HHHHHH", 0, 0x8400, 0, 5, 0, 0)],
+)
+def test_broken_packets_are_ignored_instead_of_raising(packet):
+    """Anything can arrive on a multicast socket, including garbage."""
+    assert parse_responses([packet]) == []
+
+
+def test_a_name_pointer_loop_does_not_hang():
+    header = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0)
+    loop = b"\xc0\x0c"  # points at itself
+    assert parse_responses([header + loop + struct.pack(">HHIH", 33, 1, 120, 0)]) == []
+
+
+def test_mdns_returns_nothing_when_multicast_is_unavailable(monkeypatch):
+    """Bridged Docker networks have no multicast - that is not an error."""
+
+    def no_socket(*args, **kwargs):
+        raise OSError("Network is unreachable")
+
+    monkeypatch.setattr(socket, "socket", no_socket)
+
+    assert discovery.mdns_printers(timeout=0.1) == []
+
+
+# --- both together -----------------------------------------------------------
+
+
+def test_discover_merges_both_sources(monkeypatch):
+    monkeypatch.setattr(
+        discovery,
+        "cups_queues",
+        lambda *a, **k: [Found("A", "A", "cups.lan", "cups", "ipp://10.0.0.1/ipp/print")],
+    )
+    monkeypatch.setattr(
+        discovery,
+        "mdns_printers",
+        lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")],
+    )
+
+    found, problems = discover("cups.lan")
+
+    assert [f.name for f in found] == ["A", "B"]
+    assert problems == []
+
+
+def test_a_device_that_already_has_a_queue_is_not_listed_twice(monkeypatch):
+    uri = "ipp://10.0.0.1:631/ipp/print"
+    monkeypatch.setattr(
+        discovery, "cups_queues", lambda *a, **k: [Found("A", "A", "cups.lan", "cups", uri)]
+    )
+    monkeypatch.setattr(
+        discovery, "mdns_printers", lambda **k: [Found("A", "ipp/print", "10.0.0.1", "mdns", uri)]
+    )
+
+    found, _ = discover("cups.lan")
+
+    assert len(found) == 1
+
+
+def test_a_broken_cups_server_still_leaves_the_mdns_results(monkeypatch):
+    def boom(*args, **kwargs):
+        raise DiscoveryError("Server nicht erreichbar")
+
+    monkeypatch.setattr(discovery, "cups_queues", boom)
+    monkeypatch.setattr(
+        discovery, "mdns_printers", lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns")]
+    )
+
+    found, problems = discover("cups.lan")
+
+    assert [f.name for f in found] == ["B"]
+    assert any("nicht erreichbar" in problem for problem in problems)
+
+
+def test_finding_nothing_explains_why(monkeypatch):
+    monkeypatch.setattr(discovery, "cups_queues", lambda *a, **k: [])
+    monkeypatch.setattr(discovery, "mdns_printers", lambda **k: [])
+
+    found, problems = discover("")
+
+    assert found == []
+    assert any("Multicast" in problem for problem in problems)
+
+
+def test_the_lpadmin_hint_is_a_usable_command():
+    entry = Found("Kyocera M2540", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")
+
+    command = entry.lpadmin_command()
+
+    assert command.startswith("lpadmin -p Kyocera_M2540 -v ipp://10.0.0.2:631/ipp/print")
+    assert " -m everywhere" in command
 MAIL2NAS_EOF
 
 # --- tests/test_main.py ---

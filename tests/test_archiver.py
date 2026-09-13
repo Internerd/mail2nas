@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import email
 import textwrap
 from email.message import EmailMessage
 
-from mail2nas.archiver import Archiver
+from mail2nas.addresses import AddressStore
+from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
 from mail2nas.config import (
     DEFAULT_BLOCKED_EXTENSIONS,
     DEFAULT_PRINTABLE_EXTENSIONS,
@@ -70,6 +72,7 @@ def _make_config(tmp_path, **overrides) -> Config:
         dry_run=False,
         printing_enabled=True,
         lp_binary="lp",
+        lpstat_binary="lpstat",
         print_timeout=120,
         printable_extensions=frozenset(
             e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
@@ -98,6 +101,7 @@ def _make_archiver(
     mapping_content: str | None = None,
     account: Account | None = None,
     printing=None,
+    addresses=None,
     **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
@@ -107,7 +111,9 @@ def _make_archiver(
     storage = LocalStorage(config.storage_root)
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store, storage, account or TEST_ACCOUNT, printing)
+    return Archiver(
+        config, mapping, store, storage, account or TEST_ACCOUNT, printing, addresses
+    )
 
 
 class FakeIMAPClient:
@@ -607,3 +613,304 @@ def test_a_failing_printer_does_not_stop_the_archiving(tmp_path):
     archiver._process_message(FakeIMAPClient(uid=9, raw=raw), 9)
 
     assert any((tmp_path / "rechnungen").glob("*"))
+
+
+# --- printing by the address a mail was sent to ------------------------------
+
+
+def _addressed_message(
+    to: str = "drucker@firma.de",
+    sender: str = "kollege@firma.de",
+    subject: str = "Bitte drucken",
+    filename: str = "vertrag.pdf",
+    extra_headers: dict | None = None,
+) -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to
+    for header, value in (extra_headers or {}).items():
+        msg[header] = value
+    msg.set_content("Anbei.")
+    msg.add_attachment(b"DATA", maintype="application", subtype="pdf", filename=filename)
+    return bytes(msg)
+
+
+def _addresses(tmp_path, **fields) -> AddressStore:
+    """An address store holding one rule, with print-to-a-queue defaults."""
+    store = AddressStore(str(tmp_path / "addresses.db"))
+    values = dict(name="Drucker Buero", recipient="drucker@firma.de", print_attachments=True)
+    values.update(fields)
+    store.add(**values)
+    return store
+
+
+def test_recipients_are_read_from_the_delivery_headers():
+    """An alias only survives in Delivered-To once To: has been rewritten."""
+    raw = _addressed_message(
+        to="liste@firma.de", extra_headers={"Delivered-To": "drucker@firma.de", "Cc": "chef@firma.de"}
+    )
+
+    found = recipients_of(email.message_from_bytes(raw))
+
+    assert "drucker@firma.de" in found
+    assert "liste@firma.de" in found
+    assert "chef@firma.de" in found
+
+
+def test_recipient_extraction_is_bounded(tmp_path):
+    """A mail with thousands of recipients must not make matching expensive."""
+    msg = EmailMessage()
+    msg["Subject"] = "Massenmail"
+    msg["From"] = "a@b.c"
+    msg["To"] = ", ".join(f"user{i}@firma.de" for i in range(200))
+    msg.set_content("x")
+
+    assert len(recipients_of(msg)) == MAX_RECIPIENTS
+
+
+def test_mail_to_the_configured_address_is_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_addressed_message()), 1)
+
+    assert spooler.printed_on == ["buero_eg"]
+
+
+def test_mail_to_another_address_is_not_printed(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=2, raw=_addressed_message(to="archiv@firma.de")), 2
+    )
+
+    assert spooler.printed_on == []
+
+
+def test_an_alias_in_delivered_to_is_enough(tmp_path):
+    """The usual setup: the alias is delivered into a shared mailbox."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id),
+    )
+    raw = _addressed_message(
+        to="archiv@firma.de", extra_headers={"Delivered-To": "drucker@firma.de"}
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=raw), 3)
+
+    assert spooler.printed_on == ["buero_eg"]
+
+
+def test_a_sender_restriction_keeps_strangers_from_printing(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, sender="@firma.de"),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=4, raw=_addressed_message(sender="fremder@example.com")), 4
+    )
+
+    assert spooler.printed_on == []
+
+
+def test_the_address_decides_the_folder(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=_addresses(tmp_path, print_attachments=False, folder="ausdrucke"),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=5, raw=_addressed_message(filename="Vertrag_7.pdf")), 5
+    )
+
+    assert any((tmp_path / "ausdrucke").glob("*"))
+    assert not (tmp_path / "vertraege").exists()
+
+
+def test_without_a_folder_the_keyword_rules_still_decide(tmp_path):
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=_addresses(tmp_path, print_attachments=False),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=6, raw=_addressed_message(filename="Vertrag_7.pdf")), 6
+    )
+
+    assert any((tmp_path / "vertraege").glob("*"))
+
+
+def test_an_address_can_print_without_filing(tmp_path):
+    """A print-only alias: paper comes out, the share stays clean."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, archive_attachments=False),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=7, raw=_addressed_message()), 7)
+
+    assert spooler.printed_on == ["buero_eg"]
+    assert not any(tmp_path.glob("unsorted/*"))
+
+
+def test_an_address_can_file_without_printing(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+        addresses=_addresses(tmp_path, print_attachments=False, folder="nur_ablage"),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=8, raw=_addressed_message()), 8)
+
+    # The address is the more specific statement, so it wins over the mailbox.
+    assert spooler.printed_on == []
+    assert any((tmp_path / "nur_ablage").glob("*"))
+
+
+def test_the_address_printer_beats_the_rule_and_the_mailbox(tmp_path):
+    printing, spooler, (address_printer, rule_printer, mailbox_printer) = _make_printing(
+        tmp_path, "per_adresse", "per_regel", "per_postfach"
+    )
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: Vertrag
+                folder: vertraege
+                print: true
+                printer: "{rule_printer}"
+        """,
+        account=_account(print_attachments=True, printer=mailbox_printer),
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=address_printer),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=9, raw=_addressed_message(filename="Vertrag_7.pdf")), 9
+    )
+
+    assert spooler.printed_on == ["per_adresse"]
+
+
+def test_an_address_without_its_own_printer_falls_back_to_the_mailbox(tmp_path):
+    printing, spooler, (mailbox_printer,) = _make_printing(tmp_path, "per_postfach")
+    archiver = _make_archiver(
+        tmp_path,
+        account=_account(printer=mailbox_printer),
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=""),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=10, raw=_addressed_message()), 10)
+
+    assert spooler.printed_on == ["per_postfach"]
+
+
+def test_a_blocked_attachment_is_never_printed_even_for_an_address(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer=printer_id, archive_attachments=False),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=11, raw=_addressed_message(filename="rechnung.exe")), 11
+    )
+
+    assert spooler.printed_on == []
+    # ... and it is filed despite "print only", so it can be looked at
+    assert any((tmp_path / "quarantaene").glob("*"))
+
+
+def test_a_printer_that_is_gone_does_not_stop_the_filing(tmp_path):
+    printing, spooler, _ = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(
+        tmp_path,
+        printing=printing,
+        addresses=_addresses(tmp_path, printer="999"),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=12, raw=_addressed_message()), 12)
+
+    assert spooler.printed_on == []
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_without_address_rules_nothing_changes(tmp_path):
+    """The feature is opt-in: an install with no rules behaves as before."""
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "buero_eg")
+    archiver = _make_archiver(tmp_path, printing=printing, addresses=None)
+
+    archiver._process_message(FakeIMAPClient(uid=13, raw=_addressed_message()), 13)
+
+    assert spooler.printed_on == []
+    assert any((tmp_path / "unsorted").glob("*"))
+
+
+def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
+    """The whole chain with no stub in the middle: message in, `lp` called.
+
+    Everything else here fakes the spooler, which is what makes this worth
+    having: it is the only test that proves the address rule, the printer
+    record and the real `lp` argument building fit together.
+    """
+    fake_lp = tmp_path / "lp"
+    log = tmp_path / "lp.log"
+    fake_lp.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> {log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_lp.chmod(0o755)
+
+    printers = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = printers.add(
+        name="Buero", destination="Buero_MFP", server="cups.lan:631", options="media=A4"
+    )
+    config = _make_config(tmp_path, lp_binary=str(fake_lp))
+    printing = PrintService(printers, Spooler(lp_binary=str(fake_lp), timeout=30))
+
+    storage = LocalStorage(config.storage_root)
+    archiver = Archiver(
+        config,
+        Mapping(storage, config.mapping_path, config.fallback_folder),
+        ProcessedStore(config.state_db_path),
+        storage,
+        TEST_ACCOUNT,
+        printing,
+        _addresses(tmp_path, printer=str(printer_id)),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_addressed_message()), 1)
+
+    called = log.read_text(encoding="utf-8")
+    assert "-h cups.lan:631" in called
+    assert "-d Buero_MFP" in called
+    assert "-o media=A4" in called
+    # and the document is on the share as well
+    assert any((tmp_path / "unsorted").glob("*"))

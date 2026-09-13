@@ -35,8 +35,10 @@ EMBEDDED_FILES = (
     "config/mapping.example.yaml",
     "mail2nas/config.py",
     "mail2nas/accounts.py",
+    "mail2nas/addresses.py",
     "mail2nas/printers.py",
     "mail2nas/printing.py",
+    "mail2nas/discovery.py",
     "mail2nas/runtime.py",
     "mail2nas/storage.py",
     "mail2nas/mapping.py",
@@ -52,8 +54,10 @@ EMBEDDED_FILES = (
     "tests/test_storage.py",
     "tests/test_web.py",
     "tests/test_accounts.py",
+    "tests/test_addresses.py",
     "tests/test_printers.py",
     "tests/test_printing.py",
+    "tests/test_discovery.py",
     "tests/test_main.py",
 )
 

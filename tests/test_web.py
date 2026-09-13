@@ -5,6 +5,7 @@ import re
 import pytest
 
 from mail2nas.accounts import AccountStore
+from mail2nas.addresses import AddressStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import from_config as printing_from_config
@@ -40,6 +41,7 @@ def env(tmp_path):
         accounts,
         printers=printers,
         printing=printing_from_config(config, printers),
+        addresses=AddressStore(config.state_db_path),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -831,3 +833,218 @@ def test_without_a_printer_the_print_controls_stay_hidden(client, env):
     html = client.get("/mapping").get_data(as_text=True)
 
     assert "nicht drucken" not in html
+
+
+# --- delivery addresses ------------------------------------------------------
+
+
+def _add_address(runtime, **fields) -> int:
+    values = dict(
+        name="Drucker Buero",
+        recipient="drucker@firma.de",
+        print_attachments=True,
+        archive_attachments=True,
+    )
+    values.update(fields)
+    return runtime.addresses.add(**values)
+
+
+@pytest.mark.parametrize("path", ["/config/addresses/new", "/config/addresses/1"])
+def test_address_pages_require_login(client, path):
+    response = client.get(path)
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_config_page_lists_the_addresses(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _add_address(runtime, printer=str(printer_id), folder="ausdrucke")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "drucker@firma.de" in html
+    assert "ausdrucke" in html
+    # the printer is named by its label, not by its bare id
+    assert "Buero EG" in html
+
+
+def test_creating_an_address_through_the_form(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    _login(client)
+
+    client.post("/config/addresses/new", data={
+        "name": "Drucker Buero", "recipient": "drucker@firma.de", "sender": "@firma.de",
+        "print_attachments": "1", "printer": str(printer_id),
+        "archive_attachments": "1", "folder": "ausdrucke", "enabled": "1",
+        "csrf_token": _csrf(client, "/config/addresses/new")})
+
+    rules = runtime.addresses.all()
+    assert [(r.recipient, r.sender, r.printer, r.folder) for r in rules] == [
+        ("drucker@firma.de", "@firma.de", str(printer_id), "ausdrucke")
+    ]
+
+
+def test_an_address_without_an_at_sign_is_rejected_with_a_message(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Kaputt", "recipient": "kein-at-zeichen", "print_attachments": "1",
+        "archive_attachments": "1", "csrf_token": _csrf(client, "/config/addresses/new")},
+        follow_redirects=True)
+
+    assert "@" in response.get_data(as_text=True)
+    assert runtime.addresses.all() == []
+
+
+def test_an_address_that_neither_prints_nor_files_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Weg damit", "recipient": "drucker@firma.de",
+        "csrf_token": _csrf(client, "/config/addresses/new")}, follow_redirects=True)
+
+    assert "verworfen" in response.get_data(as_text=True)
+    assert runtime.addresses.all() == []
+
+
+def test_editing_an_address(client, env):
+    _, _, _, _, runtime = env
+    address_id = _add_address(runtime)
+    _login(client)
+
+    client.post(f"/config/addresses/{address_id}", data={
+        "name": "Drucker OG", "recipient": "drucker-og@firma.de", "sender": "",
+        "print_attachments": "1", "printer": "", "archive_attachments": "1",
+        "folder": "", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/addresses/{address_id}")})
+
+    rule = runtime.addresses.get(address_id)
+    assert (rule.name, rule.recipient, rule.enabled) == ("Drucker OG", "drucker-og@firma.de", False)
+
+
+def test_deleting_an_address(client, env):
+    _, _, _, _, runtime = env
+    address_id = _add_address(runtime)
+    _login(client)
+
+    client.post(f"/config/addresses/{address_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.addresses.all() == []
+
+
+def test_opening_a_deleted_address_does_not_500(client, env):
+    _login(client)
+
+    response = client.get("/config/addresses/999", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert "gibt es nicht mehr" in response.get_data(as_text=True)
+
+
+def test_deleting_a_printer_unpins_the_addresses_using_it(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    address_id = _add_address(runtime, printer=str(printer_id))
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete",
+                data={"csrf_token": _csrf(client, "/config")})
+
+    assert runtime.addresses.get(address_id).printer == ""
+
+
+def test_changes_to_addresses_need_a_csrf_token(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/addresses/new", data={
+        "name": "Ohne Token", "recipient": "drucker@firma.de", "print_attachments": "1"})
+
+    assert response.status_code == 400
+    assert runtime.addresses.all() == []
+
+
+# --- finding printers on the network -----------------------------------------
+
+
+def test_the_discovery_page_needs_login(client):
+    response = client.get("/config/printers/discover")
+
+    assert response.status_code == 302
+
+
+def test_the_discovery_page_offers_the_configured_cups_server(client, env):
+    _, _, _, _, runtime = env
+    _add_printer(runtime, server="cups.lan:631")
+    _login(client)
+
+    html = client.get("/config/printers/discover").get_data(as_text=True)
+
+    assert 'value="cups.lan:631"' in html
+
+
+def test_searching_lists_what_was_found(client, env, monkeypatch):
+    from mail2nas import web as web_module
+    from mail2nas.discovery import Found
+
+    monkeypatch.setattr(
+        web_module,
+        "discover",
+        lambda server, **kwargs: (
+            [
+                Found("Buero_MFP", "Buero_MFP", "cups.lan", "cups", "ipp://10.0.0.5/ipp/print"),
+                Found("Kyocera M2540", "ipp/print", "10.0.0.6", "mdns", "ipp://10.0.0.6/ipp/print"),
+            ],
+            [],
+        ),
+    )
+    _login(client)
+
+    html = client.post(
+        "/config/printers/discover",
+        data={"server": "cups.lan", "csrf_token": _csrf(client, "/config/printers/discover")},
+    ).get_data(as_text=True)
+
+    assert "Buero_MFP" in html
+    assert "Kyocera M2540" in html
+    # the device without a queue comes with the command that creates one
+    assert "lpadmin -p Kyocera_M2540" in html
+
+
+def test_a_failing_search_reports_instead_of_crashing(client, env, monkeypatch):
+    from mail2nas import web as web_module
+
+    def boom(*args, **kwargs):
+        raise OSError("kaputt")
+
+    monkeypatch.setattr(web_module, "discover", boom)
+    _login(client)
+
+    response = client.post(
+        "/config/printers/discover",
+        data={"csrf_token": _csrf(client, "/config/printers/discover")},
+    )
+
+    assert response.status_code == 200
+    assert "kaputt" in response.get_data(as_text=True)
+
+
+def test_taking_over_a_found_printer_prefills_the_form(client, env):
+    _login(client)
+
+    html = client.get(
+        "/config/printers/new?name=Kyocera&destination=ipp%2Fprint&server=10.0.0.6"
+    ).get_data(as_text=True)
+
+    assert 'value="Kyocera"' in html
+    assert 'value="ipp/print"' in html
+    assert 'value="10.0.0.6"' in html
+    # nothing is stored yet, so there is nothing to test-print or delete
+    assert "Testseite drucken" not in html

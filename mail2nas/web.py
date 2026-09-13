@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import timedelta
 from functools import wraps
+from types import SimpleNamespace
 
 from flask import (
     Flask,
@@ -46,6 +47,8 @@ from .mapping import (
     validate_folder,
     validate_keyword,
 )
+from .addresses import AddressError
+from .discovery import discover
 from .printers import PrinterError
 from .printing import PrintError
 
@@ -418,8 +421,49 @@ CONFIG_BODY = """
   {% else %}
   <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
   {% endif %}
-  <p style="margin-bottom:0"><a href="{{ url_for('new_printer') }}">
-    <button type="button">Drucker hinzufuegen</button></a></p>
+  <p style="margin-bottom:0">
+    <a href="{{ url_for('new_printer') }}">
+      <button type="button">Drucker hinzufuegen</button></a>
+    <a href="{{ url_for('discover_printers') }}">
+      <button class="secondary" type="button">Im Netzwerk suchen</button></a>
+  </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Zustelladressen</h2>
+  {% if address_rules %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Empfaenger</th><th>Absender</th><th>Drucken</th><th>Ablegen</th>
+      <th>Status</th><th></th></tr>
+    {% for entry in address_rules %}
+    <tr>
+      <td class="keyword">{{ entry.name }}</td>
+      <td>{{ entry.recipient or 'alle' }}</td>
+      <td>{{ entry.sender or 'alle' }}</td>
+      <td>{% if entry.print_attachments %}ja{% if entry.printer_label %}
+        <span class="hint">&middot; {{ entry.printer_label }}</span>{% endif %}
+        {% else %}nein{% endif %}</td>
+      <td>{% if entry.archive_attachments %}ja{% if entry.folder %}
+        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}
+        {% else %}nein{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_address', address_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Die erste passende Zustelladresse gewinnt. Sie entscheidet ueber
+  Drucken und Ablegen; die Stichwort-Zuordnungen bestimmen dann nur noch den
+  Zielordner, falls hier keiner steht.</p>
+  {% else %}
+  <p class="hint">Keine Zustelladresse angelegt. Damit wird nur nach Stichwoertern
+  sortiert und nur gedruckt, was ein Postfach oder eine Zuordnung verlangt.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_address') }}">
+    <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
 <div class="card">
@@ -628,7 +672,7 @@ PRINTER_BODY = """
   Leerzeichen getrennt.</p>
 </div>
 
-{% if printer %}
+{% if printer and printer.id %}
 <div class="card">
   <h2 style="margin-top:0">Testdruck</h2>
   <form method="post" action="{{ url_for('test_printer', printer_id=printer.id) }}">
@@ -648,6 +692,148 @@ PRINTER_BODY = """
     <p class="hint">Postfaecher und Zuordnungen, die auf ihn zeigen, drucken danach
     nicht mehr - das steht dann im Log.</p>
   </form>
+</div>
+{% endif %}
+"""
+
+ADDRESS_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Zustelladresse bearbeiten' if entry else 'Zustelladresse hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ entry.name if entry else '' }}"
+               placeholder="z. B. Drucker Buero">
+      </div>
+      <div class="field">
+        <label for="recipient">Empfaengeradresse</label>
+        <input id="recipient" name="recipient" type="text"
+               value="{{ entry.recipient if entry else '' }}"
+               placeholder="drucker@firma.de, @firma.de oder drucker-*@firma.de">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="sender">Nur von diesem Absender (optional)</label>
+        <input id="sender" name="sender" type="text" value="{{ entry.sender if entry else '' }}"
+               placeholder="leer = von jedem; sonst z. B. @firma.de">
+      </div>
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="print_attachments" value="1"
+        {% if not entry or entry.print_attachments %}checked{% endif %}>
+        Anhaenge drucken</label>
+    </p>
+    <div class="field">
+      <label for="printer">Drucker</label>
+      <select id="printer" name="printer">
+        <option value="">Drucker des Postfachs</option>
+        {% for printer in printers %}
+        <option value="{{ printer.key }}"
+          {% if entry and entry.printer == printer.key %}selected{% endif %}>
+          {{ printer.label() }}</option>
+        {% endfor %}
+        {% if entry and entry.printer and entry.printer not in printer_keys %}
+        <option value="{{ entry.printer }}" selected>(geloeschter Drucker)</option>
+        {% endif %}
+      </select>
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="archive_attachments" value="1"
+        {% if not entry or entry.archive_attachments %}checked{% endif %}>
+        Anhaenge per SMB ablegen</label>
+    </p>
+    <div class="field">
+      <label for="folder">Zielordner (optional)</label>
+      <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
+             placeholder="leer = nach Stichwort-Zuordnungen">
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not entry or entry.enabled %}checked{% endif %}> Aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Gepruefte Kopfzeilen sind Delivered-To, X-Original-To, Envelope-To,
+  To und Cc - ein Alias, das in dieses Postfach zugestellt wird, wird also auch
+  dann erkannt, wenn im To: etwas anderes steht. Sind Empfaenger- und
+  Absenderadresse gesetzt, muessen beide passen; der Absender wirkt dann als
+  Schutz davor, dass Fremde ueber die Adresse drucken koennen.</p>
+</div>
+
+{% if entry %}
+<div class="card">
+  <h2 style="margin-top:0">Zustelladresse loeschen</h2>
+  <form method="post" action="{{ url_for('delete_address', address_id=entry.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diese Zustelladresse loeschen</button>
+    <p class="hint">Mail an diese Adresse wird danach wieder wie jede andere
+    behandelt.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+DISCOVERY_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Drucker im Netzwerk suchen</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="server">CUPS-Server abfragen (optional)</label>
+        <input id="server" name="server" type="text" value="{{ server }}"
+               placeholder="z. B. cups.lan:631 - leer = lokaler cupsd">
+      </div>
+      <button type="submit">Suchen</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
+    </div>
+    <p class="hint" style="margin-bottom:0">Gefragt werden die Warteschlangen des
+    CUPS-Servers und - per mDNS - Geraete, die sich im Netz selbst ankuendigen.</p>
+  </form>
+</div>
+
+{% if searched %}
+<div class="card">
+  <h2 style="margin-top:0">Gefunden</h2>
+  {% if found %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Warteschlange</th><th>Server</th><th>Quelle</th><th></th></tr>
+    {% for item in found %}
+    <tr>
+      <td class="keyword">{{ item.name }}</td>
+      <td>{{ item.destination }}<br><span class="hint">{{ item.detail }}</span></td>
+      <td>{{ item.server or 'lokal' }}</td>
+      <td>{% if item.ready_to_use %}CUPS-Warteschlange{% else %}im Netz gefunden{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('new_printer', name=item.name, destination=item.destination,
+                            server=item.server) }}">Uebernehmen</a>
+      </td>
+    </tr>
+    {% if not item.ready_to_use %}
+    <tr><td colspan="5" class="hint">Noch keine Warteschlange. Zuverlaessig wird daraus
+      eine mit:<br><code>{{ item.lpadmin_command() }}</code></td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">„Uebernehmen" fuellt das Drucker-Formular vor. Danach einmal die
+  Testseite drucken - das ist der schnellste Weg zu wissen, ob der Weg stimmt.</p>
+  {% else %}
+  <p class="hint">Nichts gefunden.</p>
+  {% endif %}
+  {% for problem in problems %}
+  <p class="hint">{{ problem }}</p>
+  {% endfor %}
 </div>
 {% endif %}
 """
@@ -981,6 +1167,7 @@ def create_app(runtime) -> Flask:
             "Konfiguration",
             accounts=runtime.accounts.all(),
             printers=_printers(),
+            address_rules=_address_rules(),
             printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
             storage_description=storage.description,
@@ -1102,6 +1289,96 @@ def create_app(runtime) -> Flask:
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
 
+    # --- delivery addresses -------------------------------------------------
+
+    def _require_addresses():
+        """The address pages only exist when there is a store behind them."""
+        if runtime.addresses is None:
+            abort(404)
+        return runtime.addresses
+
+    def _address_rules() -> list:
+        """The rules plus the label of the printer each one names, for the list."""
+        if runtime.addresses is None:
+            return []
+        labels = {printer.key: printer.label() for printer in _printers()}
+        rules = []
+        for rule in runtime.addresses.all():
+            rules.append(
+                SimpleNamespace(
+                    id=rule.id,
+                    name=rule.name,
+                    recipient=rule.recipient,
+                    sender=rule.sender,
+                    print_attachments=rule.print_attachments,
+                    printer=rule.printer,
+                    printer_label=labels.get(rule.printer, ""),
+                    archive_attachments=rule.archive_attachments,
+                    folder=rule.folder,
+                    enabled=rule.enabled,
+                )
+            )
+        return rules
+
+    def _address_form() -> dict:
+        return {
+            "name": request.form.get("name", ""),
+            "recipient": request.form.get("recipient", ""),
+            "sender": request.form.get("sender", ""),
+            "print_attachments": bool(request.form.get("print_attachments")),
+            "printer": request.form.get("printer", ""),
+            "archive_attachments": bool(request.form.get("archive_attachments")),
+            "folder": request.form.get("folder", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/addresses/new", methods=["GET", "POST"])
+    @login_required
+    def new_address():
+        addresses = _require_addresses()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                addresses.add(**_address_form())
+            except AddressError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added address rule %r", request.form.get("recipient"))
+                flash("Zustelladresse angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context())
+
+    @app.route("/config/addresses/<int:address_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_address(address_id: int):
+        addresses = _require_addresses()
+        entry = addresses.get(address_id)
+        if entry is None:
+            flash("Diese Zustelladresse gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                addresses.update(address_id, **_address_form())
+            except AddressError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated address rule %s", address_id)
+                flash("Zustelladresse gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            entry = addresses.get(address_id)
+        return render(ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context())
+
+    @app.post("/config/addresses/<int:address_id>/delete")
+    @login_required
+    def delete_address(address_id: int):
+        require_csrf()
+        _require_addresses().delete(address_id)
+        logger.info("Web UI: deleted address rule %s", address_id)
+        flash("Zustelladresse geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
     # --- printers ---------------------------------------------------------
 
     def _printer_context() -> dict:
@@ -1138,7 +1415,20 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added printer %r", request.form.get("destination"))
                 flash("Drucker angelegt. Ein Testdruck zeigt, ob er erreichbar ist.", "ok")
                 return redirect(url_for("config_page"))
-        return render(PRINTER_BODY, "Drucker", printer=None)
+        # A "Uebernehmen" link from the discovery page arrives as query
+        # parameters; they only prefill the form, nothing is saved yet.
+        suggestion = None
+        if request.args.get("destination"):
+            suggestion = SimpleNamespace(
+                name=request.args.get("name", ""),
+                destination=request.args.get("destination", ""),
+                server=request.args.get("server", ""),
+                options="",
+                copies=1,
+                enabled=True,
+                id=None,
+            )
+        return render(PRINTER_BODY, "Drucker", printer=suggestion)
 
     @app.route("/config/printers/<int:printer_id>", methods=["GET", "POST"])
     @login_required
@@ -1182,15 +1472,51 @@ def create_app(runtime) -> Flask:
             flash("Testseite an die Warteschlange uebergeben.", "ok")
         return redirect(url_for("edit_printer", printer_id=printer_id))
 
+    @app.route("/config/printers/discover", methods=["GET", "POST"])
+    @login_required
+    def discover_printers():
+        _require_printers()
+        # Default to the server the printers already use: on a NAS box that is
+        # usually the one CUPS runs on, and typing it again is pointless.
+        configured = next((p.server for p in _printers() if p.server), "")
+        server = request.form.get("server", configured).strip()
+        found: list = []
+        problems: list[str] = []
+        searched = request.method == "POST"
+        if searched:
+            require_csrf()
+            try:
+                found, problems = discover(server, lpstat_binary=config.lpstat_binary)
+            except Exception as exc:  # noqa: BLE001 - the page reports, never 500s
+                logger.exception("Web UI: printer discovery failed")
+                problems = [f"Suche fehlgeschlagen: {exc}"]
+        return render(
+            DISCOVERY_BODY,
+            "Drucker suchen",
+            server=server,
+            found=found,
+            problems=problems,
+            searched=searched,
+        )
+
     @app.post("/config/printers/<int:printer_id>/delete")
     @login_required
     def delete_printer(printer_id: int):
         require_csrf()
         _require_printers().delete(printer_id)
+        # An address rule pointing at a deleted queue would keep asking for a
+        # printer that no longer exists; blank it so it falls back to the
+        # mailbox printer instead of silently printing nothing.
+        unpinned = runtime.addresses.clear_printer(str(printer_id)) if runtime.addresses else 0
         logger.info("Web UI: deleted printer %s", printer_id)
         flash(
             "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "
-            "drucken nicht mehr.",
+            "drucken nicht mehr."
+            + (
+                f" {unpinned} Zustelladresse(n) nutzen jetzt den Drucker des Postfachs."
+                if unpinned
+                else ""
+            ),
             "ok",
         )
         return redirect(url_for("config_page"))

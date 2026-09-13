@@ -8,6 +8,7 @@ import threading
 from . import printing as printing_module
 from . import storage as storage_module
 from .accounts import AccountStore, seed_from_config
+from .addresses import AddressStore
 from .archiver import Archiver
 from .config import Config
 from .mapping import Mapping
@@ -46,12 +47,21 @@ def main() -> None:
     printers = PrinterStore(config.state_db_path)
     seed_printer_from_config(printers, settings, config)
     printing = printing_module.from_config(config, printers)
+    addresses = AddressStore(config.state_db_path)
 
     mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
     mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     runtime = Runtime(
-        config, storage, mapping, store, settings, accounts, printers=printers, printing=printing
+        config,
+        storage,
+        mapping,
+        store,
+        settings,
+        accounts,
+        printers=printers,
+        printing=printing,
+        addresses=addresses,
     )
 
     if config.web_enabled:
@@ -62,11 +72,12 @@ def main() -> None:
         web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d dry_run=%s",
+        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d addresses=%d dry_run=%s",
         storage.description,
         config.storage_backend,
         mapping_path,
         len(printers.enabled()) if config.printing_enabled else 0,
+        len(addresses.enabled()),
         config.dry_run,
     )
 
@@ -120,6 +131,7 @@ class _Worker:
             self._runtime.storage,
             self.account,
             self._runtime.printing,
+            self._runtime.addresses,
         )
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(

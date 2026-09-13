@@ -22,7 +22,16 @@ class Runtime:
     """Shared handles, plus the mapping-file location that can move."""
 
     def __init__(
-        self, config, storage, mapping, store, settings, accounts, printers=None, printing=None
+        self,
+        config,
+        storage,
+        mapping,
+        store,
+        settings,
+        accounts,
+        printers=None,
+        printing=None,
+        addresses=None,
     ):
         self.config = config
         self.storage = storage
@@ -34,6 +43,7 @@ class Runtime:
         # the archiver before printers existed) can leave them out.
         self.printers = printers
         self.printing = printing
+        self.addresses = addresses
         # Set by the web UI, consumed by the supervisor loop: the archiver
         # threads must not read a half-changed path.
         self.mapping_path_changed = threading.Event()
