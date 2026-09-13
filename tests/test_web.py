@@ -6,6 +6,8 @@ import pytest
 
 from mail2nas.accounts import AccountStore
 from mail2nas.addresses import AddressStore
+from mail2nas.archives import ArchiveStore
+from mail2nas.pickups import PickupStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import from_config as printing_from_config
@@ -42,6 +44,8 @@ def env(tmp_path):
         printers=printers,
         printing=printing_from_config(config, printers),
         addresses=AddressStore(config.state_db_path),
+        archives=ArchiveStore(config.state_db_path),
+        pickups=PickupStore(config.state_db_path),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -1048,3 +1052,263 @@ def test_taking_over_a_found_printer_prefills_the_form(client, env):
     assert 'value="10.0.0.6"' in html
     # nothing is stored yet, so there is nothing to test-print or delete
     assert "Testseite drucken" not in html
+
+
+# --- archives -----------------------------------------------------------------
+
+
+def _add_archive(runtime, **fields) -> int:
+    values = dict(name="NAS 2", backend="local", path="/mnt/nas2")
+    values.update(fields)
+    return runtime.archives.add(**values)
+
+
+@pytest.mark.parametrize("path", ["/config/archives/new", "/config/archives/1"])
+def test_archive_pages_require_login(client, path):
+    assert client.get(path).status_code == 302
+
+
+def test_config_page_lists_the_archives(client, env):
+    _, _, _, _, runtime = env
+    _add_archive(runtime, name="NAS Buero", backend="smb", host="nas.lan", share="Belege",
+                 user="u", password="p")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "NAS Buero" in html
+    assert "//nas.lan/Belege" in html
+
+
+def test_creating_an_archive_through_the_form(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/archives/new", data={
+        "name": "NAS 2", "backend": "local", "path": str(tmp_path / "zwei"), "enabled": "1",
+        "csrf_token": _csrf(client, "/config/archives/new")})
+
+    assert [(a.name, a.path) for a in runtime.archives.all()] == [("NAS 2", str(tmp_path / "zwei"))]
+
+
+def test_an_smb_archive_without_credentials_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/archives/new", data={
+        "name": "Kaputt", "backend": "smb", "host": "nas.lan", "share": "Belege",
+        "csrf_token": _csrf(client, "/config/archives/new")}, follow_redirects=True)
+
+    assert "Benutzer" in response.get_data(as_text=True)
+    assert runtime.archives.all() == []
+
+
+def test_editing_an_archive_keeps_the_password_when_left_empty(client, env):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime, backend="smb", host="nas.lan", share="Belege",
+                              user="u", password="geheim", path="")
+    _login(client)
+
+    client.post(f"/config/archives/{archive_id}", data={
+        "name": "NAS umbenannt", "backend": "smb", "host": "nas.lan", "share": "Belege",
+        "user": "u", "password": "", "port": "445", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/archives/{archive_id}")})
+
+    archive = runtime.archives.get(archive_id)
+    assert (archive.name, archive.password) == ("NAS umbenannt", "geheim")
+
+
+def test_testing_an_archive_reports_success(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    target = tmp_path / "erreichbar"
+    target.mkdir()
+    archive_id = _add_archive(runtime, path=str(target))
+    _login(client)
+
+    response = client.post(f"/config/archives/{archive_id}/test", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "erreichbar und beschreibbar" in response.get_data(as_text=True)
+
+
+def test_testing_an_unreachable_archive_reports_the_reason(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime, path=str(tmp_path / "nicht-gemountet"))
+    _login(client)
+
+    response = client.post(f"/config/archives/{archive_id}/test", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "Nicht erreichbar" in response.get_data(as_text=True)
+
+
+def test_the_last_archive_cannot_be_deleted(client, env):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime)
+    _login(client)
+
+    client.post(f"/config/archives/{archive_id}/delete", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert len(runtime.archives.all()) == 1
+
+
+def test_deleting_an_archive(client, env):
+    _, _, _, _, runtime = env
+    _add_archive(runtime, name="Haupt")
+    second = _add_archive(runtime, name="NAS 2")
+    _login(client)
+
+    client.post(f"/config/archives/{second}/delete", data={"csrf_token": _csrf(client, "/config")})
+
+    assert [a.name for a in runtime.archives.all()] == ["Haupt"]
+
+
+def test_a_rule_can_name_an_archive(client, env, tmp_path):
+    _, storage, _, config, runtime = env
+    _add_archive(runtime, name="Haupt", path=str(tmp_path))
+    second = _add_archive(runtime, name="NAS 2", path=str(tmp_path / "zwei"))
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Vertrag", "folder": "", "new_folder": "vertraege", "archive": str(second),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rules = load_rules(runtime.storage, config.mapping_path)
+    assert [(r.keyword, r.archive) for r in rules] == [("Vertrag", str(second))]
+
+
+def test_a_rule_cannot_name_an_archive_that_does_not_exist(client, env, config=None):
+    _, storage, _, config, runtime = env
+    _add_archive(runtime)
+    _login(client)
+
+    response = client.post("/mapping/add", data={
+        "keyword": "Vertrag", "folder": "", "new_folder": "vertraege", "archive": "999",
+        "csrf_token": _csrf(client, "/mapping")}, follow_redirects=True)
+
+    assert "Archiv" in response.get_data(as_text=True)
+    assert load_rules(runtime.storage, config.mapping_path) == []
+
+
+# --- pickup folders ------------------------------------------------------------
+
+
+def test_creating_a_pickup_folder(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/pickups/new", data={
+        "name": "Kopierer Flur", "folder": "scans/flur", "target_folder": "eingang",
+        "enabled": "1", "csrf_token": _csrf(client, "/config/pickups/new")})
+
+    pickups = runtime.pickups.all()
+    assert [(p.name, p.folder, p.target_folder) for p in pickups] == [
+        ("Kopierer Flur", "scans/flur", "eingang")
+    ]
+
+
+def test_a_pickup_target_inside_its_own_folder_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/pickups/new", data={
+        "name": "Schleife", "folder": "scans", "target_folder": "scans/fertig",
+        "enabled": "1", "csrf_token": _csrf(client, "/config/pickups/new")},
+        follow_redirects=True)
+
+    assert "immer wieder eingelesen" in response.get_data(as_text=True)
+    assert runtime.pickups.all() == []
+
+
+def test_config_page_lists_the_pickup_folders(client, env):
+    _, _, _, _, runtime = env
+    runtime.pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Kopierer" in html
+    assert "scans" in html
+
+
+def test_editing_and_deleting_a_pickup_folder(client, env):
+    _, _, _, _, runtime = env
+    pickup_id = runtime.pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _login(client)
+
+    client.post(f"/config/pickups/{pickup_id}", data={
+        "name": "Kopierer OG", "folder": "scans", "target_folder": "eingang", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/pickups/{pickup_id}")})
+    assert runtime.pickups.get(pickup_id).enabled is False
+
+    client.post(f"/config/pickups/{pickup_id}/delete", data={"csrf_token": _csrf(client, "/config")})
+    assert runtime.pickups.all() == []
+
+
+def test_deleting_a_printer_stops_the_pickups_printing(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    pickup_id = runtime.pickups.add(
+        name="Kopierer", folder="scans", print_attachments=True, printer=str(printer_id)
+    )
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete", data={"csrf_token": _csrf(client, "/config")})
+
+    pickup = runtime.pickups.get(pickup_id)
+    assert (pickup.print_attachments, pickup.printer) == (False, "")
+
+
+# --- quarantine list and pickup timing ------------------------------------------
+
+
+def test_the_quarantine_list_can_be_edited(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/settings", data={
+        "blocked_extensions": ".EXE, bat; com", "pickup_min_age": "45",
+        "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.blocked_extensions == frozenset({"exe", "bat", "com"})
+    assert runtime.pickup_min_age == 45
+
+
+def test_emptying_the_quarantine_list_warns(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/settings", data={
+        "blocked_extensions": "", "pickup_min_age": "20",
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "Achtung" in response.get_data(as_text=True)
+    assert runtime.blocked_extensions == frozenset()
+
+
+def test_a_nonsense_waiting_time_is_refused_without_losing_the_list(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/settings", data={
+        "blocked_extensions": "exe", "pickup_min_age": "sofort",
+        "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.blocked_extensions == frozenset({"exe"})
+    assert runtime.pickup_min_age == 20
+
+
+def test_the_env_list_is_used_until_something_is_stored(client, env):
+    _, _, _, config, runtime = env
+
+    assert runtime.blocked_extensions == config.blocked_extensions
+
+
+def test_settings_changes_need_a_csrf_token(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/settings", data={"blocked_extensions": "exe"})
+
+    assert response.status_code == 400

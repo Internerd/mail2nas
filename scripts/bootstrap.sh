@@ -132,6 +132,8 @@ MAX_ATTACHMENTS_PER_MESSAGE=20
 # verschoben, auch wenn der Dateiname sonst auf ein Mapping-Stichwort passt
 # (verhindert z. B. "Rechnung.exe" im Rechnungsordner). Komma-getrennt, ohne
 # Punkt. Leer lassen, um die Pruefung zu deaktivieren.
+# NUR VORBELEGUNG: ab dem ersten Speichern in der Weboberflaeche
+# (Konfiguration -> Quarantaene und Abholen) gilt die dort gepflegte Liste.
 BLOCKED_EXTENSIONS=exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk
 QUARANTINE_FOLDER=quarantaene
 
@@ -350,6 +352,7 @@ cat > mail2nas/config.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from .filenames import safe_relative_parts
@@ -377,11 +380,21 @@ def _bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _extension_set(name: str, default: str) -> frozenset[str]:
-    raw = os.environ.get(name, default)
+def parse_extension_list(raw: str) -> frozenset[str]:
+    """Normalise a list of file extensions ('.EXE, com; bat' -> {exe, com, bat}).
+
+    Accepts commas, semicolons and whitespace as separators, because the
+    field is typed by hand in the web UI and every one of those gets used.
+    """
     return frozenset(
-        ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip()
+        ext.strip().lower().lstrip(".")
+        for ext in re.split(r"[,;\s]+", raw or "")
+        if ext.strip()
     )
+
+
+def _extension_set(name: str, default: str) -> frozenset[str]:
+    return parse_extension_list(os.environ.get(name, default))
 
 
 def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:
@@ -914,6 +927,7 @@ class AddressRule:
     printer: str  # printer key; "" = whatever the mailbox is set to
     archive_attachments: bool
     folder: str  # "" = let the keyword rules decide
+    archive: str  # which archive the folder is on; "" = the default one
     enabled: bool
 
     @property
@@ -953,7 +967,7 @@ class AddressStore:
 
     _COLUMNS = (
         "id, name, recipient, sender, print_attachments, printer, "
-        "archive_attachments, folder, enabled"
+        "archive_attachments, folder, archive, enabled"
     )
 
     def __init__(self, db_path: str):
@@ -973,6 +987,7 @@ class AddressStore:
                 "folder TEXT NOT NULL DEFAULT '', "
                 "enabled INTEGER NOT NULL DEFAULT 1)"
             )
+            _add_missing_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)
@@ -988,7 +1003,8 @@ class AddressStore:
             printer=row[5] or "",
             archive_attachments=bool(row[6]),
             folder=row[7] or "",
-            enabled=bool(row[8]),
+            archive=row[8] or "",
+            enabled=bool(row[9]),
         )
 
     def all(self) -> list[AddressRule]:
@@ -1024,9 +1040,9 @@ class AddressStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO address_rules (name, recipient, sender, print_attachments, "
-                "printer, archive_attachments, folder, enabled) "
+                "printer, archive_attachments, folder, archive, enabled) "
                 "VALUES (:name, :recipient, :sender, :print_attachments, :printer, "
-                ":archive_attachments, :folder, :enabled)",
+                ":archive_attachments, :folder, :archive, :enabled)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -1044,6 +1060,7 @@ class AddressStore:
                 "printer": current.printer,
                 "archive_attachments": current.archive_attachments,
                 "folder": current.folder,
+                "archive": current.archive,
                 "enabled": current.enabled,
                 **fields,
             }
@@ -1054,7 +1071,7 @@ class AddressStore:
                 "UPDATE address_rules SET name = :name, recipient = :recipient, "
                 "sender = :sender, print_attachments = :print_attachments, "
                 "printer = :printer, archive_attachments = :archive_attachments, "
-                "folder = :folder, enabled = :enabled WHERE id = :id",
+                "folder = :folder, archive = :archive, enabled = :enabled WHERE id = :id",
                 values,
             )
 
@@ -1073,6 +1090,19 @@ class AddressStore:
                 "UPDATE address_rules SET printer = '' WHERE printer = ?", (str(printer_key),)
             )
             return cursor.rowcount or 0
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to date.
+
+    Address rules shipped before archives were configurable, and an update
+    must not require re-entering them - so the column is added in place, with
+    a default that keeps every existing rule on the archive it used.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(address_rules)")}
+    if "archive" not in existing:
+        conn.execute("ALTER TABLE address_rules ADD COLUMN archive TEXT NOT NULL DEFAULT ''")
+        logger.info("Added the archive column to the address rule table")
 
 
 def validate(fields: dict) -> dict:
@@ -1128,8 +1158,663 @@ def validate(fields: dict) -> dict:
         "printer": str(fields.get("printer") or "").strip(),
         "archive_attachments": 1 if archive_attachments else 0,
         "folder": folder,
+        "archive": str(fields.get("archive") or "").strip(),
         "enabled": 1 if fields.get("enabled", True) else 0,
     }
+MAIL2NAS_EOF
+
+# --- mail2nas/archives.py ---
+cat > mail2nas/archives.py <<'MAIL2NAS_EOF'
+"""The archives attachments are filed into - one or several.
+
+Until now there was exactly one archive and it came from the environment.
+A household or office often has more than one place things belong: invoices
+on the NAS in the office, scans on the one in the workshop, private documents
+on a second share of the same box. So an archive becomes a configurable
+thing, like the mailboxes and printers before it, and everything that points
+somewhere - a mapping rule, a delivery address, a pickup folder - names one.
+
+The first archive is seeded from the `.env`, so an existing installation sees
+exactly what it had, under a name, and nothing changes until a second one is
+added.
+
+`StorageSet` keeps one live `Storage` per archive. Connections are expensive
+(SMB sessions) and the configuration can change while the service runs, so
+they are built on demand and rebuilt when the entry behind them changes.
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+from .filenames import safe_relative_parts
+from .storage import LocalStorage, SmbStorage, Storage
+
+logger = logging.getLogger(__name__)
+
+SETTING_ARCHIVES_SEEDED = "archives_seeded"
+
+# An empty key means "the default archive" - the first enabled one. Mapping
+# files written before archives existed carry no key at all, and a renamed or
+# replaced first archive must not silently redirect every rule.
+DEFAULT_ARCHIVE = ""
+
+MAX_NAME_LENGTH = 80
+BACKENDS = ("smb", "local")
+
+
+class ArchiveError(ValueError):
+    """An archive the user tried to save is not usable."""
+
+
+@dataclass(frozen=True)
+class Archive:
+    """One place to file into: an SMB share, or a directory on this machine."""
+
+    id: int
+    name: str
+    backend: str  # "smb" or "local"
+    host: str
+    share: str
+    user: str
+    password: str
+    domain: str
+    port: int
+    root: str  # subfolder below the share root, optional
+    encrypt: bool
+    path: str  # local backend only
+    enabled: bool
+
+    @property
+    def key(self) -> str:
+        """Stable identifier, as referenced by rules, addresses and pickups."""
+        return str(self.id)
+
+    def location(self) -> str:
+        if self.backend == "local":
+            return self.path
+        where = f"//{self.host}/{self.share}"
+        return f"{where}/{self.root}" if self.root else where
+
+    def label(self) -> str:
+        return f"{self.name} ({self.location()})"
+
+    def fingerprint(self) -> tuple:
+        """Everything the connection depends on; a change means rebuild it."""
+        return (
+            self.backend,
+            self.host,
+            self.share,
+            self.user,
+            self.password,
+            self.domain,
+            self.port,
+            self.root,
+            self.encrypt,
+            self.path,
+        )
+
+    def to_storage(self) -> Storage:
+        if self.backend == "local":
+            return LocalStorage(self.path)
+        return SmbStorage(
+            host=self.host,
+            share=self.share,
+            user=self.user,
+            password=self.password,
+            domain=self.domain or None,
+            port=self.port,
+            root=self.root,
+            encrypt=self.encrypt,
+        )
+
+
+class ArchiveStore:
+    """CRUD for the configured archives.
+
+    Short-lived connection per call, like the other stores: the web UI and the
+    workers are different threads, and one sqlite3 connection must not be
+    shared between them.
+    """
+
+    _COLUMNS = (
+        "id, name, backend, host, share, user, password, domain, port, root, "
+        "encrypt, path, enabled"
+    )
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS archives ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, "
+                "backend TEXT NOT NULL DEFAULT 'smb', "
+                "host TEXT NOT NULL DEFAULT '', "
+                "share TEXT NOT NULL DEFAULT '', "
+                "user TEXT NOT NULL DEFAULT '', "
+                "password TEXT NOT NULL DEFAULT '', "
+                "domain TEXT NOT NULL DEFAULT '', "
+                "port INTEGER NOT NULL DEFAULT 445, "
+                "root TEXT NOT NULL DEFAULT '', "
+                "encrypt INTEGER NOT NULL DEFAULT 1, "
+                "path TEXT NOT NULL DEFAULT '', "
+                "enabled INTEGER NOT NULL DEFAULT 1)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    @staticmethod
+    def _row_to_archive(row) -> Archive:
+        return Archive(
+            id=row[0],
+            name=row[1],
+            backend=row[2],
+            host=row[3],
+            share=row[4],
+            user=row[5],
+            password=row[6],
+            domain=row[7],
+            port=row[8],
+            root=row[9],
+            encrypt=bool(row[10]),
+            path=row[11],
+            enabled=bool(row[12]),
+        )
+
+    def all(self) -> list[Archive]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT {self._COLUMNS} FROM archives ORDER BY id").fetchall()
+        return [self._row_to_archive(row) for row in rows]
+
+    def enabled(self) -> list[Archive]:
+        return [archive for archive in self.all() if archive.enabled]
+
+    def get(self, archive_id: int) -> Archive | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM archives WHERE id = ?", (archive_id,)
+            ).fetchone()
+        return self._row_to_archive(row) if row else None
+
+    def by_key(self, key: str) -> Archive | None:
+        try:
+            return self.get(int(str(key).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    def default(self) -> Archive | None:
+        """The archive used by everything that does not name one."""
+        return next(iter(self.enabled()), None)
+
+    def add(self, **fields) -> int:
+        values = validate(fields)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO archives (name, backend, host, share, user, password, domain, "
+                "port, root, encrypt, path, enabled) VALUES (:name, :backend, :host, :share, "
+                ":user, :password, :domain, :port, :root, :encrypt, :path, :enabled)",
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update(self, archive_id: int, **fields) -> None:
+        current = self.get(archive_id)
+        if current is None:
+            raise KeyError(archive_id)
+        values = validate(
+            {
+                "name": current.name,
+                "backend": current.backend,
+                "host": current.host,
+                "share": current.share,
+                "user": current.user,
+                "password": current.password,
+                "domain": current.domain,
+                "port": current.port,
+                "root": current.root,
+                "encrypt": current.encrypt,
+                "path": current.path,
+                "enabled": current.enabled,
+                **fields,
+            }
+        )
+        values["id"] = archive_id
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE archives SET name = :name, backend = :backend, host = :host, "
+                "share = :share, user = :user, password = :password, domain = :domain, "
+                "port = :port, root = :root, encrypt = :encrypt, path = :path, "
+                "enabled = :enabled WHERE id = :id",
+                values,
+            )
+
+    def delete(self, archive_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM archives WHERE id = ?", (archive_id,))
+
+
+def validate(fields: dict) -> dict:
+    """Check and normalise what the UI (or the environment) supplies."""
+    name = str(fields.get("name") or "").strip()
+    backend = str(fields.get("backend") or "smb").strip().lower()
+    if backend not in BACKENDS:
+        raise ArchiveError("Unbekannte Art von Archiv.")
+    if len(name) > MAX_NAME_LENGTH:
+        raise ArchiveError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
+
+    host = str(fields.get("host") or "").strip()
+    share = str(fields.get("share") or "").strip().strip("/\\")
+    user = str(fields.get("user") or "").strip()
+    password = str(fields.get("password") or "")
+    domain = str(fields.get("domain") or "").strip()
+    path = str(fields.get("path") or "").strip()
+    root = str(fields.get("root") or "").strip()
+
+    if root:
+        try:
+            root = "/".join(safe_relative_parts(root))
+        except ValueError as exc:
+            raise ArchiveError(f"Der Unterordner ist nicht zulaessig: {exc}") from None
+
+    try:
+        port = int(fields.get("port") or 445)
+    except (TypeError, ValueError):
+        raise ArchiveError("Der Port muss eine Zahl sein.") from None
+    if not 1 <= port <= 65535:
+        raise ArchiveError("Der Port muss zwischen 1 und 65535 liegen.")
+
+    if backend == "smb":
+        if not host:
+            raise ArchiveError("Bitte den Server (NAS) angeben.")
+        if not share:
+            raise ArchiveError("Bitte den Namen der Freigabe angeben.")
+        if not user:
+            raise ArchiveError("Bitte den SMB-Benutzer angeben.")
+        if not password:
+            raise ArchiveError("Bitte das SMB-Passwort angeben.")
+    else:
+        if not path:
+            raise ArchiveError("Bitte das Verzeichnis angeben, in dem das Share gemountet ist.")
+        if not path.startswith("/"):
+            raise ArchiveError("Das Verzeichnis muss ein absoluter Pfad sein (z. B. /mnt/nas).")
+
+    default_name = share or Path(path).name or host or "Archiv"
+    return {
+        "name": name or default_name,
+        "backend": backend,
+        "host": host,
+        "share": share,
+        "user": user,
+        "password": password,
+        "domain": domain,
+        "port": port,
+        "root": root,
+        "encrypt": 1 if fields.get("encrypt", True) else 0,
+        "path": path,
+        "enabled": 1 if fields.get("enabled", True) else 0,
+    }
+
+
+def seed_from_config(store: ArchiveStore, settings, config) -> None:
+    """Create the first archive from the environment, once.
+
+    Guarded by a flag rather than by "is the table empty", so deleting the
+    last archive in the UI does not resurrect it from the .env on the next
+    restart.
+    """
+    if settings.get(SETTING_ARCHIVES_SEEDED):
+        return
+    if store.all():
+        settings.set(SETTING_ARCHIVES_SEEDED, "1")
+        return
+
+    if config.storage_backend == "smb":
+        store.add(
+            name=config.smb_share or config.smb_host,
+            backend="smb",
+            host=config.smb_host,
+            share=config.smb_share,
+            user=config.smb_user,
+            password=config.smb_password,
+            domain=config.smb_domain,
+            port=config.smb_port,
+            root=config.smb_root,
+            encrypt=config.smb_encrypt,
+        )
+    else:
+        store.add(name="Archiv", backend="local", path=config.storage_root)
+    settings.set(SETTING_ARCHIVES_SEEDED, "1")
+    logger.info("Created the first archive from the configuration")
+
+
+class StorageSet:
+    """Live `Storage` objects for the configured archives.
+
+    Built on demand and cached: an SMB session is not something to set up per
+    attachment. The cache key includes the archive's settings, so changing a
+    password in the UI takes effect on the next write instead of after a
+    restart.
+    """
+
+    def __init__(self, archives: ArchiveStore | None, fallback: Storage):
+        self._archives = archives
+        self._fallback = fallback
+        self._cache: dict[str, tuple[tuple, Storage]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def fallback(self) -> Storage:
+        """The archive from the .env - used when nothing is configured yet."""
+        return self._fallback
+
+    def archive_for(self, key: str) -> Archive | None:
+        """The archive a key refers to, or the default one."""
+        if self._archives is None:
+            return None
+        if key and key != DEFAULT_ARCHIVE:
+            archive = self._archives.by_key(key)
+            if archive is None:
+                logger.warning("Archive %r is configured somewhere but no longer exists", key)
+            elif not archive.enabled:
+                logger.warning("Archive %r is paused - filing into the default archive", archive.name)
+            else:
+                return archive
+        return self._archives.default()
+
+    def get(self, key: str = DEFAULT_ARCHIVE) -> Storage:
+        """The storage behind `key`, falling back to the default archive."""
+        archive = self.archive_for(key)
+        if archive is None:
+            return self._fallback
+        with self._lock:
+            cached = self._cache.get(archive.key)
+            if cached is not None and cached[0] == archive.fingerprint():
+                return cached[1]
+            if cached is not None:
+                logger.info("Archive %r changed - reconnecting", archive.name)
+                self._close(cached[1])
+            storage = archive.to_storage()
+            self._cache[archive.key] = (archive.fingerprint(), storage)
+            return storage
+
+    def default(self) -> Storage:
+        return self.get(DEFAULT_ARCHIVE)
+
+    def label_for(self, key: str) -> str:
+        archive = self.archive_for(key)
+        return archive.name if archive is not None else self._fallback.description
+
+    def close(self) -> None:
+        with self._lock:
+            for _, storage in self._cache.values():
+                self._close(storage)
+            self._cache.clear()
+
+    @staticmethod
+    def _close(storage: Storage) -> None:
+        try:
+            storage.close()
+        except Exception:  # noqa: BLE001 - closing a broken session must not raise
+            logger.debug("Could not close a storage connection", exc_info=True)
+MAIL2NAS_EOF
+
+# --- mail2nas/pickups.py ---
+cat > mail2nas/pickups.py <<'MAIL2NAS_EOF'
+"""Folders that devices drop documents into.
+
+Multifunction printers can usually either mail a scan or write it straight
+onto an SMB share ("Scan to Folder"). The second way never involves a mailbox
+at all, so nothing in the IMAP path sees it - but the documents should end up
+filed by exactly the same rules, and optionally printed.
+
+A pickup folder is therefore the third way in, next to mail and delivery
+addresses: mail2nas watches it, waits until a file has stopped changing, and
+moves it into the archive.
+
+Moving, not copying: the pickup folder is the device's outbox. Leaving the
+original behind would re-import it on every single cycle.
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+from .filenames import safe_relative_parts
+
+logger = logging.getLogger(__name__)
+
+MAX_NAME_LENGTH = 80
+# How often the watched folders are listed. Cheap locally, a network round
+# trip over SMB - so not on every supervisor pass.
+PICKUP_INTERVAL = 30
+# Devices like to create one subfolder per user or scan profile; that is worth
+# following, an unbounded tree is not.
+MAX_DEPTH = 5
+
+
+class PickupError(ValueError):
+    """A pickup folder the user tried to save is not usable."""
+
+
+@dataclass(frozen=True)
+class Pickup:
+    """One watched folder, and what happens to what turns up in it."""
+
+    id: int
+    name: str
+    archive: str  # archive the folder is on ("" = the default one)
+    folder: str  # relative path of the watched folder
+    target_archive: str  # where the documents go ("" = the default one)
+    target_folder: str  # "" = let the keyword rules decide
+    print_attachments: bool
+    printer: str
+    enabled: bool
+
+    @property
+    def key(self) -> str:
+        return str(self.id)
+
+    def label(self) -> str:
+        return f"{self.name} ({self.folder})"
+
+    @property
+    def has_fixed_target(self) -> bool:
+        return bool(self.target_folder.strip())
+
+    @property
+    def parts(self) -> tuple[str, ...]:
+        return safe_relative_parts(self.folder)
+
+    def rule_scope(self) -> str:
+        """The account id a pickup files under.
+
+        A document dropped into a folder did not arrive through any mailbox,
+        so only rules that apply to "all accounts" may claim it. Account ids
+        are numbers, so this can never collide with a real one.
+        """
+        return f"pickup:{self.id}"
+
+    def files_into_itself(self) -> bool:
+        """True if the target sits inside the watched folder.
+
+        That would re-import the same document for ever, so it is refused when
+        saving and skipped at runtime.
+        """
+        if not self.has_fixed_target or (self.target_archive or "") != (self.archive or ""):
+            return False
+        try:
+            source = safe_relative_parts(self.folder)
+            target = safe_relative_parts(self.target_folder)
+        except ValueError:
+            return False
+        return target[: len(source)] == source
+
+
+class PickupStore:
+    """CRUD for the watched folders."""
+
+    _COLUMNS = (
+        "id, name, archive, folder, target_archive, target_folder, "
+        "print_attachments, printer, enabled"
+    )
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pickup_folders ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, "
+                "archive TEXT NOT NULL DEFAULT '', "
+                "folder TEXT NOT NULL, "
+                "target_archive TEXT NOT NULL DEFAULT '', "
+                "target_folder TEXT NOT NULL DEFAULT '', "
+                "print_attachments INTEGER NOT NULL DEFAULT 0, "
+                "printer TEXT NOT NULL DEFAULT '', "
+                "enabled INTEGER NOT NULL DEFAULT 1)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    @staticmethod
+    def _row_to_pickup(row) -> Pickup:
+        return Pickup(
+            id=row[0],
+            name=row[1],
+            archive=row[2] or "",
+            folder=row[3],
+            target_archive=row[4] or "",
+            target_folder=row[5] or "",
+            print_attachments=bool(row[6]),
+            printer=row[7] or "",
+            enabled=bool(row[8]),
+        )
+
+    def all(self) -> list[Pickup]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._COLUMNS} FROM pickup_folders ORDER BY id"
+            ).fetchall()
+        return [self._row_to_pickup(row) for row in rows]
+
+    def enabled(self) -> list[Pickup]:
+        return [pickup for pickup in self.all() if pickup.enabled]
+
+    def get(self, pickup_id: int) -> Pickup | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM pickup_folders WHERE id = ?", (pickup_id,)
+            ).fetchone()
+        return self._row_to_pickup(row) if row else None
+
+    def add(self, **fields) -> int:
+        values = validate(fields)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO pickup_folders (name, archive, folder, target_archive, "
+                "target_folder, print_attachments, printer, enabled) "
+                "VALUES (:name, :archive, :folder, :target_archive, :target_folder, "
+                ":print_attachments, :printer, :enabled)",
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update(self, pickup_id: int, **fields) -> None:
+        current = self.get(pickup_id)
+        if current is None:
+            raise KeyError(pickup_id)
+        values = validate(
+            {
+                "name": current.name,
+                "archive": current.archive,
+                "folder": current.folder,
+                "target_archive": current.target_archive,
+                "target_folder": current.target_folder,
+                "print_attachments": current.print_attachments,
+                "printer": current.printer,
+                "enabled": current.enabled,
+                **fields,
+            }
+        )
+        values["id"] = pickup_id
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE pickup_folders SET name = :name, archive = :archive, "
+                "folder = :folder, target_archive = :target_archive, "
+                "target_folder = :target_folder, print_attachments = :print_attachments, "
+                "printer = :printer, enabled = :enabled WHERE id = :id",
+                values,
+            )
+
+    def delete(self, pickup_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM pickup_folders WHERE id = ?", (pickup_id,))
+
+    def clear_printer(self, printer_key: str) -> int:
+        """Drop references to a printer that was deleted."""
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE pickup_folders SET print_attachments = 0, printer = '' "
+                "WHERE printer = ?",
+                (str(printer_key),),
+            )
+            return cursor.rowcount or 0
+
+
+def validate(fields: dict) -> dict:
+    """Check and normalise what the UI supplies."""
+    name = str(fields.get("name") or "").strip()
+    folder = str(fields.get("folder") or "").strip()
+    target_folder = str(fields.get("target_folder") or "").strip()
+
+    if len(name) > MAX_NAME_LENGTH:
+        raise PickupError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
+    if not folder:
+        raise PickupError("Bitte den Ordner angeben, in den das Geraet die Scans legt.")
+
+    cleaned = {}
+    for key, value in (("folder", folder), ("target_folder", target_folder)):
+        if not value:
+            cleaned[key] = ""
+            continue
+        try:
+            cleaned[key] = "/".join(safe_relative_parts(value))
+        except ValueError as exc:
+            what = "Abholordner" if key == "folder" else "Zielordner"
+            raise PickupError(f"Der {what} ist nicht zulaessig: {exc}") from None
+
+    values = {
+        "name": name or cleaned["folder"],
+        "archive": str(fields.get("archive") or "").strip(),
+        "folder": cleaned["folder"],
+        "target_archive": str(fields.get("target_archive") or "").strip(),
+        "target_folder": cleaned["target_folder"],
+        "print_attachments": 1 if fields.get("print_attachments", False) else 0,
+        "printer": str(fields.get("printer") or "").strip(),
+        "enabled": 1 if fields.get("enabled", True) else 0,
+    }
+
+    candidate = Pickup(id=0, **{**values, "print_attachments": bool(values["print_attachments"]),
+                                "enabled": bool(values["enabled"])})
+    if candidate.files_into_itself():
+        raise PickupError(
+            "Der Zielordner liegt im Abholordner - die Dokumente wuerden immer wieder "
+            "eingelesen. Bitte einen Zielordner ausserhalb waehlen."
+        )
+    return values
 MAIL2NAS_EOF
 
 # --- mail2nas/printers.py ---
@@ -1982,12 +2667,21 @@ from __future__ import annotations
 import logging
 import threading
 
-from .mapping import MappingError
+from .archives import StorageSet
+from .config import parse_extension_list
 from .filenames import safe_relative_parts
+from .mapping import Mapping, MappingError
 
 logger = logging.getLogger(__name__)
 
 SETTING_MAPPING_PATH = "mapping_path"
+SETTING_BLOCKED_EXTENSIONS = "blocked_extensions"
+SETTING_PICKUP_MIN_AGE = "pickup_min_age_seconds"
+
+# How long a file in a pickup folder has to have been untouched before it is
+# treated as finished. Long enough for a slow scan over SMB, short enough that
+# nobody waits for their document.
+DEFAULT_PICKUP_MIN_AGE = 20
 
 
 class Runtime:
@@ -2004,9 +2698,13 @@ class Runtime:
         printers=None,
         printing=None,
         addresses=None,
+        archives=None,
+        pickups=None,
     ):
         self.config = config
-        self.storage = storage
+        # The archive described by the .env. It stays the fallback for an
+        # installation that has not (yet) configured any archive of its own.
+        self.env_storage = storage
         self.mapping = mapping
         self.store = store
         self.settings = settings
@@ -2016,9 +2714,58 @@ class Runtime:
         self.printers = printers
         self.printing = printing
         self.addresses = addresses
+        self.archives = archives
+        self.pickups = pickups
+        self.storages = StorageSet(archives, storage)
         # Set by the web UI, consumed by the supervisor loop: the archiver
         # threads must not read a half-changed path.
         self.mapping_path_changed = threading.Event()
+
+    def attach_mapping(self, relative_path: str) -> Mapping:
+        """Create the rule-file view, once the default archive is known.
+
+        The mapping lives on the default archive, which only exists after the
+        archive store has been read - so it is set here rather than passed in.
+        """
+        self.mapping = Mapping(self.storage, relative_path, self.config.fallback_folder)
+        return self.mapping
+
+    @property
+    def storage(self):
+        """The default archive - where the mapping file and anything without
+        its own archive lives."""
+        return self.storages.default()
+
+    @property
+    def blocked_extensions(self) -> frozenset[str]:
+        """The quarantined file extensions, as edited in the web UI.
+
+        The .env value is only the starting point: it seeds the stored list on
+        first start, and is used as long as nothing has been stored.
+        """
+        raw = self.settings.get(SETTING_BLOCKED_EXTENSIONS)
+        if raw is None:
+            return self.config.blocked_extensions
+        return parse_extension_list(raw)
+
+    def set_blocked_extensions(self, raw: str) -> frozenset[str]:
+        """Store a new list; takes effect on the next message, no restart."""
+        extensions = parse_extension_list(raw)
+        self.settings.set(SETTING_BLOCKED_EXTENSIONS, ",".join(sorted(extensions)))
+        return extensions
+
+    @property
+    def pickup_min_age(self) -> int:
+        raw = self.settings.get(SETTING_PICKUP_MIN_AGE)
+        try:
+            return max(0, int(raw)) if raw is not None else DEFAULT_PICKUP_MIN_AGE
+        except (TypeError, ValueError):
+            return DEFAULT_PICKUP_MIN_AGE
+
+    def set_pickup_min_age(self, seconds) -> int:
+        value = max(0, int(seconds))
+        self.settings.set(SETTING_PICKUP_MIN_AGE, str(value))
+        return value
 
     @property
     def mapping_path(self) -> str:
@@ -2058,7 +2805,12 @@ class Runtime:
         self.mapping_path_changed.set()
 
     def apply_mapping_path(self) -> None:
-        """Re-point the shared Mapping if the stored path changed."""
+        """Re-point the shared Mapping if the path or the default archive moved.
+
+        Both can change while the service runs: the path from the mapping
+        form, the archive from someone editing the first archive's password.
+        """
+        self.mapping.set_storage(self.storage)
         wanted = self.mapping_path
         if self.mapping.path != wanted:
             self.mapping.set_path(wanted)
@@ -2090,13 +2842,32 @@ import secrets
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from .filenames import safe_relative_parts, unique_path, write_atomic
+from .filenames import copy_atomic, safe_relative_parts, unique_path, write_atomic
 
 logger = logging.getLogger(__name__)
 
 TEMP_PREFIX = ".mail2nas-tmp-"
+COPY_CHUNK = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class StoredFile:
+    """One file inside the archive, as `list_files` reports it."""
+
+    parts: tuple[str, ...]  # relative to the root, including the file name
+    size: int
+    mtime: float
+
+    @property
+    def name(self) -> str:
+        return self.parts[-1]
+
+    @property
+    def relative(self) -> str:
+        return "/".join(self.parts)
 
 
 class Storage(ABC):
@@ -2130,6 +2901,14 @@ class Storage(ABC):
         """Read a UTF-8 text file relative to the root. Raises FileNotFoundError."""
 
     @abstractmethod
+    def read_bytes(self, relative: str) -> bytes:
+        """Read a file relative to the root. Raises FileNotFoundError.
+
+        Used when a document has to cross from one archive to another, where
+        a streamed move is not possible because the two are different servers.
+        """
+
+    @abstractmethod
     def write_text(self, relative: str, text: str) -> None:
         """Overwrite a UTF-8 text file relative to the root, atomically.
 
@@ -2149,6 +2928,37 @@ class Storage(ABC):
     @abstractmethod
     def create_folder(self, relative: str) -> None:
         """Create a directory below the root, including parents."""
+
+    @abstractmethod
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        """True if `<root>/<parts>` is a directory.
+
+        `list_files` cannot answer this: an empty folder and a mistyped one
+        both look like "no files", and only one of them is worth telling
+        somebody about.
+        """
+
+    @abstractmethod
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        """Files below `<root>/<parts>`, recursively. Empty if it does not exist.
+
+        Feeds the pickup folders: a scanner writes there, and mail2nas has to
+        see what arrived, including in the per-user subfolders devices like to
+        create. Hidden files are skipped.
+        """
+
+    @abstractmethod
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        """Move `<root>/<source_parts>` to `<root>/<parts>/<filename>`.
+
+        Copy-then-delete rather than a rename: the two can be on different
+        shares once more than one archive is configured, and the original must
+        only disappear once the copy is complete. Never overwrites (a counter
+        is appended). Streamed, because a scan can be much larger than a mail
+        attachment.
+        """
 
     @abstractmethod
     def remove_file(self, relative: str) -> None:
@@ -2198,6 +3008,9 @@ class LocalStorage(Storage):
     def read_text(self, relative: str) -> str:
         return self._resolve(relative).read_text(encoding="utf-8")
 
+    def read_bytes(self, relative: str) -> bytes:
+        return self._resolve(relative).read_bytes()
+
     def write_text(self, relative: str, text: str) -> None:
         path = self._resolve(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2225,6 +3038,56 @@ class LocalStorage(Storage):
 
     def create_folder(self, relative: str) -> None:
         self._root.joinpath(*safe_relative_parts(relative)).mkdir(parents=True, exist_ok=True)
+
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        return self._root.joinpath(*parts).is_dir()
+
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        base = self._root.joinpath(*parts)
+        found: list[StoredFile] = []
+
+        def walk(directory: Path, prefix: tuple[str, ...], depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
+            except OSError:
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:  # vanished between listing and stat
+                    continue
+                if entry.is_dir():
+                    walk(entry, (*prefix, entry.name), depth + 1)
+                elif entry.is_file():
+                    found.append(
+                        StoredFile((*prefix, entry.name), stat.st_size, stat.st_mtime)
+                    )
+
+        if base.is_dir():
+            walk(base, tuple(parts), 1)
+        return found
+
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        source = self._root.joinpath(*source_parts)
+        directory = self._root.joinpath(*parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        out_path = unique_path(directory, filename)
+        copy_atomic(source, out_path)
+        try:
+            source.unlink()
+        except OSError:
+            # The copy is only legitimate if the original goes away: a pickup
+            # folder we cannot delete from would hand us the same scan again
+            # on every single cycle.
+            out_path.unlink(missing_ok=True)
+            raise
+        return str(out_path)
 
     def remove_file(self, relative: str) -> None:
         self._resolve(relative).unlink(missing_ok=True)
@@ -2414,12 +3277,7 @@ class SmbStorage(Storage):
 
         # Pick a free name. Single-writer assumption, same as the local
         # backend: mail2nas is one process per share path.
-        target_name = filename
-        stem, suffix = Path(filename).stem, Path(filename).suffix
-        counter = 0
-        while smbclient.path.exists(self._unc(parts, target_name), **self._kwargs):
-            counter += 1
-            target_name = f"{stem}_{counter}{suffix}"
+        target_name = self._free_name(parts, filename)
 
         # Write to a temporary name and rename into place, so an interrupted
         # transfer can never leave a truncated file under a name that looks
@@ -2449,6 +3307,18 @@ class SmbStorage(Storage):
 
         with smbclient.open_file(
             self._unc(parts[:-1], parts[-1]), mode="r", encoding="utf-8", **self._kwargs
+        ) as fh:
+            return fh.read()
+
+    def read_bytes(self, relative: str) -> bytes:
+        parts = safe_relative_parts(relative)
+        return self._with_reconnect("read", lambda: self._read_bytes(parts))
+
+    def _read_bytes(self, parts: Sequence[str]) -> bytes:
+        import smbclient
+
+        with smbclient.open_file(
+            self._unc(parts[:-1], parts[-1]), mode="rb", **self._kwargs
         ) as fh:
             return fh.read()
 
@@ -2505,6 +3375,113 @@ class SmbStorage(Storage):
     def create_folder(self, relative: str) -> None:
         parts = safe_relative_parts(relative)
         self._with_reconnect("mkdir", lambda: self._ensure_dir(parts))
+
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        base = tuple(parts)
+        return self._with_reconnect("stat", lambda: self._folder_exists(base))
+
+    def _folder_exists(self, parts: tuple[str, ...]) -> bool:
+        import smbclient.path
+
+        return bool(smbclient.path.isdir(self._unc(parts), **self._kwargs))
+
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        base = tuple(parts)
+        return self._with_reconnect("list files", lambda: self._list_files(base, max_depth))
+
+    def _list_files(self, base: tuple[str, ...], max_depth: int) -> list[StoredFile]:
+        import smbclient
+
+        found: list[StoredFile] = []
+
+        def walk(current: tuple[str, ...], depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(
+                    smbclient.scandir(self._unc(current), **self._kwargs),
+                    key=lambda e: e.name.lower(),
+                )
+            except Exception:  # noqa: BLE001 - a folder that is gone is simply empty
+                logger.debug("Could not list %s", self._unc(current), exc_info=True)
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    walk((*current, entry.name), depth + 1)
+                    continue
+                try:
+                    stat = entry.stat()
+                except Exception:  # noqa: BLE001 - vanished between listing and stat
+                    continue
+                found.append(
+                    StoredFile((*current, entry.name), stat.st_size, stat.st_mtime)
+                )
+
+        walk(base, 1)
+        return found
+
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        source = tuple(source_parts)
+        target = tuple(parts)
+        return self._with_reconnect(
+            "move", lambda: self._move_unique(source, target, filename)
+        )
+
+    def _move_unique(
+        self, source_parts: tuple[str, ...], parts: tuple[str, ...], filename: str
+    ) -> str:
+        import smbclient
+        import smbclient.path
+
+        self._ensure_dir(parts)
+        target_name = self._free_name(parts, filename)
+
+        tmp_name = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
+        tmp_path = self._unc(parts, tmp_name)
+        source_path = self._unc(source_parts[:-1], source_parts[-1])
+        try:
+            with smbclient.open_file(source_path, mode="rb", **self._kwargs) as src:
+                with smbclient.open_file(tmp_path, mode="xb", **self._kwargs) as dst:
+                    while True:
+                        chunk = src.read(COPY_CHUNK)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+            smbclient.replace(tmp_path, self._unc(parts, target_name), **self._kwargs)
+        except BaseException:
+            try:
+                smbclient.remove(tmp_path, **self._kwargs)
+            except Exception:  # noqa: BLE001 - cleanup of a failed copy is best effort
+                logger.debug("Could not remove temporary file %s", tmp_path, exc_info=True)
+            raise
+
+        try:
+            smbclient.remove(source_path, **self._kwargs)
+        except Exception:
+            # Without the delete the same file would be picked up again on the
+            # next cycle, so the copy has to go rather than be duplicated.
+            try:
+                smbclient.remove(self._unc(parts, target_name), **self._kwargs)
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not remove the copy either", exc_info=True)
+            raise
+
+        return self._display_unc(parts, target_name)
+
+    def _free_name(self, parts: Sequence[str], filename: str) -> str:
+        import smbclient.path
+
+        target_name = filename
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        counter = 0
+        while smbclient.path.exists(self._unc(parts, target_name), **self._kwargs):
+            counter += 1
+            target_name = f"{stem}_{counter}{suffix}"
+        return target_name
 
     def remove_file(self, relative: str) -> None:
         parts = safe_relative_parts(relative)
@@ -2645,6 +3622,9 @@ class Rule:
     # empty string means "whatever the mailbox is set to".
     print_attachments: bool = False
     printer: str = ""
+    # Which archive the folder is on. Empty = the default archive, so a
+    # mapping file written before there was more than one keeps working.
+    archive: str = ""
     _matcher: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
@@ -2655,6 +3635,7 @@ class Rule:
         account: str = ALL_ACCOUNTS,
         print_attachments: bool = False,
         printer: str = "",
+        archive: str = "",
     ) -> "Rule":
         return cls(
             keyword,
@@ -2662,6 +3643,7 @@ class Rule:
             account or ALL_ACCOUNTS,
             bool(print_attachments),
             str(printer or ""),
+            str(archive or ""),
             _compile(keyword),
         )
 
@@ -2689,6 +3671,8 @@ class Rule:
             data["print"] = True
         if self.printer:
             data["printer"] = self.printer
+        if self.archive:
+            data["archive"] = self.archive
         return data
 
 
@@ -2724,6 +3708,7 @@ def parse_rules(raw) -> list[Rule]:
                     str(entry.get("account", ALL_ACCOUNTS)),
                     _as_bool(entry.get("print", False)),
                     str(entry.get("printer", "") or ""),
+                    str(entry.get("archive", "") or ""),
                 )
             )
         return rules
@@ -2761,6 +3746,15 @@ class Mapping:
     @property
     def path(self) -> str:
         return self._relative_path
+
+    def set_storage(self, storage: Storage) -> None:
+        """Point at a different archive (the default one was reconfigured)."""
+        with self._lock:
+            if storage is self._storage:
+                return
+            self._storage = storage
+            self._mtime = None
+        self.set_path(self._relative_path)
 
     def set_path(self, relative_path: str) -> None:
         """Point at a different mapping file and load it immediately."""
@@ -2919,6 +3913,11 @@ def set_account(rule: Rule, account: str) -> Rule:
     return replace(rule, account=account or ALL_ACCOUNTS)
 
 
+def set_archive(rule: Rule, archive: str) -> Rule:
+    """Move a rule's target folder to another archive ("" = the default one)."""
+    return replace(rule, archive=str(archive or ""))
+
+
 def set_printing(rule: Rule, print_attachments: bool, printer: str) -> Rule:
     """Change a rule's print settings, dropping the printer when off."""
     print_attachments = bool(print_attachments)
@@ -2935,6 +3934,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -3049,6 +4049,29 @@ def unique_path(directory: str | Path, filename: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def copy_atomic(source: str | Path, path: str | Path) -> None:
+    """Copy `source` to `path` via a temporary file plus rename.
+
+    Same reasoning as write_atomic, but streamed: a file picked up from a
+    scanner folder is already on disk and can be far larger than a mail
+    attachment, so there is no reason to pull it through memory.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".mail2nas-tmp-")
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def write_atomic(path: str | Path, data: bytes) -> None:
@@ -3265,6 +4288,9 @@ class AttachmentPlan:
     archive: bool
     printer: Printer | None
     address: AddressRule | None = None
+    # Which archive the folder is on; "" = the default one. Not to be confused
+    # with `archive` above, which says *whether* to file at all.
+    archive_key: str = ""
 
 
 class Archiver:
@@ -3277,6 +4303,8 @@ class Archiver:
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
+        storages=None,
+        blocked_extensions=None,
     ):
         self.config = config
         self.mapping = mapping
@@ -3287,6 +4315,24 @@ class Archiver:
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
+        # A StorageSet once more than one archive can be configured; without
+        # it everything is filed into the one archive from the environment.
+        self.storages = storages
+        # Read through a callable rather than copied from the config: the list
+        # is editable in the web UI and has to take effect without a restart.
+        self._blocked_extensions = blocked_extensions
+
+    @property
+    def blocked_extensions(self) -> frozenset[str]:
+        if self._blocked_extensions is None:
+            return self.config.blocked_extensions
+        return self._blocked_extensions()
+
+    def storage_for(self, archive_key: str):
+        """The archive a plan points at, or the only one there is."""
+        if self.storages is None:
+            return self.storage
+        return self.storages.get(archive_key)
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -3395,14 +4441,15 @@ class Archiver:
 
                 if plan.archive:
                     target_parts = self._target_parts(plan.folder)
+                    storage = self.storage_for(plan.archive_key)
                     if self.config.dry_run:
                         logger.info(
                             "[dry-run] would save %s -> %s",
                             out_name,
-                            self.storage.display(target_parts),
+                            storage.display(target_parts),
                         )
                     else:
-                        out_path = self.storage.save_unique(target_parts, out_name, payload)
+                        out_path = storage.save_unique(target_parts, out_name, payload)
                         saved.append(out_path)
                         logger.info(
                             "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
@@ -3507,12 +4554,13 @@ class Archiver:
         # disk: sanitizing can change the trailing extension, and only the
         # latter is what a file manager will act on when someone opens it.
         extensions = {extension_of(filename), extension_of(sanitize_filename(_decode(filename)))}
-        quarantined = bool(extensions & self.config.blocked_extensions)
+        quarantined = bool(extensions & self.blocked_extensions)
 
         return AttachmentPlan(
             folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
+            archive_key=self._archive_of(rule, address_rule),
             # "Print only" still files anything quarantined: it cannot be
             # printed either, and dropping it without a trace would hide
             # exactly the attachment somebody may need to look at.
@@ -3530,6 +4578,17 @@ class Archiver:
         if address_rule is not None and address_rule.folder:
             return address_rule.folder
         return rule.folder if rule else self.config.fallback_folder
+
+    def _archive_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
+        """Which archive the folder lives on.
+
+        An address rule that names one wins - it is the more specific
+        statement, even when the folder itself comes from a keyword rule
+        ("file it where it usually goes, but on that NAS").
+        """
+        if address_rule is not None and address_rule.archive:
+            return address_rule.archive
+        return rule.archive if rule else ""
 
     def _printer_for(
         self, rule: Rule | None, quarantined: bool, address_rule: AddressRule | None = None
@@ -3628,6 +4687,245 @@ class Archiver:
             return ""
 MAIL2NAS_EOF
 
+# --- mail2nas/scanning.py ---
+cat > mail2nas/scanning.py <<'MAIL2NAS_EOF'
+"""Emptying the pickup folders: what a device wrote, filed like a mail.
+
+One pass over every configured folder, run from the supervisor. The rules,
+the quarantine and the naming are the same ones the IMAP path uses - a scan
+that arrives by mail and the same scan dropped into a folder must not end up
+in different places.
+
+Two properties this has to keep:
+
+* **A file is only touched once it is finished.** A scan being transferred
+  over SMB is a file that exists, grows, and is worthless until it stops -
+  so nothing is picked up before it has been untouched for a while.
+* **The original goes away.** The pickup folder is an outbox, not an archive;
+  a copy left behind would be imported again on the next cycle.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime
+
+from .filenames import extension_of, sanitize_filename
+from .pickups import MAX_DEPTH, Pickup, PickupStore
+from .printing import job_title
+
+logger = logging.getLogger(__name__)
+
+# Names that are never a finished document: dotfiles (the archive's own
+# temporary files start with one) and the suffixes devices and SMB clients use
+# while a file is still being written.
+IGNORED_SUFFIXES = (".tmp", ".part", ".partial", ".crdownload", ".filepart", ".lock", ".!ut")
+
+
+class PickupRunner:
+    """Files everything that is ready, in every configured pickup folder."""
+
+    def __init__(
+        self,
+        config,
+        mapping,
+        storages,
+        pickups: PickupStore,
+        printing=None,
+        blocked_extensions=None,
+        min_age_seconds: int = 20,
+    ):
+        self.config = config
+        self.mapping = mapping
+        self.storages = storages
+        self.pickups = pickups
+        self.printing = printing
+        self._blocked_extensions = blocked_extensions
+        self.min_age_seconds = min_age_seconds
+        # Remembers the last problem reported per folder, so one that stays
+        # unreachable is logged once instead of on every cycle.
+        self._reported: dict[int, str] = {}
+
+    @property
+    def blocked_extensions(self) -> frozenset[str]:
+        if self._blocked_extensions is None:
+            return self.config.blocked_extensions
+        return self._blocked_extensions()
+
+    # --- one pass ------------------------------------------------------------
+
+    def run_once(self) -> int:
+        """Import everything that is ready. Returns the number of files filed."""
+        folders = self.pickups.enabled()
+        if not folders:
+            return 0
+        self.mapping.reload()
+        total = 0
+        for pickup in folders:
+            try:
+                total += self._empty(pickup)
+            except Exception:  # noqa: BLE001 - one broken folder must not stop the rest
+                self._report(pickup, f"Abholen fehlgeschlagen: {self._short(pickup)}")
+                logger.exception("Pickup %s failed, retrying next cycle", pickup.name)
+        return total
+
+    def _short(self, pickup: Pickup) -> str:
+        return f"{pickup.name} ({pickup.folder})"
+
+    def _report(self, pickup: Pickup, problem: str | None) -> None:
+        if problem is None:
+            if self._reported.pop(pickup.id, None):
+                logger.info("Pickup %s: folder is reachable again", pickup.name)
+            return
+        if self._reported.get(pickup.id) != problem:
+            logger.warning("Pickup %s: %s", pickup.name, problem)
+            self._reported[pickup.id] = problem
+
+    def _empty(self, pickup: Pickup) -> int:
+        source = self.storages.get(pickup.archive)
+        target = self.storages.get(pickup.target_archive)
+
+        if pickup.files_into_itself():
+            self._report(
+                pickup,
+                "Zielordner liegt im Abholordner - es wird nichts abgeholt, "
+                "sonst wuerde dasselbe Dokument endlos wieder eingelesen",
+            )
+            return 0
+
+        if not source.folder_exists(pickup.parts):
+            # Far friendlier than an error: the device needs the folder to
+            # exist before it can write into it, and someone has just said
+            # where it should be.
+            source.create_folder(pickup.folder)
+            self._report(pickup, f"Abholordner {pickup.folder} angelegt - er war noch nicht da")
+            return 0
+        self._report(pickup, None)
+        files = source.list_files(pickup.parts, MAX_DEPTH)
+
+        deadline = time.time() - max(0, self.min_age_seconds)
+        filed = 0
+        for entry in files:
+            if entry.size == 0 or entry.name.lower().endswith(IGNORED_SUFFIXES):
+                continue
+            if entry.mtime > deadline:
+                logger.debug("%s is still being written, waiting", entry.relative)
+                continue
+            try:
+                if self._file_one(pickup, source, target, entry):
+                    filed += 1
+            except Exception:  # noqa: BLE001 - leave it in place and try again later
+                logger.exception(
+                    "Pickup %s: could not file %s, leaving it in place",
+                    pickup.name,
+                    entry.relative,
+                )
+        return filed
+
+    # --- one document ---------------------------------------------------------
+
+    def _file_one(self, pickup: Pickup, source, target, entry) -> bool:
+        rule = None
+        if not pickup.has_fixed_target:
+            rule = self.mapping.match(entry.name, account_id=pickup.rule_scope())
+
+        quarantined = bool(
+            {extension_of(entry.name), extension_of(sanitize_filename(entry.name))}
+            & self.blocked_extensions
+        )
+        if quarantined:
+            folder = self.config.quarantine_folder
+        elif pickup.has_fixed_target:
+            folder = pickup.target_folder
+        elif rule is not None:
+            folder = rule.folder
+        else:
+            folder = self.config.fallback_folder
+
+        parts = self._target_parts(folder)
+        out_name = self._build_filename(entry, pickup)
+
+        if self.config.dry_run:
+            logger.info(
+                "[dry-run] would move %s -> %s",
+                source.display(entry.parts),
+                target.display(parts),
+            )
+            return False
+
+        # Printing first, and from the source: the document has to be read
+        # anyway, and a printer that is out of paper must not stop the filing
+        # (nor leave the scan in the folder to be printed again next cycle).
+        printer = self._printer_for(pickup, quarantined)
+        if printer is not None:
+            self.printing.send(
+                printer, source.read_bytes(entry.relative), entry.name,
+                job_title(pickup.name, entry.name),
+            )
+
+        if source is target:
+            out_path = target.move_unique(entry.parts, parts, out_name)
+        else:
+            # Two different servers: no streamed move, so copy the bytes over
+            # and only then remove the original.
+            out_path = target.save_unique(parts, out_name, source.read_bytes(entry.relative))
+            source.remove_file(entry.relative)
+
+        logger.info(
+            "Pickup %s: '%s' matched '%s'%s -> %s",
+            pickup.name,
+            entry.name,
+            (rule.keyword if rule else None) or ("<fest>" if pickup.has_fixed_target else "<fallback>"),
+            " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
+            out_path,
+        )
+        return True
+
+    def _printer_for(self, pickup: Pickup, quarantined: bool):
+        if self.printing is None or not self.config.printing_enabled:
+            return None
+        if quarantined or not pickup.print_attachments:
+            return None
+        printer = self.printing.printer_for(pickup.printer)
+        if printer is None:
+            logger.warning(
+                "Pickup %s should print but no usable printer is configured", pickup.name
+            )
+        return printer
+
+    def _target_parts(self, folder: str) -> tuple[str, ...]:
+        from .filenames import safe_relative_parts
+
+        for candidate, note in (
+            (folder, None),
+            (self.config.fallback_folder, "fallback"),
+            ("unsorted", "built-in"),
+        ):
+            try:
+                parts = safe_relative_parts(candidate)
+            except ValueError as exc:
+                logger.error("Unsafe target folder %r (%s) - not writing there", candidate, exc)
+                continue
+            if note:
+                logger.warning("Using %s folder %r instead of %r", note, candidate, folder)
+            return parts
+        raise ValueError("No usable target folder inside the archive root")
+
+    def _build_filename(self, entry, pickup: Pickup) -> str:
+        """Same naming as for mail, with the folder standing in for the sender."""
+        filename = sanitize_filename(entry.name)
+        mode = self.config.filename_prefix
+        if mode == "none":
+            return filename
+        date_prefix = datetime.fromtimestamp(entry.mtime).strftime("%Y-%m-%d")
+        if mode == "date":
+            return f"{date_prefix}_{filename}"
+        source = sanitize_filename(pickup.name or "scan")
+        if mode == "sender":
+            return f"{source}_{filename}"
+        return f"{date_prefix}_{source}_{filename}"
+MAIL2NAS_EOF
+
 # --- mail2nas/web.py ---
 cat > mail2nas/web.py <<'MAIL2NAS_EOF'
 """Minimal web UI for editing the keyword -> folder mapping.
@@ -3675,11 +4973,14 @@ from .mapping import (
     move_rule,
     save_rules,
     set_account,
+    set_archive,
     set_printing,
     validate_folder,
     validate_keyword,
 )
 from .addresses import AddressError
+from .archives import ArchiveError
+from .pickups import PICKUP_INTERVAL, PickupError
 from .discovery import discover
 from .printers import PrinterError
 from .printing import PrintError
@@ -3871,6 +5172,17 @@ MAPPING_BODY = """
         </select>
       </div>
       {% endif %}
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+            <option value="{{ entry.key }}">{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       {% if printers %}
       <div class="field">
         <label for="printer">Drucken</label>
@@ -3946,6 +5258,19 @@ MAPPING_BODY = """
             {% endfor %}
             {% if rule.account not in account_keys %}
               <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
+          {% if archives|length > 1 %}
+          <input type="hidden" name="archive_fields" value="1">
+          <select name="archive" title="Archiv, auf dem der Zielordner liegt">
+            <option value="" {% if not rule.archive %}selected{% endif %}>Standard-Archiv</option>
+            {% for entry in archives %}
+              <option value="{{ entry.key }}"
+                {% if rule.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+            {% endfor %}
+            {% if rule.archive and rule.archive not in archive_keys %}
+              <option value="{{ rule.archive }}" selected>(geloeschtes Archiv)</option>
             {% endif %}
           </select>
           {% endif %}
@@ -4062,6 +5387,95 @@ CONFIG_BODY = """
 </div>
 
 <div class="card">
+  <h2 style="margin-top:0">Archive</h2>
+  {% if archives %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Ort</th><th>Art</th><th>Status</th><th></th></tr>
+    {% for entry in archives %}
+    <tr>
+      <td class="keyword">{{ entry.name }}{% if loop.first %}
+        <span class="hint">Standard</span>{% endif %}</td>
+      <td>{{ entry.location() }}</td>
+      <td>{% if entry.backend == 'smb' %}SMB{% else %}gemountet{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_archive', archive_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dort liegt die
+  Mapping-Datei, dorthin geht alles ohne eigene Angabe. Zuordnungen, Zustelladressen
+  und Abholordner koennen jeweils ein anderes waehlen.</p>
+  {% else %}
+  <p class="hint">Es wird das Archiv aus der .env verwendet: {{ storage_description }}</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
+    <button type="button">Archiv hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Abholordner (Scan-to-Folder)</h2>
+  {% if pickups %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Ordner</th><th>Ziel</th><th>Drucken</th><th>Status</th><th></th></tr>
+    {% for entry in pickups %}
+    <tr>
+      <td class="keyword">{{ entry.name }}</td>
+      <td>{{ entry.folder }}{% if entry.archive_label %}
+        <span class="hint">auf {{ entry.archive_label }}</span>{% endif %}</td>
+      <td>{{ entry.target_folder or 'nach Stichwoertern' }}{% if entry.target_archive_label %}
+        <span class="hint">auf {{ entry.target_archive_label }}</span>{% endif %}</td>
+      <td>{% if entry.print_attachments %}{{ entry.printer_label or 'ja' }}{% else %}nein{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_pickup', pickup_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Fertige Dateien werden von dort ins Archiv <em>verschoben</em> -
+  ganz ohne Postfach. Geprueft wird alle {{ pickup_interval }} Sekunden.</p>
+  {% else %}
+  <p class="hint">Kein Abholordner eingerichtet. Fuer Geraete, die Scans per SMB
+  ablegen statt sie zu mailen: Ordner eintragen, mail2nas raeumt ihn ab.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_pickup') }}">
+    <button type="button">Abholordner hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Quarantaene und Abholen</h2>
+  <form method="post" action="{{ url_for('save_settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="blocked_extensions">Gesperrte Dateiendungen</label>
+      <input id="blocked_extensions" name="blocked_extensions" type="text"
+             value="{{ blocked_extensions }}">
+    </div>
+    <p class="hint">Anhaenge mit einer dieser Endungen landen <strong>immer</strong> im
+    Ordner <code>{{ quarantine_folder }}</code> - auch wenn ein Stichwort passt und auch
+    wenn sie aus einem Abholordner kommen. So kann „Rechnung.exe" nicht im
+    Rechnungsordner landen. Gedruckt wird so etwas nie.
+    Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
+    <strong>Leer heisst: keine Pruefung.</strong></p>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="pickup_min_age">Abholordner: Datei gilt als fertig nach (Sekunden)</label>
+        <input id="pickup_min_age" name="pickup_min_age" type="text" value="{{ pickup_min_age }}">
+      </div>
+      <button type="submit">Speichern</button>
+    </div>
+    <p class="hint" style="margin-bottom:0">Wirkt sofort, ohne Neustart. Die
+    <code>.env</code> gibt nur noch den Startwert vor.</p>
+  </form>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">Zustelladressen</h2>
   {% if address_rules %}
   <div class="table-wrap">
@@ -4077,7 +5491,8 @@ CONFIG_BODY = """
         <span class="hint">&middot; {{ entry.printer_label }}</span>{% endif %}
         {% else %}nein{% endif %}</td>
       <td>{% if entry.archive_attachments %}ja{% if entry.folder %}
-        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}
+        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}{% if entry.archive_label %}
+        <span class="hint">&middot; {{ entry.archive_label }}</span>{% endif %}
         {% else %}nein{% endif %}</td>
       <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
@@ -4122,6 +5537,7 @@ CONFIG_BODY = """
     <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
     <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
     <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
+    <dt>Archiv aus der .env</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
     <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
     <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
     <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
@@ -4379,10 +5795,27 @@ ADDRESS_BODY = """
         {% if not entry or entry.archive_attachments %}checked{% endif %}>
         Anhaenge per SMB ablegen</label>
     </p>
-    <div class="field">
-      <label for="folder">Zielordner (optional)</label>
-      <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
-             placeholder="leer = nach Stichwort-Zuordnungen">
+    <div class="row">
+      <div class="field">
+        <label for="folder">Zielordner (optional)</label>
+        <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
+               placeholder="leer = nach Stichwort-Zuordnungen">
+      </div>
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for item in archives %}
+          <option value="{{ item.key }}"
+            {% if entry and entry.archive == item.key %}selected{% endif %}>{{ item.name }}</option>
+          {% endfor %}
+          {% if entry and entry.archive and entry.archive not in archive_keys %}
+          <option value="{{ entry.archive }}" selected>(geloeschtes Archiv)</option>
+          {% endif %}
+        </select>
+      </div>
+      {% endif %}
     </div>
 
     <p style="margin:.9rem 0 .2rem">
@@ -4470,6 +5903,214 @@ DISCOVERY_BODY = """
 {% endif %}
 """
 
+ARCHIVE_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Archiv bearbeiten' if archive else 'Archiv hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ archive.name if archive else '' }}"
+               placeholder="z. B. NAS Buero">
+      </div>
+      <div class="field">
+        <label for="backend">Art</label>
+        <select id="backend" name="backend">
+          <option value="smb" {% if not archive or archive.backend == 'smb' %}selected{% endif %}>
+            SMB-Freigabe (nichts gemountet)</option>
+          <option value="local" {% if archive and archive.backend == 'local' %}selected{% endif %}>
+            Gemountetes Verzeichnis</option>
+        </select>
+      </div>
+    </div>
+
+    <p class="hint" style="margin:.9rem 0 .2rem"><strong>Nur fuer SMB:</strong></p>
+    <div class="row">
+      <div class="field">
+        <label for="host">Server (NAS)</label>
+        <input id="host" name="host" type="text" value="{{ archive.host if archive else '' }}"
+               placeholder="nas.lan oder 192.168.1.10">
+      </div>
+      <div class="field">
+        <label for="share">Freigabe</label>
+        <input id="share" name="share" type="text" value="{{ archive.share if archive else '' }}"
+               placeholder="z. B. Belege">
+      </div>
+      <div class="field">
+        <label for="root">Unterordner (optional)</label>
+        <input id="root" name="root" type="text" value="{{ archive.root if archive else '' }}"
+               placeholder="z. B. archiv/2026">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="user">Benutzer</label>
+        <input id="user" name="user" type="text" value="{{ archive.user if archive else '' }}">
+      </div>
+      <div class="field">
+        <label for="password">Passwort{% if archive %}
+          <span class="hint">(leer = unveraendert)</span>{% endif %}</label>
+        <input id="password" name="password" type="password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="domain">Domain (optional)</label>
+        <input id="domain" name="domain" type="text" value="{{ archive.domain if archive else '' }}">
+      </div>
+      <div class="field">
+        <label for="port">Port</label>
+        <input id="port" name="port" type="text" value="{{ archive.port if archive else '445' }}">
+      </div>
+    </div>
+    <p style="margin:.6rem 0 .2rem">
+      <label><input type="checkbox" name="encrypt" value="1"
+        {% if not archive or archive.encrypt %}checked{% endif %}> Verbindung verschluesseln
+        (SMB3; abschalten, wenn der Server das ablehnt)</label>
+    </p>
+
+    <p class="hint" style="margin:.9rem 0 .2rem"><strong>Nur fuer ein gemountetes
+    Verzeichnis:</strong></p>
+    <div class="field">
+      <label for="path">Pfad</label>
+      <input id="path" name="path" type="text" value="{{ archive.path if archive else '' }}"
+             placeholder="/mnt/nas2">
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not archive or archive.enabled %}checked{% endif %}> Archiv aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dort
+  liegt die Mapping-Datei, und dorthin geht alles, was kein eigenes Archiv nennt.
+  Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
+  mountet nichts.</p>
+</div>
+
+{% if archive %}
+<div class="card">
+  <h2 style="margin-top:0">Verbindung testen</h2>
+  <form method="post" action="{{ url_for('test_archive', archive_id=archive.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Verbindung testen</button>
+    <p class="hint">Schreibt eine winzige Testdatei und loescht sie wieder - so steht
+    fest, dass Zugangsdaten und Schreibrechte stimmen, bevor die erste Rechnung
+    kommt.</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Archiv loeschen</h2>
+  <form method="post" action="{{ url_for('delete_archive', archive_id=archive.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Dieses Archiv loeschen</button>
+    <p class="hint">Die Dateien darauf bleiben unangetastet. Zuordnungen und Adressen,
+    die darauf zeigten, nutzen danach das Standard-Archiv.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+PICKUP_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Abholordner bearbeiten' if pickup else 'Abholordner hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ pickup.name if pickup else '' }}"
+               placeholder="z. B. Kopierer Flur">
+      </div>
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv, auf dem der Ordner liegt</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+          <option value="{{ entry.key }}"
+            {% if pickup and pickup.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="folder">Abholordner</label>
+        <input id="folder" name="folder" type="text" value="{{ pickup.folder if pickup else '' }}"
+               placeholder="z. B. scans/kopierer-flur" required>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:.6rem">
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="target_archive">Zielarchiv</label>
+        <select id="target_archive" name="target_archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+          <option value="{{ entry.key }}"
+            {% if pickup and pickup.target_archive == entry.key %}selected{% endif %}>
+            {{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="target_folder">Zielordner <span class="hint">(leer = nach Stichwoertern)</span></label>
+        <input id="target_folder" name="target_folder" type="text"
+               value="{{ pickup.target_folder if pickup else '' }}" placeholder="z. B. scans">
+      </div>
+      {% if printers %}
+      <div class="field">
+        <label for="printer">Drucken</label>
+        <select id="printer" name="printer">
+          <option value="">nicht drucken</option>
+          {% for printer in printers %}
+          <option value="{{ printer.key }}"
+            {% if pickup and pickup.print_attachments and pickup.printer == printer.key %}selected{% endif %}>
+            drucken auf {{ printer.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not pickup or pickup.enabled %}checked{% endif %}> Ordner ueberwachen</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Der Ordner ist ein <strong>Postausgang, kein Archiv</strong>: was
+  abgeholt wurde, wird von dort <em>verschoben</em>. Angefasst wird eine Datei erst,
+  wenn sie {{ min_age }} Sekunden unveraendert ist - sonst landet eine noch laufende
+  Uebertragung im Archiv. Unterordner werden mitgelesen; versteckte und halbfertige
+  Dateien (<code>.tmp</code>, <code>.part</code>) bleiben liegen.</p>
+  <p class="hint">Ohne Zielordner entscheiden die Stichwort-Zuordnungen - dabei greifen
+  nur die fuer „alle Postfaecher", denn eine Datei aus einem Ordner gehoert zu keinem
+  Postfach. Gesperrte Dateiendungen kommen auch hier in die Quarantaene.</p>
+</div>
+
+{% if pickup %}
+<div class="card">
+  <h2 style="margin-top:0">Abholordner loeschen</h2>
+  <form method="post" action="{{ url_for('delete_pickup', pickup_id=pickup.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diesen Abholordner loeschen</button>
+    <p class="hint">Der Ordner selbst und alles darin bleiben unangetastet - es wird
+    nur nicht mehr hineingesehen.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
 PASSWORD_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Passwort aendern</h2>
@@ -4497,7 +6138,11 @@ PASSWORD_BODY = """
 
 def create_app(runtime) -> Flask:
     """Build the web UI on top of a Runtime (config, storage, settings, accounts)."""
-    config, storage, settings = runtime.config, runtime.storage, runtime.settings
+    config, settings = runtime.config, runtime.settings
+
+    def storage():
+        """The default archive - looked up per request, because it is editable."""
+        return runtime.storage
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=_secret_key(settings),
@@ -4631,10 +6276,10 @@ def create_app(runtime) -> Flask:
         return True, value
 
     def _rules() -> list[Rule]:
-        return load_rules(storage, runtime.mapping_path)
+        return load_rules(storage(), runtime.mapping_path)
 
     def _save(rules: list[Rule]) -> None:
-        save_rules(storage, runtime.mapping_path, rules)
+        save_rules(storage(), runtime.mapping_path, rules)
 
     def _index(rules: list[Rule]) -> int:
         try:
@@ -4655,7 +6300,7 @@ def create_app(runtime) -> Flask:
             flash(str(exc), "error")
 
         try:
-            folders = storage.list_folders()
+            folders = storage().list_folders()
         except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
             folders = []
             logger.warning("Web UI: could not list folders (%s)", exc)
@@ -4678,7 +6323,8 @@ def create_app(runtime) -> Flask:
             account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
             printers=printers,
             printer_keys=[printer.key for printer in printers],
-            storage_description=storage.description,
+            **_archive_context(),
+            storage_description=storage().description,
             mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
@@ -4696,9 +6342,10 @@ def create_app(runtime) -> Flask:
             folder = validate_folder(chosen)
             account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
             printing, printer = _print_choice(request.form.get("printer", ""))
+            archive = _archive_choice(request.form.get("archive", ""))
             if new_folder:
-                storage.create_folder(folder)
-            rules.append(Rule.create(keyword, folder, account, printing, printer))
+                _archive_storage(archive).create_folder(folder)
+            rules.append(Rule.create(keyword, folder, account, printing, printer, archive))
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -4734,8 +6381,17 @@ def create_app(runtime) -> Flask:
                 printing, printer = _print_choice(request.form.get("printer", ""))
             else:
                 printing, printer = rule.print_attachments, rule.printer
-            updated = Rule.create(rule.keyword, folder, account, printing, printer)
-            rules[index] = set_printing(set_account(updated, account), printing, printer)
+            # Same for the archive: the dropdown only exists once there is
+            # more than one archive to choose from.
+            archive = (
+                _archive_choice(request.form.get("archive", ""))
+                if request.form.get("archive_fields")
+                else rule.archive
+            )
+            updated = Rule.create(rule.keyword, folder, account, printing, printer, archive)
+            rules[index] = set_archive(
+                set_printing(set_account(updated, account), printing, printer), archive
+            )
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -4800,9 +6456,14 @@ def create_app(runtime) -> Flask:
             accounts=runtime.accounts.all(),
             printers=_printers(),
             address_rules=_address_rules(),
+            archives=_archives(),
+            pickups=_pickup_rows(),
+            pickup_interval=PICKUP_INTERVAL,
+            blocked_extensions=", ".join(sorted(runtime.blocked_extensions)),
+            pickup_min_age=runtime.pickup_min_age,
             printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
-            storage_description=storage.description,
+            storage_description=storage().description,
             storage_backend=config.storage_backend,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
@@ -4811,6 +6472,31 @@ def create_app(runtime) -> Flask:
             poll_interval=config.poll_interval,
             dry_run=config.dry_run,
         )
+
+    @app.post("/config/settings")
+    @login_required
+    def save_settings():
+        require_csrf()
+        extensions = runtime.set_blocked_extensions(request.form.get("blocked_extensions", ""))
+        try:
+            age = runtime.set_pickup_min_age(request.form.get("pickup_min_age", "20").strip() or 0)
+        except (TypeError, ValueError):
+            age = runtime.pickup_min_age
+            flash("Die Wartezeit muss eine Zahl sein - sie blieb unveraendert.", "error")
+        logger.info(
+            "Web UI: quarantine list set to %d extension(s), pickup age %ss",
+            len(extensions),
+            age,
+        )
+        if extensions:
+            flash("Einstellungen gespeichert.", "ok")
+        else:
+            flash(
+                "Einstellungen gespeichert. Achtung: ohne gesperrte Endungen wird "
+                "nichts mehr in die Quarantaene verschoben.",
+                "error",
+            )
+        return redirect(url_for("config_page"))
 
     @app.post("/config/mapping-path")
     @login_required
@@ -4921,6 +6607,133 @@ def create_app(runtime) -> Flask:
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
 
+    # --- archives -------------------------------------------------------------
+
+    def _archives() -> list:
+        """The archives offered in the dropdowns; empty means "just the one"."""
+        if runtime.archives is None:
+            return []
+        return runtime.archives.all()
+
+    def _archive_context() -> dict:
+        archives = _archives()
+        return {"archives": archives, "archive_keys": [a.key for a in archives]}
+
+    def _archive_choice(value: str, fallback: str = "") -> str:
+        """Read an archive dropdown, refusing one that no longer exists."""
+        value = (value or "").strip()
+        if not value:
+            return ""
+        if value not in {archive.key for archive in _archives()}:
+            raise MappingError("Dieses Archiv gibt es nicht.")
+        return value
+
+    def _archive_storage(key: str):
+        return runtime.storages.get(key) if runtime.storages else storage()
+
+    def _require_archives():
+        if runtime.archives is None:
+            abort(404)
+        return runtime.archives
+
+    def _archive_form() -> dict:
+        backend = request.form.get("backend", "smb").strip().lower()
+        return {
+            "name": request.form.get("name", ""),
+            "backend": backend,
+            "host": request.form.get("host", ""),
+            "share": request.form.get("share", ""),
+            "user": request.form.get("user", ""),
+            "password": request.form.get("password", ""),
+            "domain": request.form.get("domain", ""),
+            "port": request.form.get("port", "445").strip() or "445",
+            "root": request.form.get("root", ""),
+            "encrypt": bool(request.form.get("encrypt")),
+            "path": request.form.get("path", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/archives/new", methods=["GET", "POST"])
+    @login_required
+    def new_archive():
+        archives = _require_archives()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                archives.add(**_archive_form())
+            except ArchiveError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added archive %r", request.form.get("name"))
+                flash("Archiv angelegt. Mit „Verbindung testen\" pruefen, ob es erreichbar ist.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ARCHIVE_BODY, "Archiv", archive=None)
+
+    @app.route("/config/archives/<int:archive_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_archive(archive_id: int):
+        archives = _require_archives()
+        archive = archives.get(archive_id)
+        if archive is None:
+            flash("Dieses Archiv gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            fields = _archive_form()
+            # An empty password field means "keep the stored one", like the
+            # mailbox form - the page never shows the password back.
+            if not fields["password"]:
+                fields["password"] = archive.password
+            try:
+                archives.update(archive_id, **fields)
+            except ArchiveError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated archive %s", archive_id)
+                flash("Archiv gespeichert.", "ok")
+                runtime.mapping_path_changed.set()
+                return redirect(url_for("config_page"))
+            archive = archives.get(archive_id)
+        return render(ARCHIVE_BODY, "Archiv", archive=archive)
+
+    @app.post("/config/archives/<int:archive_id>/test")
+    @login_required
+    def test_archive(archive_id: int):
+        require_csrf()
+        archive = _require_archives().get(archive_id)
+        if archive is None:
+            flash("Dieses Archiv gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            archive.to_storage().check_writable()
+        except SystemExit as exc:
+            flash(f"Nicht erreichbar: {exc}", "error")
+        except Exception as exc:  # noqa: BLE001 - report anything else too
+            logger.exception("Web UI: archive test failed")
+            flash(f"Nicht erreichbar: {exc}", "error")
+        else:
+            flash(f"{archive.location()} ist erreichbar und beschreibbar.", "ok")
+        return redirect(url_for("edit_archive", archive_id=archive_id))
+
+    @app.post("/config/archives/<int:archive_id>/delete")
+    @login_required
+    def delete_archive(archive_id: int):
+        require_csrf()
+        archives = _require_archives()
+        if len(archives.all()) <= 1:
+            flash("Das letzte Archiv kann nicht geloescht werden.", "error")
+            return redirect(url_for("config_page"))
+        archives.delete(archive_id)
+        logger.info("Web UI: deleted archive %s", archive_id)
+        runtime.mapping_path_changed.set()
+        flash(
+            "Archiv geloescht. Zuordnungen, Zustelladressen und Abholordner, die darauf "
+            "zeigten, nutzen jetzt das Standard-Archiv.",
+            "ok",
+        )
+        return redirect(url_for("config_page"))
+
     # --- delivery addresses -------------------------------------------------
 
     def _require_addresses():
@@ -4934,6 +6747,7 @@ def create_app(runtime) -> Flask:
         if runtime.addresses is None:
             return []
         labels = {printer.key: printer.label() for printer in _printers()}
+        archive_names = {archive.key: archive.name for archive in _archives()}
         rules = []
         for rule in runtime.addresses.all():
             rules.append(
@@ -4947,6 +6761,7 @@ def create_app(runtime) -> Flask:
                     printer_label=labels.get(rule.printer, ""),
                     archive_attachments=rule.archive_attachments,
                     folder=rule.folder,
+                    archive_label=archive_names.get(rule.archive, ""),
                     enabled=rule.enabled,
                 )
             )
@@ -4961,6 +6776,7 @@ def create_app(runtime) -> Flask:
             "printer": request.form.get("printer", ""),
             "archive_attachments": bool(request.form.get("archive_attachments")),
             "folder": request.form.get("folder", ""),
+            "archive": request.form.get("archive", ""),
             "enabled": bool(request.form.get("enabled")),
         }
 
@@ -4978,7 +6794,9 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added address rule %r", request.form.get("recipient"))
                 flash("Zustelladresse angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context())
+        return render(
+            ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context(), **_archive_context()
+        )
 
     @app.route("/config/addresses/<int:address_id>", methods=["GET", "POST"])
     @login_required
@@ -5000,7 +6818,9 @@ def create_app(runtime) -> Flask:
                 flash("Zustelladresse gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             entry = addresses.get(address_id)
-        return render(ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context())
+        return render(
+            ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context(), **_archive_context()
+        )
 
     @app.post("/config/addresses/<int:address_id>/delete")
     @login_required
@@ -5009,6 +6829,107 @@ def create_app(runtime) -> Flask:
         _require_addresses().delete(address_id)
         logger.info("Web UI: deleted address rule %s", address_id)
         flash("Zustelladresse geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
+    # --- pickup folders -------------------------------------------------------
+
+    def _require_pickups():
+        if runtime.pickups is None:
+            abort(404)
+        return runtime.pickups
+
+    def _pickups() -> list:
+        return runtime.pickups.all() if runtime.pickups is not None else []
+
+    def _pickup_rows() -> list:
+        """The pickup folders with the names of what they point at."""
+        if runtime.pickups is None:
+            return []
+        archive_names = {archive.key: archive.name for archive in _archives()}
+        printer_labels = {printer.key: printer.label() for printer in _printers()}
+        rows = []
+        for pickup in runtime.pickups.all():
+            rows.append(
+                SimpleNamespace(
+                    id=pickup.id,
+                    name=pickup.name,
+                    folder=pickup.folder,
+                    archive_label=archive_names.get(pickup.archive, ""),
+                    target_folder=pickup.target_folder,
+                    target_archive_label=archive_names.get(pickup.target_archive, ""),
+                    print_attachments=pickup.print_attachments,
+                    printer_label=printer_labels.get(pickup.printer, ""),
+                    enabled=pickup.enabled,
+                )
+            )
+        return rows
+
+    def _pickup_form() -> dict:
+        printing, printer = _print_choice(request.form.get("printer", ""))
+        return {
+            "name": request.form.get("name", ""),
+            "archive": request.form.get("archive", ""),
+            "folder": request.form.get("folder", ""),
+            "target_archive": request.form.get("target_archive", ""),
+            "target_folder": request.form.get("target_folder", ""),
+            # "Drucker des Postfachs" makes no sense here - a folder has none.
+            "print_attachments": bool(printer),
+            "printer": printer,
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    def _pickup_context() -> dict:
+        return {
+            **_archive_context(),
+            **_printer_context(),
+            "min_age": runtime.pickup_min_age,
+        }
+
+    @app.route("/config/pickups/new", methods=["GET", "POST"])
+    @login_required
+    def new_pickup():
+        pickups = _require_pickups()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                pickups.add(**_pickup_form())
+            except PickupError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added pickup folder %r", request.form.get("folder"))
+                flash("Abholordner angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(PICKUP_BODY, "Abholordner", pickup=None, **_pickup_context())
+
+    @app.route("/config/pickups/<int:pickup_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_pickup(pickup_id: int):
+        pickups = _require_pickups()
+        pickup = pickups.get(pickup_id)
+        if pickup is None:
+            flash("Diesen Abholordner gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                pickups.update(pickup_id, **_pickup_form())
+            except PickupError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated pickup folder %s", pickup_id)
+                flash("Abholordner gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            pickup = pickups.get(pickup_id)
+        return render(PICKUP_BODY, "Abholordner", pickup=pickup, **_pickup_context())
+
+    @app.post("/config/pickups/<int:pickup_id>/delete")
+    @login_required
+    def delete_pickup(pickup_id: int):
+        require_csrf()
+        _require_pickups().delete(pickup_id)
+        logger.info("Web UI: deleted pickup folder %s", pickup_id)
+        flash("Abholordner geloescht.", "ok")
         return redirect(url_for("config_page"))
 
     # --- printers ---------------------------------------------------------
@@ -5140,6 +7061,8 @@ def create_app(runtime) -> Flask:
         # printer that no longer exists; blank it so it falls back to the
         # mailbox printer instead of silently printing nothing.
         unpinned = runtime.addresses.clear_printer(str(printer_id)) if runtime.addresses else 0
+        if runtime.pickups is not None:
+            unpinned += runtime.pickups.clear_printer(str(printer_id))
         logger.info("Web UI: deleted printer %s", printer_id)
         flash(
             "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "
@@ -5252,17 +7175,21 @@ import logging
 import os
 import sys
 import threading
+import time
 
 from . import printing as printing_module
 from . import storage as storage_module
 from .accounts import AccountStore, seed_from_config
 from .addresses import AddressStore
 from .archiver import Archiver
+from .archives import ArchiveStore
+from .archives import seed_from_config as seed_archive_from_config
 from .config import Config
-from .mapping import Mapping
+from .pickups import PICKUP_INTERVAL, PickupStore
 from .printers import PrinterStore
 from .printers import seed_from_config as seed_printer_from_config
 from .runtime import SETTING_MAPPING_PATH, Runtime
+from .scanning import PickupRunner
 from .state import ProcessedStore, SettingsStore
 
 logger = logging.getLogger("mail2nas")
@@ -5281,10 +7208,7 @@ def main() -> None:
     )
 
     config = Config.from_env()
-    storage = storage_module.from_config(config)
-    # Fail fast: an unreachable share is otherwise indistinguishable from an
-    # empty one, and attachments would land somewhere they silently vanish.
-    storage.check_writable()
+    env_storage = storage_module.from_config(config)
 
     settings = SettingsStore(config.state_db_path)
     accounts = AccountStore(config.state_db_path)
@@ -5296,21 +7220,30 @@ def main() -> None:
     seed_printer_from_config(printers, settings, config)
     printing = printing_module.from_config(config, printers)
     addresses = AddressStore(config.state_db_path)
+    archives = ArchiveStore(config.state_db_path)
+    seed_archive_from_config(archives, settings, config)
+    pickups = PickupStore(config.state_db_path)
 
     mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
-    mapping = Mapping(storage, mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     runtime = Runtime(
         config,
-        storage,
-        mapping,
+        env_storage,
+        None,  # the mapping needs the default archive, which Runtime resolves
         store,
         settings,
         accounts,
         printers=printers,
         printing=printing,
         addresses=addresses,
+        archives=archives,
+        pickups=pickups,
     )
+    # Fail fast: an unreachable share is otherwise indistinguishable from an
+    # empty one, and attachments would land somewhere they silently vanish.
+    runtime.storage.check_writable()
+    runtime.attach_mapping(mapping_path)
+    _check_other_archives(runtime)
 
     if config.web_enabled:
         # Imported lazily so the archiver still runs if the web dependencies
@@ -5320,12 +7253,14 @@ def main() -> None:
         web.serve(runtime)
 
     logger.info(
-        "Starting mail2nas: storage=%s (%s) mapping=%s printers=%d addresses=%d dry_run=%s",
-        storage.description,
-        config.storage_backend,
+        "Starting mail2nas: archive=%s mapping=%s archives=%d printers=%d addresses=%d "
+        "pickups=%d dry_run=%s",
+        runtime.storage.description,
         mapping_path,
+        len(archives.enabled()) or 1,
         len(printers.enabled()) if config.printing_enabled else 0,
         len(addresses.enabled()),
+        len(pickups.enabled()),
         config.dry_run,
     )
 
@@ -5333,7 +7268,31 @@ def main() -> None:
         _supervise(runtime)
     finally:
         store.close()
-        storage.close()
+        runtime.storages.close()
+        env_storage.close()
+
+
+def _check_other_archives(runtime: Runtime) -> None:
+    """Report archives besides the default one, without refusing to start.
+
+    The default archive is fatal when it is unreachable - nothing can be
+    filed at all. A second NAS being down is different: everything else keeps
+    working, and the mails meant for it are simply retried until it is back.
+    """
+    if runtime.archives is None:
+        return
+    default = runtime.archives.default()
+    for archive in runtime.archives.enabled():
+        if default is not None and archive.id == default.id:
+            continue
+        try:
+            archive.to_storage().check_writable()
+        except SystemExit as exc:
+            logger.error("Archive %r is not usable: %s", archive.name, exc)
+        except Exception as exc:  # noqa: BLE001 - never fail startup over a second archive
+            logger.error("Archive %r is not usable: %s", archive.name, exc)
+        else:
+            logger.info("Archive %r -> %s", archive.name, archive.location())
 
 
 def _protect_state_file(path: str) -> None:
@@ -5380,6 +7339,8 @@ class _Worker:
             self.account,
             self._runtime.printing,
             self._runtime.addresses,
+            self._runtime.storages,
+            lambda: self._runtime.blocked_extensions,
         )
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(
@@ -5475,13 +7436,42 @@ def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
     return workers
 
 
+def _make_pickup_runner(runtime: Runtime) -> PickupRunner | None:
+    if runtime.pickups is None:
+        return None
+    return PickupRunner(
+        runtime.config,
+        runtime.mapping,
+        runtime.storages,
+        runtime.pickups,
+        printing=runtime.printing,
+        blocked_extensions=lambda: runtime.blocked_extensions,
+        min_age_seconds=runtime.pickup_min_age,
+    )
+
+
 def _supervise(runtime: Runtime) -> None:
     """Keep one worker per enabled account, following changes made in the UI."""
     workers: dict[int, _Worker] = {}
     idle_warning_shown = False
+    pickup = _make_pickup_runner(runtime)
+    next_pickup = 0.0
     try:
         while True:
             reconcile(runtime, workers)
+
+            # Folders are walked on their own schedule: the supervisor wakes
+            # up every few seconds to notice UI changes, which is far more
+            # often than a share should be listed over SMB.
+            if pickup is not None and time.monotonic() >= next_pickup:
+                pickup.min_age_seconds = runtime.pickup_min_age
+                try:
+                    filed = pickup.run_once()
+                    if filed:
+                        logger.info("Picked up %d document(s) from the watched folders", filed)
+                except Exception:  # noqa: BLE001 - never let this stop the supervisor
+                    logger.exception("Pickup cycle failed")
+                next_pickup = time.monotonic() + PICKUP_INTERVAL
 
             if not workers and not idle_warning_shown:
                 # Once, not on every pass - this loop runs every few seconds.
@@ -6031,6 +8021,7 @@ import textwrap
 from email.message import EmailMessage
 
 from mail2nas.addresses import AddressStore
+from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
 from mail2nas.config import (
     DEFAULT_BLOCKED_EXTENSIONS,
@@ -6128,6 +8119,8 @@ def _make_archiver(
     account: Account | None = None,
     printing=None,
     addresses=None,
+    storages=None,
+    blocked_extensions=None,
     **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
@@ -6138,7 +8131,15 @@ def _make_archiver(
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     return Archiver(
-        config, mapping, store, storage, account or TEST_ACCOUNT, printing, addresses
+        config,
+        mapping,
+        store,
+        storage,
+        account or TEST_ACCOUNT,
+        printing,
+        addresses,
+        storages,
+        blocked_extensions,
     )
 
 
@@ -6940,6 +8941,141 @@ def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
     assert "-o media=A4" in called
     # and the document is on the share as well
     assert any((tmp_path / "unsorted").glob("*"))
+
+
+# --- several archives ----------------------------------------------------------
+
+
+def _two_archives(tmp_path):
+    """<tmp_path> as the default archive, <tmp_path>/nas2 as the second."""
+    second = tmp_path / "nas2"
+    second.mkdir(exist_ok=True)
+    archives = ArchiveStore(str(tmp_path / "archives.db"))
+    archives.add(name="Haupt", backend="local", path=str(tmp_path))
+    second_key = str(archives.add(name="NAS 2", backend="local", path=str(second)))
+    return StorageSet(archives, LocalStorage(str(tmp_path))), second, second_key
+
+
+def test_a_rule_files_onto_the_archive_it_names(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "{second_key}"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_build_message("RE-1", [("b.pdf", b"D")])), 1)
+
+    assert len(list((second / "rechnungen").glob("*"))) == 1
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_a_rule_without_an_archive_uses_the_default_one(tmp_path):
+    storages, second, _ = _two_archives(tmp_path)
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n", storages=storages)
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=_build_message("RE-1", [("b.pdf", b"D")])), 2)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+    assert not (second / "rechnungen").exists()
+
+
+def test_a_deleted_archive_falls_back_instead_of_losing_the_attachment(tmp_path):
+    storages, _, _ = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "999"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=_build_message("RE-1", [("b.pdf", b"D")])), 3)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+
+def test_an_address_rule_can_send_a_document_to_another_archive(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    addresses = _addresses(tmp_path, print_attachments=False, folder="ausdrucke",
+                           archive=second_key)
+    archiver = _make_archiver(tmp_path, addresses=addresses, storages=storages)
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=_addressed_message()), 4)
+
+    assert len(list((second / "ausdrucke").glob("*"))) == 1
+
+
+def test_the_address_archive_wins_over_the_rule_folder_archive(tmp_path):
+    """"File it where it usually goes, but on that NAS" has to work."""
+    storages, second, second_key = _two_archives(tmp_path)
+    addresses = _addresses(tmp_path, print_attachments=False, archive=second_key)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=addresses,
+        storages=storages,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=5, raw=_addressed_message(filename="Vertrag_7.pdf")), 5
+    )
+
+    assert len(list((second / "vertraege").glob("*"))) == 1
+
+
+def test_a_quarantined_attachment_stays_on_the_archive_it_was_meant_for(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "{second_key}"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=6, raw=_build_message("RE-1", [("Rechnung.exe", b"MZ")])), 6
+    )
+
+    assert len(list((second / "quarantaene").glob("*"))) == 1
+
+
+# --- the quarantine list is read live -------------------------------------------
+
+
+def test_the_blocked_extension_list_is_read_per_message(tmp_path):
+    """Editing it in the web UI must not need a restart."""
+    blocked = {"value": frozenset()}
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", blocked_extensions=lambda: blocked["value"]
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=7, raw=_build_message("RE-1", [("a.exe", b"MZ")])), 7
+    )
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+    blocked["value"] = frozenset({"exe"})
+    archiver._process_message(
+        FakeIMAPClient(uid=8, raw=_build_message("RE-2", [("b.exe", b"MZ")])), 8
+    )
+
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
 MAIL2NAS_EOF
 
 # --- tests/test_config.py ---
@@ -7114,6 +9250,7 @@ from __future__ import annotations
 
 import errno
 import os
+from pathlib import Path
 
 import pytest
 
@@ -7275,6 +9412,89 @@ def test_from_config_selects_the_configured_backend(tmp_path):
     )
     assert isinstance(smb, SmbStorage)
     assert smb.description == "//nas.local/Belege"
+
+
+# --- listing and moving files (pickup folders) --------------------------------
+
+
+def _drop(path: Path, content: bytes = b"scan") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_list_files_finds_files_in_subfolders(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf")
+    _drop(tmp_path / "scans" / "anna" / "b.pdf")
+
+    found = storage.list_files(("scans",))
+
+    assert sorted(entry.relative for entry in found) == ["scans/a.pdf", "scans/anna/b.pdf"]
+    assert all(entry.size == 4 for entry in found)
+
+
+def test_list_files_skips_hidden_entries(tmp_path):
+    """Our own temporary files start with a dot - they are not documents."""
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / ".mail2nas-tmp-1")
+    _drop(tmp_path / "scans" / "real.pdf")
+
+    assert [entry.name for entry in storage.list_files(("scans",))] == ["real.pdf"]
+
+
+def test_list_files_on_a_missing_folder_is_empty(tmp_path):
+    assert LocalStorage(str(tmp_path)).list_files(("gibtsnicht",)) == []
+
+
+def test_list_files_stops_at_the_depth_limit(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a" / "b" / "c" / "deep.pdf")
+
+    assert storage.list_files(("scans",), max_depth=2) == []
+    assert len(storage.list_files(("scans",), max_depth=5)) == 1
+
+
+def test_move_unique_moves_and_removes_the_original(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    source = _drop(tmp_path / "scans" / "a.pdf", b"inhalt")
+
+    out = storage.move_unique(("scans", "a.pdf"), ("eingang",), "2026-01-01_a.pdf")
+
+    assert not source.exists()
+    assert Path(out).read_bytes() == b"inhalt"
+
+
+def test_move_unique_never_overwrites(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "eingang" / "a.pdf", b"alt")
+    _drop(tmp_path / "scans" / "a.pdf", b"neu")
+
+    out = storage.move_unique(("scans", "a.pdf"), ("eingang",), "a.pdf")
+
+    assert Path(out).name == "a_1.pdf"
+    assert (tmp_path / "eingang" / "a.pdf").read_bytes() == b"alt"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores write permission bits")
+def test_a_source_that_cannot_be_deleted_leaves_no_copy(tmp_path):
+    """Copying without deleting would re-import the same scan for ever."""
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf")
+    (tmp_path / "scans").chmod(0o500)
+    try:
+        with pytest.raises(OSError):
+            storage.move_unique(("scans", "a.pdf"), ("eingang",), "a.pdf")
+        assert list((tmp_path / "eingang").glob("*")) == []
+    finally:
+        (tmp_path / "scans").chmod(0o700)
+
+
+def test_read_bytes(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf", b"%PDF-1.4")
+
+    assert storage.read_bytes("scans/a.pdf") == b"%PDF-1.4"
 MAIL2NAS_EOF
 
 # --- tests/test_web.py ---
@@ -7287,6 +9507,8 @@ import pytest
 
 from mail2nas.accounts import AccountStore
 from mail2nas.addresses import AddressStore
+from mail2nas.archives import ArchiveStore
+from mail2nas.pickups import PickupStore
 from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import from_config as printing_from_config
@@ -7323,6 +9545,8 @@ def env(tmp_path):
         printers=printers,
         printing=printing_from_config(config, printers),
         addresses=AddressStore(config.state_db_path),
+        archives=ArchiveStore(config.state_db_path),
+        pickups=PickupStore(config.state_db_path),
     )
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
@@ -8329,6 +10553,266 @@ def test_taking_over_a_found_printer_prefills_the_form(client, env):
     assert 'value="10.0.0.6"' in html
     # nothing is stored yet, so there is nothing to test-print or delete
     assert "Testseite drucken" not in html
+
+
+# --- archives -----------------------------------------------------------------
+
+
+def _add_archive(runtime, **fields) -> int:
+    values = dict(name="NAS 2", backend="local", path="/mnt/nas2")
+    values.update(fields)
+    return runtime.archives.add(**values)
+
+
+@pytest.mark.parametrize("path", ["/config/archives/new", "/config/archives/1"])
+def test_archive_pages_require_login(client, path):
+    assert client.get(path).status_code == 302
+
+
+def test_config_page_lists_the_archives(client, env):
+    _, _, _, _, runtime = env
+    _add_archive(runtime, name="NAS Buero", backend="smb", host="nas.lan", share="Belege",
+                 user="u", password="p")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "NAS Buero" in html
+    assert "//nas.lan/Belege" in html
+
+
+def test_creating_an_archive_through_the_form(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/archives/new", data={
+        "name": "NAS 2", "backend": "local", "path": str(tmp_path / "zwei"), "enabled": "1",
+        "csrf_token": _csrf(client, "/config/archives/new")})
+
+    assert [(a.name, a.path) for a in runtime.archives.all()] == [("NAS 2", str(tmp_path / "zwei"))]
+
+
+def test_an_smb_archive_without_credentials_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/archives/new", data={
+        "name": "Kaputt", "backend": "smb", "host": "nas.lan", "share": "Belege",
+        "csrf_token": _csrf(client, "/config/archives/new")}, follow_redirects=True)
+
+    assert "Benutzer" in response.get_data(as_text=True)
+    assert runtime.archives.all() == []
+
+
+def test_editing_an_archive_keeps_the_password_when_left_empty(client, env):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime, backend="smb", host="nas.lan", share="Belege",
+                              user="u", password="geheim", path="")
+    _login(client)
+
+    client.post(f"/config/archives/{archive_id}", data={
+        "name": "NAS umbenannt", "backend": "smb", "host": "nas.lan", "share": "Belege",
+        "user": "u", "password": "", "port": "445", "enabled": "1",
+        "csrf_token": _csrf(client, f"/config/archives/{archive_id}")})
+
+    archive = runtime.archives.get(archive_id)
+    assert (archive.name, archive.password) == ("NAS umbenannt", "geheim")
+
+
+def test_testing_an_archive_reports_success(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    target = tmp_path / "erreichbar"
+    target.mkdir()
+    archive_id = _add_archive(runtime, path=str(target))
+    _login(client)
+
+    response = client.post(f"/config/archives/{archive_id}/test", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "erreichbar und beschreibbar" in response.get_data(as_text=True)
+
+
+def test_testing_an_unreachable_archive_reports_the_reason(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime, path=str(tmp_path / "nicht-gemountet"))
+    _login(client)
+
+    response = client.post(f"/config/archives/{archive_id}/test", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "Nicht erreichbar" in response.get_data(as_text=True)
+
+
+def test_the_last_archive_cannot_be_deleted(client, env):
+    _, _, _, _, runtime = env
+    archive_id = _add_archive(runtime)
+    _login(client)
+
+    client.post(f"/config/archives/{archive_id}/delete", data={
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert len(runtime.archives.all()) == 1
+
+
+def test_deleting_an_archive(client, env):
+    _, _, _, _, runtime = env
+    _add_archive(runtime, name="Haupt")
+    second = _add_archive(runtime, name="NAS 2")
+    _login(client)
+
+    client.post(f"/config/archives/{second}/delete", data={"csrf_token": _csrf(client, "/config")})
+
+    assert [a.name for a in runtime.archives.all()] == ["Haupt"]
+
+
+def test_a_rule_can_name_an_archive(client, env, tmp_path):
+    _, storage, _, config, runtime = env
+    _add_archive(runtime, name="Haupt", path=str(tmp_path))
+    second = _add_archive(runtime, name="NAS 2", path=str(tmp_path / "zwei"))
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Vertrag", "folder": "", "new_folder": "vertraege", "archive": str(second),
+        "csrf_token": _csrf(client, "/mapping")})
+
+    rules = load_rules(runtime.storage, config.mapping_path)
+    assert [(r.keyword, r.archive) for r in rules] == [("Vertrag", str(second))]
+
+
+def test_a_rule_cannot_name_an_archive_that_does_not_exist(client, env, config=None):
+    _, storage, _, config, runtime = env
+    _add_archive(runtime)
+    _login(client)
+
+    response = client.post("/mapping/add", data={
+        "keyword": "Vertrag", "folder": "", "new_folder": "vertraege", "archive": "999",
+        "csrf_token": _csrf(client, "/mapping")}, follow_redirects=True)
+
+    assert "Archiv" in response.get_data(as_text=True)
+    assert load_rules(runtime.storage, config.mapping_path) == []
+
+
+# --- pickup folders ------------------------------------------------------------
+
+
+def test_creating_a_pickup_folder(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/pickups/new", data={
+        "name": "Kopierer Flur", "folder": "scans/flur", "target_folder": "eingang",
+        "enabled": "1", "csrf_token": _csrf(client, "/config/pickups/new")})
+
+    pickups = runtime.pickups.all()
+    assert [(p.name, p.folder, p.target_folder) for p in pickups] == [
+        ("Kopierer Flur", "scans/flur", "eingang")
+    ]
+
+
+def test_a_pickup_target_inside_its_own_folder_is_rejected(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/pickups/new", data={
+        "name": "Schleife", "folder": "scans", "target_folder": "scans/fertig",
+        "enabled": "1", "csrf_token": _csrf(client, "/config/pickups/new")},
+        follow_redirects=True)
+
+    assert "immer wieder eingelesen" in response.get_data(as_text=True)
+    assert runtime.pickups.all() == []
+
+
+def test_config_page_lists_the_pickup_folders(client, env):
+    _, _, _, _, runtime = env
+    runtime.pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert "Kopierer" in html
+    assert "scans" in html
+
+
+def test_editing_and_deleting_a_pickup_folder(client, env):
+    _, _, _, _, runtime = env
+    pickup_id = runtime.pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _login(client)
+
+    client.post(f"/config/pickups/{pickup_id}", data={
+        "name": "Kopierer OG", "folder": "scans", "target_folder": "eingang", "enabled": "",
+        "csrf_token": _csrf(client, f"/config/pickups/{pickup_id}")})
+    assert runtime.pickups.get(pickup_id).enabled is False
+
+    client.post(f"/config/pickups/{pickup_id}/delete", data={"csrf_token": _csrf(client, "/config")})
+    assert runtime.pickups.all() == []
+
+
+def test_deleting_a_printer_stops_the_pickups_printing(client, env):
+    _, _, _, _, runtime = env
+    printer_id = _add_printer(runtime)
+    pickup_id = runtime.pickups.add(
+        name="Kopierer", folder="scans", print_attachments=True, printer=str(printer_id)
+    )
+    _login(client)
+
+    client.post(f"/config/printers/{printer_id}/delete", data={"csrf_token": _csrf(client, "/config")})
+
+    pickup = runtime.pickups.get(pickup_id)
+    assert (pickup.print_attachments, pickup.printer) == (False, "")
+
+
+# --- quarantine list and pickup timing ------------------------------------------
+
+
+def test_the_quarantine_list_can_be_edited(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/settings", data={
+        "blocked_extensions": ".EXE, bat; com", "pickup_min_age": "45",
+        "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.blocked_extensions == frozenset({"exe", "bat", "com"})
+    assert runtime.pickup_min_age == 45
+
+
+def test_emptying_the_quarantine_list_warns(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/settings", data={
+        "blocked_extensions": "", "pickup_min_age": "20",
+        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+
+    assert "Achtung" in response.get_data(as_text=True)
+    assert runtime.blocked_extensions == frozenset()
+
+
+def test_a_nonsense_waiting_time_is_refused_without_losing_the_list(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/settings", data={
+        "blocked_extensions": "exe", "pickup_min_age": "sofort",
+        "csrf_token": _csrf(client, "/config")})
+
+    assert runtime.blocked_extensions == frozenset({"exe"})
+    assert runtime.pickup_min_age == 20
+
+
+def test_the_env_list_is_used_until_something_is_stored(client, env):
+    _, _, _, config, runtime = env
+
+    assert runtime.blocked_extensions == config.blocked_extensions
+
+
+def test_settings_changes_need_a_csrf_token(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/settings", data={"blocked_extensions": "exe"})
+
+    assert response.status_code == 400
 MAIL2NAS_EOF
 
 # --- tests/test_accounts.py ---
@@ -8473,6 +10957,7 @@ def _rule(**overrides) -> AddressRule:
         printer="",
         archive_attachments=True,
         folder="",
+        archive="",
         enabled=True,
     )
     values.update(overrides)
@@ -8668,6 +11153,731 @@ def test_the_name_defaults_to_the_address(tmp_path):
     rule_id = store.add(recipient="drucker@firma.de")
 
     assert store.get(rule_id).name == "drucker@firma.de"
+
+
+def test_an_older_database_gets_the_archive_column(tmp_path):
+    """Updating must not mean re-entering every delivery address."""
+    import sqlite3
+
+    db = str(tmp_path / "state.db")
+    with sqlite3.connect(db) as conn:
+        # Exactly the table the previous version created.
+        conn.execute(
+            "CREATE TABLE address_rules ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+            "recipient TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', "
+            "print_attachments INTEGER NOT NULL DEFAULT 1, printer TEXT NOT NULL DEFAULT '', "
+            "archive_attachments INTEGER NOT NULL DEFAULT 1, folder TEXT NOT NULL DEFAULT '', "
+            "enabled INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute(
+            "INSERT INTO address_rules (name, recipient, printer) VALUES ('Alt', 'a@b.de', '2')"
+        )
+
+    store = AddressStore(db)
+
+    rule = store.all()[0]
+    assert (rule.name, rule.recipient, rule.printer) == ("Alt", "a@b.de", "2")
+    assert rule.archive == ""  # the archive it always used: the default one
+MAIL2NAS_EOF
+
+# --- tests/test_archives.py ---
+cat > tests/test_archives.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.archives import (
+    Archive,
+    ArchiveError,
+    ArchiveStore,
+    StorageSet,
+    seed_from_config,
+)
+from mail2nas.state import SettingsStore
+from mail2nas.storage import LocalStorage, SmbStorage
+from tests.test_archiver import _make_config
+
+
+def _store(tmp_path) -> ArchiveStore:
+    return ArchiveStore(str(tmp_path / "state.db"))
+
+
+def _local(tmp_path, **fields) -> int:
+    values = dict(name="Haupt", backend="local", path=str(tmp_path))
+    values.update(fields)
+    return _store(tmp_path).add(**values)
+
+
+# --- validation ---------------------------------------------------------------
+
+
+def test_an_smb_archive_needs_server_share_and_credentials(tmp_path):
+    store = _store(tmp_path)
+
+    for missing in ("host", "share", "user", "password"):
+        fields = dict(
+            name="NAS", backend="smb", host="nas.lan", share="Belege", user="u", password="p"
+        )
+        fields[missing] = ""
+        with pytest.raises(ArchiveError):
+            store.add(**fields)
+
+
+def test_a_mounted_archive_needs_an_absolute_path(tmp_path):
+    store = _store(tmp_path)
+
+    with pytest.raises(ArchiveError, match="absoluter Pfad"):
+        store.add(name="Lokal", backend="local", path="relativ/pfad")
+
+
+def test_an_unknown_backend_is_rejected(tmp_path):
+    with pytest.raises(ArchiveError, match="Unbekannte Art"):
+        _store(tmp_path).add(name="X", backend="ftp", path="/mnt/x")
+
+
+def test_a_subfolder_that_escapes_the_share_is_rejected(tmp_path):
+    with pytest.raises(ArchiveError, match="Unterordner"):
+        _store(tmp_path).add(
+            name="NAS", backend="smb", host="h", share="s", user="u", password="p",
+            root="../woanders",
+        )
+
+
+def test_the_port_has_to_be_a_number(tmp_path):
+    with pytest.raises(ArchiveError, match="Zahl"):
+        _store(tmp_path).add(
+            name="NAS", backend="smb", host="h", share="s", user="u", password="p", port="vier",
+        )
+
+
+def test_the_name_defaults_to_the_share(tmp_path):
+    store = _store(tmp_path)
+
+    archive_id = store.add(
+        backend="smb", host="nas.lan", share="Belege", user="u", password="p"
+    )
+
+    assert store.get(archive_id).name == "Belege"
+
+
+# --- store --------------------------------------------------------------------
+
+
+def test_add_and_read_back(tmp_path):
+    store = _store(tmp_path)
+
+    archive_id = store.add(
+        name="NAS Buero", backend="smb", host="nas.lan", share="Belege",
+        user="archiv", password="geheim", root="2026", port=445, encrypt=False,
+    )
+
+    archive = store.get(archive_id)
+    assert archive.location() == "//nas.lan/Belege/2026"
+    assert archive.encrypt is False
+    assert archive.key == str(archive_id)
+
+
+def test_update_keeps_the_fields_not_sent(tmp_path):
+    store = _store(tmp_path)
+    archive_id = store.add(
+        name="NAS", backend="smb", host="nas.lan", share="Belege", user="u", password="geheim"
+    )
+
+    store.update(archive_id, name="NAS Buero")
+
+    archive = store.get(archive_id)
+    assert (archive.name, archive.password) == ("NAS Buero", "geheim")
+
+
+def test_the_default_is_the_first_enabled_archive(tmp_path):
+    store = _store(tmp_path)
+    first = store.add(name="Alt", backend="local", path="/mnt/alt", enabled=False)
+    second = store.add(name="Neu", backend="local", path="/mnt/neu")
+
+    assert store.default().id == second
+    assert store.get(first).enabled is False
+
+
+def test_by_key_survives_nonsense(tmp_path):
+    store = _store(tmp_path)
+
+    assert store.by_key("keine-zahl") is None
+    assert store.by_key("999") is None
+
+
+# --- seeding from the environment ---------------------------------------------
+
+
+def test_seeding_takes_the_smb_settings_from_the_env(tmp_path):
+    config = _make_config(
+        tmp_path, storage_backend="smb", smb_host="nas.lan", smb_share="Belege",
+        smb_user="archiv", smb_password="geheim",
+    )
+    store = _store(tmp_path)
+    settings = SettingsStore(config.state_db_path)
+
+    seed_from_config(store, settings, config)
+
+    archive = store.default()
+    assert (archive.backend, archive.host, archive.share) == ("smb", "nas.lan", "Belege")
+
+
+def test_seeding_takes_the_mounted_directory_from_the_env(tmp_path):
+    config = _make_config(tmp_path, storage_backend="local")
+    store = _store(tmp_path)
+
+    seed_from_config(store, SettingsStore(config.state_db_path), config)
+
+    archive = store.default()
+    assert (archive.backend, archive.path) == ("local", config.storage_root)
+
+
+def test_seeding_happens_only_once(tmp_path):
+    """Deleting the last archive in the UI must not resurrect it on restart."""
+    config = _make_config(tmp_path, storage_backend="local")
+    store = _store(tmp_path)
+    settings = SettingsStore(config.state_db_path)
+    seed_from_config(store, settings, config)
+
+    for archive in store.all():
+        store.delete(archive.id)
+    seed_from_config(store, settings, config)
+
+    assert store.all() == []
+
+
+# --- storage set --------------------------------------------------------------
+
+
+def test_without_archives_everything_uses_the_env_storage(tmp_path):
+    fallback = LocalStorage(str(tmp_path))
+    storages = StorageSet(None, fallback)
+
+    assert storages.get("") is fallback
+    assert storages.get("7") is fallback
+
+
+def test_a_named_archive_gets_its_own_storage(tmp_path):
+    store = _store(tmp_path)
+    store.add(name="Haupt", backend="local", path=str(tmp_path))
+    second = store.add(name="NAS 2", backend="local", path=str(tmp_path / "zwei"))
+    storages = StorageSet(store, LocalStorage(str(tmp_path)))
+
+    assert storages.get(str(second)).description == str(tmp_path / "zwei")
+    assert storages.default().description == str(tmp_path)
+
+
+def test_the_storage_is_reused_until_the_archive_changes(tmp_path):
+    """An SMB session per attachment would be absurd - so it is cached."""
+    store = _store(tmp_path)
+    archive_id = store.add(name="Haupt", backend="local", path=str(tmp_path))
+    storages = StorageSet(store, LocalStorage(str(tmp_path)))
+
+    first = storages.get(str(archive_id))
+    assert storages.get(str(archive_id)) is first
+
+    store.update(archive_id, path=str(tmp_path / "woanders"))
+    rebuilt = storages.get(str(archive_id))
+
+    assert rebuilt is not first
+    assert rebuilt.description == str(tmp_path / "woanders")
+
+
+def test_an_unknown_or_paused_archive_falls_back_to_the_default(tmp_path):
+    """A rule may name an archive that was deleted - file it, do not lose it."""
+    store = _store(tmp_path)
+    store.add(name="Haupt", backend="local", path=str(tmp_path))
+    paused = store.add(name="Aus", backend="local", path=str(tmp_path / "aus"), enabled=False)
+    storages = StorageSet(store, LocalStorage(str(tmp_path)))
+
+    assert storages.get("999").description == str(tmp_path)
+    assert storages.get(str(paused)).description == str(tmp_path)
+
+
+def test_an_smb_archive_builds_an_smb_storage(tmp_path):
+    archive = Archive(
+        id=1, name="NAS", backend="smb", host="nas.lan", share="Belege", user="u",
+        password="p", domain="", port=445, root="", encrypt=True, path="", enabled=True,
+    )
+
+    assert isinstance(archive.to_storage(), SmbStorage)
+
+
+def test_closing_releases_every_connection(tmp_path):
+    store = _store(tmp_path)
+    store.add(name="Haupt", backend="local", path=str(tmp_path))
+    storages = StorageSet(store, LocalStorage(str(tmp_path)))
+    storages.default()
+
+    storages.close()  # must not raise, and drops the cache
+
+    assert storages.default() is not None
+MAIL2NAS_EOF
+
+# --- tests/test_pickups.py ---
+cat > tests/test_pickups.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import pytest
+
+from mail2nas.pickups import Pickup, PickupError, PickupStore
+
+
+def _store(tmp_path) -> PickupStore:
+    return PickupStore(str(tmp_path / "state.db"))
+
+
+def _pickup(**overrides) -> Pickup:
+    values = dict(
+        id=1,
+        name="Kopierer",
+        archive="",
+        folder="scans",
+        target_archive="",
+        target_folder="eingang",
+        print_attachments=False,
+        printer="",
+        enabled=True,
+    )
+    values.update(overrides)
+    return Pickup(**values)
+
+
+# --- validation ---------------------------------------------------------------
+
+
+def test_a_folder_is_required(tmp_path):
+    with pytest.raises(PickupError, match="Ordner"):
+        _store(tmp_path).add(name="Ohne Ordner")
+
+
+@pytest.mark.parametrize("folder", ["../woanders", "/etc", ""])
+def test_a_folder_that_escapes_the_archive_is_rejected(tmp_path, folder):
+    with pytest.raises(PickupError):
+        _store(tmp_path).add(name="Boese", folder=folder)
+
+
+def test_a_target_inside_the_pickup_folder_is_refused(tmp_path):
+    """Otherwise the same document is imported again on every cycle."""
+    with pytest.raises(PickupError, match="immer wieder eingelesen"):
+        _store(tmp_path).add(name="Schleife", folder="scans", target_folder="scans/fertig")
+
+
+def test_the_same_folder_on_another_archive_is_fine(tmp_path):
+    """Same path, different NAS - that is a move, not a loop."""
+    store = _store(tmp_path)
+
+    pickup_id = store.add(
+        name="Kopierer", folder="scans", target_archive="2", target_folder="scans/fertig"
+    )
+
+    assert store.get(pickup_id).target_folder == "scans/fertig"
+
+
+def test_the_name_defaults_to_the_folder(tmp_path):
+    store = _store(tmp_path)
+
+    pickup_id = store.add(folder="scans/flur")
+
+    assert store.get(pickup_id).name == "scans/flur"
+
+
+def test_paths_are_normalised(tmp_path):
+    store = _store(tmp_path)
+
+    pickup_id = store.add(folder="scans\\\\flur\\\\", target_folder="eingang/")
+
+    pickup = store.get(pickup_id)
+    assert (pickup.folder, pickup.target_folder) == ("scans/flur", "eingang")
+
+
+# --- the rules a pickup plays by ----------------------------------------------
+
+
+def test_files_into_itself_detects_the_loop():
+    assert _pickup(folder="scans", target_folder="scans/fertig").files_into_itself() is True
+    assert _pickup(folder="scans", target_folder="scans").files_into_itself() is True
+    assert _pickup(folder="scans", target_folder="eingang").files_into_itself() is False
+    # no fixed target: the rules decide, and they cannot point back by name
+    assert _pickup(folder="scans", target_folder="").files_into_itself() is False
+
+
+def test_a_similar_name_is_not_a_loop():
+    assert _pickup(folder="scans", target_folder="scans-fertig").files_into_itself() is False
+
+
+def test_the_rule_scope_can_never_be_a_real_account():
+    """Account ids are numbers, so only "all accounts" rules may claim a scan."""
+    assert _pickup(id=3).rule_scope() == "pickup:3"
+
+
+# --- store --------------------------------------------------------------------
+
+
+def test_add_update_delete(tmp_path):
+    store = _store(tmp_path)
+    pickup_id = store.add(name="Kopierer", folder="scans", target_folder="eingang")
+
+    store.update(pickup_id, name="Kopierer Flur")
+    assert store.get(pickup_id).name == "Kopierer Flur"
+    assert store.get(pickup_id).target_folder == "eingang"
+
+    store.delete(pickup_id)
+    assert store.get(pickup_id) is None
+
+
+def test_disabled_folders_are_not_watched(tmp_path):
+    store = _store(tmp_path)
+    store.add(name="Aus", folder="scans", enabled=False)
+
+    assert store.enabled() == []
+
+
+def test_deleting_a_printer_stops_the_printing(tmp_path):
+    store = _store(tmp_path)
+    pickup_id = store.add(name="Kopierer", folder="scans", print_attachments=True, printer="4")
+
+    assert store.clear_printer("4") == 1
+
+    pickup = store.get(pickup_id)
+    assert (pickup.print_attachments, pickup.printer) == (False, "")
+MAIL2NAS_EOF
+
+# --- tests/test_scanning.py ---
+cat > tests/test_scanning.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from mail2nas.archives import ArchiveStore, StorageSet
+from mail2nas.config import parse_extension_list
+from mail2nas.mapping import Mapping, Rule, save_rules
+from mail2nas.pickups import PickupStore
+from mail2nas.printers import PrinterStore
+from mail2nas.printing import PrintService
+from mail2nas.scanning import PickupRunner
+from mail2nas.storage import LocalStorage
+from tests.test_archiver import RecordingSpooler, _make_config
+
+
+def _env(tmp_path, rules=None, **config_overrides):
+    """A runner over <tmp_path> as the default archive, plus a second one."""
+    second = tmp_path / "nas2"
+    second.mkdir(exist_ok=True)
+
+    config = _make_config(tmp_path, **config_overrides)
+    archives = ArchiveStore(str(tmp_path / "state.db"))
+    archives.add(name="Haupt", backend="local", path=str(tmp_path))
+    second_id = archives.add(name="NAS 2", backend="local", path=str(second))
+    storages = StorageSet(archives, LocalStorage(config.storage_root))
+
+    storage = LocalStorage(config.storage_root)
+    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    if rules:
+        save_rules(storage, config.mapping_path, rules)
+        mapping.reload(force=True)
+
+    pickups = PickupStore(str(tmp_path / "state.db"))
+    runner = PickupRunner(config, mapping, storages, pickups, min_age_seconds=0)
+    return runner, pickups, second, str(second_id)
+
+
+def _drop(directory: Path, name: str, content: bytes = b"scan", age: int = 60) -> Path:
+    """Write a file into a pickup folder, pretending it finished `age` ago."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_bytes(content)
+    stamp = time.time() - age
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+# --- the basic move -----------------------------------------------------------
+
+
+def test_a_ready_file_is_moved_into_the_target_folder(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    source = _drop(tmp_path / "scans", "SKM_C250i.pdf")
+
+    assert runner.run_once() == 1
+
+    assert not source.exists()  # the folder is an outbox, not an archive
+    filed = list((tmp_path / "eingang").glob("*"))
+    assert len(filed) == 1
+    assert filed[0].read_bytes() == b"scan"
+
+
+def test_the_name_gets_the_date_and_the_folder_it_came_from(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans", "scan.pdf")
+
+    runner.run_once()
+
+    name = next((tmp_path / "eingang").glob("*")).name
+    assert name.endswith("_Kopierer_scan.pdf")
+    assert name[:4].isdigit()
+
+
+def test_subfolders_are_walked(tmp_path):
+    """Devices create one folder per user or scan profile."""
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans" / "anna", "a.pdf")
+    _drop(tmp_path / "scans" / "bert", "b.pdf")
+
+    assert runner.run_once() == 2
+    assert len(list((tmp_path / "eingang").glob("*"))) == 2
+
+
+def test_two_scans_of_the_same_name_do_not_overwrite_each_other(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path, filename_prefix="none")
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans", "scan.pdf", b"erster")
+    runner.run_once()
+    _drop(tmp_path / "scans", "scan.pdf", b"zweiter")
+    runner.run_once()
+
+    assert sorted(p.read_bytes() for p in (tmp_path / "eingang").glob("*")) == [
+        b"erster",
+        b"zweiter",
+    ]
+
+
+# --- what is not ready --------------------------------------------------------
+
+
+def test_a_file_still_being_written_is_left_alone(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    runner.min_age_seconds = 30
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    source = _drop(tmp_path / "scans", "halb.pdf", age=0)
+
+    assert runner.run_once() == 0
+    assert source.exists()
+
+
+@pytest.mark.parametrize("name", ["scan.pdf.tmp", "scan.PART", "scan.crdownload", ".versteckt.pdf"])
+def test_half_written_or_hidden_files_are_ignored(tmp_path, name):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    source = _drop(tmp_path / "scans", name)
+
+    assert runner.run_once() == 0
+    assert source.exists()
+
+
+def test_an_empty_file_is_ignored(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans", "leer.pdf", b"")
+
+    assert runner.run_once() == 0
+
+
+def test_a_folder_that_does_not_exist_yet_is_created(tmp_path, caplog):
+    """The device has to be able to write there - so make it, and say so once."""
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+
+    with caplog.at_level("WARNING"):
+        assert runner.run_once() == 0
+        assert runner.run_once() == 0
+
+    assert (tmp_path / "scans").is_dir()
+    warnings = [r for r in caplog.records if r.name == "mail2nas.scanning"]
+    assert len(warnings) == 1
+
+
+def test_a_disabled_folder_is_not_touched(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang", enabled=False)
+    source = _drop(tmp_path / "scans", "scan.pdf")
+
+    assert runner.run_once() == 0
+    assert source.exists()
+
+
+def test_dry_run_moves_nothing(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path, dry_run=True)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    source = _drop(tmp_path / "scans", "scan.pdf")
+
+    assert runner.run_once() == 0
+    assert source.exists()
+
+
+# --- where the document goes ---------------------------------------------------
+
+
+def test_without_a_fixed_target_the_keyword_rules_decide(tmp_path):
+    runner, pickups, _, _ = _env(
+        tmp_path, rules=[Rule.create("Rechnung", "rechnungen")]
+    )
+    pickups.add(name="Kopierer", folder="scans")
+    _drop(tmp_path / "scans", "Rechnung_4711.pdf")
+
+    runner.run_once()
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+
+def test_without_a_match_the_fallback_folder_is_used(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path, rules=[Rule.create("Rechnung", "rechnungen")])
+    pickups.add(name="Kopierer", folder="scans")
+    _drop(tmp_path / "scans", "irgendwas.pdf")
+
+    runner.run_once()
+
+    assert len(list((tmp_path / "unsorted").glob("*"))) == 1
+
+
+def test_rules_pinned_to_a_mailbox_do_not_claim_folder_scans(tmp_path):
+    """A file from a folder arrived through no mailbox at all."""
+    runner, pickups, _, _ = _env(
+        tmp_path, rules=[Rule.create("Rechnung", "privat", account="2")]
+    )
+    pickups.add(name="Kopierer", folder="scans")
+    _drop(tmp_path / "scans", "Rechnung_1.pdf")
+
+    runner.run_once()
+
+    assert not (tmp_path / "privat").exists()
+    assert len(list((tmp_path / "unsorted").glob("*"))) == 1
+
+
+def test_a_blocked_extension_is_quarantined(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans", "Rechnung.exe", b"MZ")
+
+    runner.run_once()
+
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+    assert not (tmp_path / "eingang").exists()
+
+
+def test_the_quarantine_list_is_read_live(tmp_path):
+    """Editing it in the web UI has to take effect without a restart."""
+    runner, pickups, _, _ = _env(tmp_path)
+    blocked = {"value": parse_extension_list("exe")}
+    runner._blocked_extensions = lambda: blocked["value"]
+    pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+
+    blocked["value"] = parse_extension_list("pdf")
+    _drop(tmp_path / "scans", "scan.pdf")
+    runner.run_once()
+
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_a_target_inside_the_pickup_folder_is_skipped(tmp_path):
+    """Configuration refuses it, a hand-edited database must not loop either."""
+    runner, pickups, _, _ = _env(tmp_path)
+    pickup_id = pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
+    import sqlite3
+
+    with sqlite3.connect(str(tmp_path / "state.db")) as conn:
+        conn.execute(
+            "UPDATE pickup_folders SET target_folder = 'scans/fertig' WHERE id = ?", (pickup_id,)
+        )
+    source = _drop(tmp_path / "scans", "scan.pdf")
+
+    assert runner.run_once() == 0
+    assert source.exists()
+
+
+# --- several archives ----------------------------------------------------------
+
+
+def test_a_scan_can_be_filed_onto_another_archive(tmp_path):
+    runner, pickups, second, second_key = _env(tmp_path)
+    pickups.add(
+        name="Kopierer", folder="scans", target_archive=second_key, target_folder="eingang"
+    )
+    _drop(tmp_path / "scans", "scan.pdf", b"inhalt")
+
+    assert runner.run_once() == 1
+
+    filed = list((second / "eingang").glob("*"))
+    assert len(filed) == 1 and filed[0].read_bytes() == b"inhalt"
+    assert not (tmp_path / "scans" / "scan.pdf").exists()
+
+
+def test_the_folder_can_live_on_the_second_archive(tmp_path):
+    runner, pickups, second, second_key = _env(tmp_path)
+    pickups.add(
+        name="Kopierer", archive=second_key, folder="scans", target_folder="eingang"
+    )
+    _drop(second / "scans", "scan.pdf")
+
+    assert runner.run_once() == 1
+    assert len(list((tmp_path / "eingang").glob("*"))) == 1
+
+
+# --- printing ------------------------------------------------------------------
+
+
+def _printing(tmp_path, queue="drucker_a"):
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = str(store.add(name=queue, destination=queue))
+    spooler = RecordingSpooler()
+    return PrintService(store, spooler), spooler, printer_id
+
+
+def test_a_pickup_can_print_what_it_files(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    printing, spooler, printer_id = _printing(tmp_path)
+    runner.printing = printing
+    pickups.add(
+        name="Kopierer", folder="scans", target_folder="eingang",
+        print_attachments=True, printer=printer_id,
+    )
+    _drop(tmp_path / "scans", "scan.pdf")
+
+    assert runner.run_once() == 1
+
+    assert spooler.printed_on == ["drucker_a"]
+    assert len(list((tmp_path / "eingang").glob("*"))) == 1
+
+
+def test_a_quarantined_scan_is_never_printed(tmp_path):
+    runner, pickups, _, _ = _env(tmp_path)
+    printing, spooler, printer_id = _printing(tmp_path)
+    runner.printing = printing
+    pickups.add(
+        name="Kopierer", folder="scans", target_folder="eingang",
+        print_attachments=True, printer=printer_id,
+    )
+    _drop(tmp_path / "scans", "boese.exe", b"MZ")
+
+    runner.run_once()
+
+    assert spooler.printed_on == []
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+def test_one_broken_folder_does_not_stop_the_others(tmp_path, monkeypatch):
+    runner, pickups, _, _ = _env(tmp_path)
+    broken = pickups.add(name="Kaputt", folder="fehlt", target_folder="eingang")
+    original = runner._empty
+
+    def explode(pickup):
+        if pickup.id == broken:
+            raise OSError("Share weg")
+        return original(pickup)
+
+    monkeypatch.setattr(runner, "_empty", explode)
+    pickups.add(name="Gut", folder="scans", target_folder="eingang")
+    _drop(tmp_path / "scans", "scan.pdf")
+
+    assert runner.run_once() == 1
 MAIL2NAS_EOF
 
 # --- tests/test_printers.py ---

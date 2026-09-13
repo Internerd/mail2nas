@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+from pathlib import Path
 
 import pytest
 
@@ -163,3 +164,86 @@ def test_from_config_selects_the_configured_backend(tmp_path):
     )
     assert isinstance(smb, SmbStorage)
     assert smb.description == "//nas.local/Belege"
+
+
+# --- listing and moving files (pickup folders) --------------------------------
+
+
+def _drop(path: Path, content: bytes = b"scan") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_list_files_finds_files_in_subfolders(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf")
+    _drop(tmp_path / "scans" / "anna" / "b.pdf")
+
+    found = storage.list_files(("scans",))
+
+    assert sorted(entry.relative for entry in found) == ["scans/a.pdf", "scans/anna/b.pdf"]
+    assert all(entry.size == 4 for entry in found)
+
+
+def test_list_files_skips_hidden_entries(tmp_path):
+    """Our own temporary files start with a dot - they are not documents."""
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / ".mail2nas-tmp-1")
+    _drop(tmp_path / "scans" / "real.pdf")
+
+    assert [entry.name for entry in storage.list_files(("scans",))] == ["real.pdf"]
+
+
+def test_list_files_on_a_missing_folder_is_empty(tmp_path):
+    assert LocalStorage(str(tmp_path)).list_files(("gibtsnicht",)) == []
+
+
+def test_list_files_stops_at_the_depth_limit(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a" / "b" / "c" / "deep.pdf")
+
+    assert storage.list_files(("scans",), max_depth=2) == []
+    assert len(storage.list_files(("scans",), max_depth=5)) == 1
+
+
+def test_move_unique_moves_and_removes_the_original(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    source = _drop(tmp_path / "scans" / "a.pdf", b"inhalt")
+
+    out = storage.move_unique(("scans", "a.pdf"), ("eingang",), "2026-01-01_a.pdf")
+
+    assert not source.exists()
+    assert Path(out).read_bytes() == b"inhalt"
+
+
+def test_move_unique_never_overwrites(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "eingang" / "a.pdf", b"alt")
+    _drop(tmp_path / "scans" / "a.pdf", b"neu")
+
+    out = storage.move_unique(("scans", "a.pdf"), ("eingang",), "a.pdf")
+
+    assert Path(out).name == "a_1.pdf"
+    assert (tmp_path / "eingang" / "a.pdf").read_bytes() == b"alt"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores write permission bits")
+def test_a_source_that_cannot_be_deleted_leaves_no_copy(tmp_path):
+    """Copying without deleting would re-import the same scan for ever."""
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf")
+    (tmp_path / "scans").chmod(0o500)
+    try:
+        with pytest.raises(OSError):
+            storage.move_unique(("scans", "a.pdf"), ("eingang",), "a.pdf")
+        assert list((tmp_path / "eingang").glob("*")) == []
+    finally:
+        (tmp_path / "scans").chmod(0o700)
+
+
+def test_read_bytes(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    _drop(tmp_path / "scans" / "a.pdf", b"%PDF-1.4")
+
+    assert storage.read_bytes("scans/a.pdf") == b"%PDF-1.4"

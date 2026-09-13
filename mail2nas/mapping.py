@@ -94,6 +94,9 @@ class Rule:
     # empty string means "whatever the mailbox is set to".
     print_attachments: bool = False
     printer: str = ""
+    # Which archive the folder is on. Empty = the default archive, so a
+    # mapping file written before there was more than one keeps working.
+    archive: str = ""
     _matcher: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
@@ -104,6 +107,7 @@ class Rule:
         account: str = ALL_ACCOUNTS,
         print_attachments: bool = False,
         printer: str = "",
+        archive: str = "",
     ) -> "Rule":
         return cls(
             keyword,
@@ -111,6 +115,7 @@ class Rule:
             account or ALL_ACCOUNTS,
             bool(print_attachments),
             str(printer or ""),
+            str(archive or ""),
             _compile(keyword),
         )
 
@@ -138,6 +143,8 @@ class Rule:
             data["print"] = True
         if self.printer:
             data["printer"] = self.printer
+        if self.archive:
+            data["archive"] = self.archive
         return data
 
 
@@ -173,6 +180,7 @@ def parse_rules(raw) -> list[Rule]:
                     str(entry.get("account", ALL_ACCOUNTS)),
                     _as_bool(entry.get("print", False)),
                     str(entry.get("printer", "") or ""),
+                    str(entry.get("archive", "") or ""),
                 )
             )
         return rules
@@ -210,6 +218,15 @@ class Mapping:
     @property
     def path(self) -> str:
         return self._relative_path
+
+    def set_storage(self, storage: Storage) -> None:
+        """Point at a different archive (the default one was reconfigured)."""
+        with self._lock:
+            if storage is self._storage:
+                return
+            self._storage = storage
+            self._mtime = None
+        self.set_path(self._relative_path)
 
     def set_path(self, relative_path: str) -> None:
         """Point at a different mapping file and load it immediately."""
@@ -366,6 +383,11 @@ def move_rule(rules: list[Rule], index: int, offset: int) -> list[Rule]:
 
 def set_account(rule: Rule, account: str) -> Rule:
     return replace(rule, account=account or ALL_ACCOUNTS)
+
+
+def set_archive(rule: Rule, archive: str) -> Rule:
+    """Move a rule's target folder to another archive ("" = the default one)."""
+    return replace(rule, archive=str(archive or ""))
 
 
 def set_printing(rule: Rule, print_attachments: bool, printer: str) -> Rule:

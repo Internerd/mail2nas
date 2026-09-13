@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from .filenames import safe_relative_parts
@@ -28,11 +29,21 @@ def _bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _extension_set(name: str, default: str) -> frozenset[str]:
-    raw = os.environ.get(name, default)
+def parse_extension_list(raw: str) -> frozenset[str]:
+    """Normalise a list of file extensions ('.EXE, com; bat' -> {exe, com, bat}).
+
+    Accepts commas, semicolons and whitespace as separators, because the
+    field is typed by hand in the web UI and every one of those gets used.
+    """
     return frozenset(
-        ext.strip().lower().lstrip(".") for ext in raw.split(",") if ext.strip()
+        ext.strip().lower().lstrip(".")
+        for ext in re.split(r"[,;\s]+", raw or "")
+        if ext.strip()
     )
+
+
+def _extension_set(name: str, default: str) -> frozenset[str]:
+    return parse_extension_list(os.environ.get(name, default))
 
 
 def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:

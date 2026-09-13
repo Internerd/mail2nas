@@ -5,6 +5,7 @@ import textwrap
 from email.message import EmailMessage
 
 from mail2nas.addresses import AddressStore
+from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
 from mail2nas.config import (
     DEFAULT_BLOCKED_EXTENSIONS,
@@ -102,6 +103,8 @@ def _make_archiver(
     account: Account | None = None,
     printing=None,
     addresses=None,
+    storages=None,
+    blocked_extensions=None,
     **config_overrides,
 ) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
@@ -112,7 +115,15 @@ def _make_archiver(
     mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
     return Archiver(
-        config, mapping, store, storage, account or TEST_ACCOUNT, printing, addresses
+        config,
+        mapping,
+        store,
+        storage,
+        account or TEST_ACCOUNT,
+        printing,
+        addresses,
+        storages,
+        blocked_extensions,
     )
 
 
@@ -914,3 +925,138 @@ def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
     assert "-o media=A4" in called
     # and the document is on the share as well
     assert any((tmp_path / "unsorted").glob("*"))
+
+
+# --- several archives ----------------------------------------------------------
+
+
+def _two_archives(tmp_path):
+    """<tmp_path> as the default archive, <tmp_path>/nas2 as the second."""
+    second = tmp_path / "nas2"
+    second.mkdir(exist_ok=True)
+    archives = ArchiveStore(str(tmp_path / "archives.db"))
+    archives.add(name="Haupt", backend="local", path=str(tmp_path))
+    second_key = str(archives.add(name="NAS 2", backend="local", path=str(second)))
+    return StorageSet(archives, LocalStorage(str(tmp_path))), second, second_key
+
+
+def test_a_rule_files_onto_the_archive_it_names(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "{second_key}"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_build_message("RE-1", [("b.pdf", b"D")])), 1)
+
+    assert len(list((second / "rechnungen").glob("*"))) == 1
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_a_rule_without_an_archive_uses_the_default_one(tmp_path):
+    storages, second, _ = _two_archives(tmp_path)
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n", storages=storages)
+
+    archiver._process_message(FakeIMAPClient(uid=2, raw=_build_message("RE-1", [("b.pdf", b"D")])), 2)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+    assert not (second / "rechnungen").exists()
+
+
+def test_a_deleted_archive_falls_back_instead_of_losing_the_attachment(tmp_path):
+    storages, _, _ = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "999"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=3, raw=_build_message("RE-1", [("b.pdf", b"D")])), 3)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+
+def test_an_address_rule_can_send_a_document_to_another_archive(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    addresses = _addresses(tmp_path, print_attachments=False, folder="ausdrucke",
+                           archive=second_key)
+    archiver = _make_archiver(tmp_path, addresses=addresses, storages=storages)
+
+    archiver._process_message(FakeIMAPClient(uid=4, raw=_addressed_message()), 4)
+
+    assert len(list((second / "ausdrucke").glob("*"))) == 1
+
+
+def test_the_address_archive_wins_over_the_rule_folder_archive(tmp_path):
+    """"File it where it usually goes, but on that NAS" has to work."""
+    storages, second, second_key = _two_archives(tmp_path)
+    addresses = _addresses(tmp_path, print_attachments=False, archive=second_key)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="Vertrag: vertraege\n",
+        addresses=addresses,
+        storages=storages,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=5, raw=_addressed_message(filename="Vertrag_7.pdf")), 5
+    )
+
+    assert len(list((second / "vertraege").glob("*"))) == 1
+
+
+def test_a_quarantined_attachment_stays_on_the_archive_it_was_meant_for(tmp_path):
+    storages, second, second_key = _two_archives(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content=f"""
+            version: 2
+            rules:
+              - keyword: RE
+                folder: rechnungen
+                archive: "{second_key}"
+        """,
+        storages=storages,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=6, raw=_build_message("RE-1", [("Rechnung.exe", b"MZ")])), 6
+    )
+
+    assert len(list((second / "quarantaene").glob("*"))) == 1
+
+
+# --- the quarantine list is read live -------------------------------------------
+
+
+def test_the_blocked_extension_list_is_read_per_message(tmp_path):
+    """Editing it in the web UI must not need a restart."""
+    blocked = {"value": frozenset()}
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", blocked_extensions=lambda: blocked["value"]
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=7, raw=_build_message("RE-1", [("a.exe", b"MZ")])), 7
+    )
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+    blocked["value"] = frozenset({"exe"})
+    archiver._process_message(
+        FakeIMAPClient(uid=8, raw=_build_message("RE-2", [("b.exe", b"MZ")])), 8
+    )
+
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1

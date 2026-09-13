@@ -75,6 +75,7 @@ class AddressRule:
     printer: str  # printer key; "" = whatever the mailbox is set to
     archive_attachments: bool
     folder: str  # "" = let the keyword rules decide
+    archive: str  # which archive the folder is on; "" = the default one
     enabled: bool
 
     @property
@@ -114,7 +115,7 @@ class AddressStore:
 
     _COLUMNS = (
         "id, name, recipient, sender, print_attachments, printer, "
-        "archive_attachments, folder, enabled"
+        "archive_attachments, folder, archive, enabled"
     )
 
     def __init__(self, db_path: str):
@@ -134,6 +135,7 @@ class AddressStore:
                 "folder TEXT NOT NULL DEFAULT '', "
                 "enabled INTEGER NOT NULL DEFAULT 1)"
             )
+            _add_missing_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)
@@ -149,7 +151,8 @@ class AddressStore:
             printer=row[5] or "",
             archive_attachments=bool(row[6]),
             folder=row[7] or "",
-            enabled=bool(row[8]),
+            archive=row[8] or "",
+            enabled=bool(row[9]),
         )
 
     def all(self) -> list[AddressRule]:
@@ -185,9 +188,9 @@ class AddressStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO address_rules (name, recipient, sender, print_attachments, "
-                "printer, archive_attachments, folder, enabled) "
+                "printer, archive_attachments, folder, archive, enabled) "
                 "VALUES (:name, :recipient, :sender, :print_attachments, :printer, "
-                ":archive_attachments, :folder, :enabled)",
+                ":archive_attachments, :folder, :archive, :enabled)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -205,6 +208,7 @@ class AddressStore:
                 "printer": current.printer,
                 "archive_attachments": current.archive_attachments,
                 "folder": current.folder,
+                "archive": current.archive,
                 "enabled": current.enabled,
                 **fields,
             }
@@ -215,7 +219,7 @@ class AddressStore:
                 "UPDATE address_rules SET name = :name, recipient = :recipient, "
                 "sender = :sender, print_attachments = :print_attachments, "
                 "printer = :printer, archive_attachments = :archive_attachments, "
-                "folder = :folder, enabled = :enabled WHERE id = :id",
+                "folder = :folder, archive = :archive, enabled = :enabled WHERE id = :id",
                 values,
             )
 
@@ -234,6 +238,19 @@ class AddressStore:
                 "UPDATE address_rules SET printer = '' WHERE printer = ?", (str(printer_key),)
             )
             return cursor.rowcount or 0
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to date.
+
+    Address rules shipped before archives were configurable, and an update
+    must not require re-entering them - so the column is added in place, with
+    a default that keeps every existing rule on the archive it used.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(address_rules)")}
+    if "archive" not in existing:
+        conn.execute("ALTER TABLE address_rules ADD COLUMN archive TEXT NOT NULL DEFAULT ''")
+        logger.info("Added the archive column to the address rule table")
 
 
 def validate(fields: dict) -> dict:
@@ -289,5 +306,6 @@ def validate(fields: dict) -> dict:
         "printer": str(fields.get("printer") or "").strip(),
         "archive_attachments": 1 if archive_attachments else 0,
         "folder": folder,
+        "archive": str(fields.get("archive") or "").strip(),
         "enabled": 1 if fields.get("enabled", True) else 0,
     }

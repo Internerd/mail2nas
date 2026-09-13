@@ -22,13 +22,32 @@ import secrets
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from .filenames import safe_relative_parts, unique_path, write_atomic
+from .filenames import copy_atomic, safe_relative_parts, unique_path, write_atomic
 
 logger = logging.getLogger(__name__)
 
 TEMP_PREFIX = ".mail2nas-tmp-"
+COPY_CHUNK = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class StoredFile:
+    """One file inside the archive, as `list_files` reports it."""
+
+    parts: tuple[str, ...]  # relative to the root, including the file name
+    size: int
+    mtime: float
+
+    @property
+    def name(self) -> str:
+        return self.parts[-1]
+
+    @property
+    def relative(self) -> str:
+        return "/".join(self.parts)
 
 
 class Storage(ABC):
@@ -62,6 +81,14 @@ class Storage(ABC):
         """Read a UTF-8 text file relative to the root. Raises FileNotFoundError."""
 
     @abstractmethod
+    def read_bytes(self, relative: str) -> bytes:
+        """Read a file relative to the root. Raises FileNotFoundError.
+
+        Used when a document has to cross from one archive to another, where
+        a streamed move is not possible because the two are different servers.
+        """
+
+    @abstractmethod
     def write_text(self, relative: str, text: str) -> None:
         """Overwrite a UTF-8 text file relative to the root, atomically.
 
@@ -81,6 +108,37 @@ class Storage(ABC):
     @abstractmethod
     def create_folder(self, relative: str) -> None:
         """Create a directory below the root, including parents."""
+
+    @abstractmethod
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        """True if `<root>/<parts>` is a directory.
+
+        `list_files` cannot answer this: an empty folder and a mistyped one
+        both look like "no files", and only one of them is worth telling
+        somebody about.
+        """
+
+    @abstractmethod
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        """Files below `<root>/<parts>`, recursively. Empty if it does not exist.
+
+        Feeds the pickup folders: a scanner writes there, and mail2nas has to
+        see what arrived, including in the per-user subfolders devices like to
+        create. Hidden files are skipped.
+        """
+
+    @abstractmethod
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        """Move `<root>/<source_parts>` to `<root>/<parts>/<filename>`.
+
+        Copy-then-delete rather than a rename: the two can be on different
+        shares once more than one archive is configured, and the original must
+        only disappear once the copy is complete. Never overwrites (a counter
+        is appended). Streamed, because a scan can be much larger than a mail
+        attachment.
+        """
 
     @abstractmethod
     def remove_file(self, relative: str) -> None:
@@ -130,6 +188,9 @@ class LocalStorage(Storage):
     def read_text(self, relative: str) -> str:
         return self._resolve(relative).read_text(encoding="utf-8")
 
+    def read_bytes(self, relative: str) -> bytes:
+        return self._resolve(relative).read_bytes()
+
     def write_text(self, relative: str, text: str) -> None:
         path = self._resolve(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +218,56 @@ class LocalStorage(Storage):
 
     def create_folder(self, relative: str) -> None:
         self._root.joinpath(*safe_relative_parts(relative)).mkdir(parents=True, exist_ok=True)
+
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        return self._root.joinpath(*parts).is_dir()
+
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        base = self._root.joinpath(*parts)
+        found: list[StoredFile] = []
+
+        def walk(directory: Path, prefix: tuple[str, ...], depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
+            except OSError:
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:  # vanished between listing and stat
+                    continue
+                if entry.is_dir():
+                    walk(entry, (*prefix, entry.name), depth + 1)
+                elif entry.is_file():
+                    found.append(
+                        StoredFile((*prefix, entry.name), stat.st_size, stat.st_mtime)
+                    )
+
+        if base.is_dir():
+            walk(base, tuple(parts), 1)
+        return found
+
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        source = self._root.joinpath(*source_parts)
+        directory = self._root.joinpath(*parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        out_path = unique_path(directory, filename)
+        copy_atomic(source, out_path)
+        try:
+            source.unlink()
+        except OSError:
+            # The copy is only legitimate if the original goes away: a pickup
+            # folder we cannot delete from would hand us the same scan again
+            # on every single cycle.
+            out_path.unlink(missing_ok=True)
+            raise
+        return str(out_path)
 
     def remove_file(self, relative: str) -> None:
         self._resolve(relative).unlink(missing_ok=True)
@@ -346,12 +457,7 @@ class SmbStorage(Storage):
 
         # Pick a free name. Single-writer assumption, same as the local
         # backend: mail2nas is one process per share path.
-        target_name = filename
-        stem, suffix = Path(filename).stem, Path(filename).suffix
-        counter = 0
-        while smbclient.path.exists(self._unc(parts, target_name), **self._kwargs):
-            counter += 1
-            target_name = f"{stem}_{counter}{suffix}"
+        target_name = self._free_name(parts, filename)
 
         # Write to a temporary name and rename into place, so an interrupted
         # transfer can never leave a truncated file under a name that looks
@@ -381,6 +487,18 @@ class SmbStorage(Storage):
 
         with smbclient.open_file(
             self._unc(parts[:-1], parts[-1]), mode="r", encoding="utf-8", **self._kwargs
+        ) as fh:
+            return fh.read()
+
+    def read_bytes(self, relative: str) -> bytes:
+        parts = safe_relative_parts(relative)
+        return self._with_reconnect("read", lambda: self._read_bytes(parts))
+
+    def _read_bytes(self, parts: Sequence[str]) -> bytes:
+        import smbclient
+
+        with smbclient.open_file(
+            self._unc(parts[:-1], parts[-1]), mode="rb", **self._kwargs
         ) as fh:
             return fh.read()
 
@@ -437,6 +555,113 @@ class SmbStorage(Storage):
     def create_folder(self, relative: str) -> None:
         parts = safe_relative_parts(relative)
         self._with_reconnect("mkdir", lambda: self._ensure_dir(parts))
+
+    def folder_exists(self, parts: Sequence[str]) -> bool:
+        base = tuple(parts)
+        return self._with_reconnect("stat", lambda: self._folder_exists(base))
+
+    def _folder_exists(self, parts: tuple[str, ...]) -> bool:
+        import smbclient.path
+
+        return bool(smbclient.path.isdir(self._unc(parts), **self._kwargs))
+
+    def list_files(self, parts: Sequence[str], max_depth: int = 5) -> list[StoredFile]:
+        base = tuple(parts)
+        return self._with_reconnect("list files", lambda: self._list_files(base, max_depth))
+
+    def _list_files(self, base: tuple[str, ...], max_depth: int) -> list[StoredFile]:
+        import smbclient
+
+        found: list[StoredFile] = []
+
+        def walk(current: tuple[str, ...], depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(
+                    smbclient.scandir(self._unc(current), **self._kwargs),
+                    key=lambda e: e.name.lower(),
+                )
+            except Exception:  # noqa: BLE001 - a folder that is gone is simply empty
+                logger.debug("Could not list %s", self._unc(current), exc_info=True)
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    walk((*current, entry.name), depth + 1)
+                    continue
+                try:
+                    stat = entry.stat()
+                except Exception:  # noqa: BLE001 - vanished between listing and stat
+                    continue
+                found.append(
+                    StoredFile((*current, entry.name), stat.st_size, stat.st_mtime)
+                )
+
+        walk(base, 1)
+        return found
+
+    def move_unique(
+        self, source_parts: Sequence[str], parts: Sequence[str], filename: str
+    ) -> str:
+        source = tuple(source_parts)
+        target = tuple(parts)
+        return self._with_reconnect(
+            "move", lambda: self._move_unique(source, target, filename)
+        )
+
+    def _move_unique(
+        self, source_parts: tuple[str, ...], parts: tuple[str, ...], filename: str
+    ) -> str:
+        import smbclient
+        import smbclient.path
+
+        self._ensure_dir(parts)
+        target_name = self._free_name(parts, filename)
+
+        tmp_name = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
+        tmp_path = self._unc(parts, tmp_name)
+        source_path = self._unc(source_parts[:-1], source_parts[-1])
+        try:
+            with smbclient.open_file(source_path, mode="rb", **self._kwargs) as src:
+                with smbclient.open_file(tmp_path, mode="xb", **self._kwargs) as dst:
+                    while True:
+                        chunk = src.read(COPY_CHUNK)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+            smbclient.replace(tmp_path, self._unc(parts, target_name), **self._kwargs)
+        except BaseException:
+            try:
+                smbclient.remove(tmp_path, **self._kwargs)
+            except Exception:  # noqa: BLE001 - cleanup of a failed copy is best effort
+                logger.debug("Could not remove temporary file %s", tmp_path, exc_info=True)
+            raise
+
+        try:
+            smbclient.remove(source_path, **self._kwargs)
+        except Exception:
+            # Without the delete the same file would be picked up again on the
+            # next cycle, so the copy has to go rather than be duplicated.
+            try:
+                smbclient.remove(self._unc(parts, target_name), **self._kwargs)
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not remove the copy either", exc_info=True)
+            raise
+
+        return self._display_unc(parts, target_name)
+
+    def _free_name(self, parts: Sequence[str], filename: str) -> str:
+        import smbclient.path
+
+        target_name = filename
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        counter = 0
+        while smbclient.path.exists(self._unc(parts, target_name), **self._kwargs):
+            counter += 1
+            target_name = f"{stem}_{counter}{suffix}"
+        return target_name
 
     def remove_file(self, relative: str) -> None:
         parts = safe_relative_parts(relative)

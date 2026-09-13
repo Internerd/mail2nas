@@ -43,11 +43,14 @@ from .mapping import (
     move_rule,
     save_rules,
     set_account,
+    set_archive,
     set_printing,
     validate_folder,
     validate_keyword,
 )
 from .addresses import AddressError
+from .archives import ArchiveError
+from .pickups import PICKUP_INTERVAL, PickupError
 from .discovery import discover
 from .printers import PrinterError
 from .printing import PrintError
@@ -239,6 +242,17 @@ MAPPING_BODY = """
         </select>
       </div>
       {% endif %}
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+            <option value="{{ entry.key }}">{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       {% if printers %}
       <div class="field">
         <label for="printer">Drucken</label>
@@ -314,6 +328,19 @@ MAPPING_BODY = """
             {% endfor %}
             {% if rule.account not in account_keys %}
               <option value="{{ rule.account }}" selected>(geloeschtes Postfach)</option>
+            {% endif %}
+          </select>
+          {% endif %}
+          {% if archives|length > 1 %}
+          <input type="hidden" name="archive_fields" value="1">
+          <select name="archive" title="Archiv, auf dem der Zielordner liegt">
+            <option value="" {% if not rule.archive %}selected{% endif %}>Standard-Archiv</option>
+            {% for entry in archives %}
+              <option value="{{ entry.key }}"
+                {% if rule.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+            {% endfor %}
+            {% if rule.archive and rule.archive not in archive_keys %}
+              <option value="{{ rule.archive }}" selected>(geloeschtes Archiv)</option>
             {% endif %}
           </select>
           {% endif %}
@@ -430,6 +457,95 @@ CONFIG_BODY = """
 </div>
 
 <div class="card">
+  <h2 style="margin-top:0">Archive</h2>
+  {% if archives %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Ort</th><th>Art</th><th>Status</th><th></th></tr>
+    {% for entry in archives %}
+    <tr>
+      <td class="keyword">{{ entry.name }}{% if loop.first %}
+        <span class="hint">Standard</span>{% endif %}</td>
+      <td>{{ entry.location() }}</td>
+      <td>{% if entry.backend == 'smb' %}SMB{% else %}gemountet{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_archive', archive_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dort liegt die
+  Mapping-Datei, dorthin geht alles ohne eigene Angabe. Zuordnungen, Zustelladressen
+  und Abholordner koennen jeweils ein anderes waehlen.</p>
+  {% else %}
+  <p class="hint">Es wird das Archiv aus der .env verwendet: {{ storage_description }}</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
+    <button type="button">Archiv hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Abholordner (Scan-to-Folder)</h2>
+  {% if pickups %}
+  <div class="table-wrap">
+  <table>
+    <tr><th>Name</th><th>Ordner</th><th>Ziel</th><th>Drucken</th><th>Status</th><th></th></tr>
+    {% for entry in pickups %}
+    <tr>
+      <td class="keyword">{{ entry.name }}</td>
+      <td>{{ entry.folder }}{% if entry.archive_label %}
+        <span class="hint">auf {{ entry.archive_label }}</span>{% endif %}</td>
+      <td>{{ entry.target_folder or 'nach Stichwoertern' }}{% if entry.target_archive_label %}
+        <span class="hint">auf {{ entry.target_archive_label }}</span>{% endif %}</td>
+      <td>{% if entry.print_attachments %}{{ entry.printer_label or 'ja' }}{% else %}nein{% endif %}</td>
+      <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
+      <td style="white-space:nowrap">
+        <a href="{{ url_for('edit_pickup', pickup_id=entry.id) }}">Bearbeiten</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="hint">Fertige Dateien werden von dort ins Archiv <em>verschoben</em> -
+  ganz ohne Postfach. Geprueft wird alle {{ pickup_interval }} Sekunden.</p>
+  {% else %}
+  <p class="hint">Kein Abholordner eingerichtet. Fuer Geraete, die Scans per SMB
+  ablegen statt sie zu mailen: Ordner eintragen, mail2nas raeumt ihn ab.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('new_pickup') }}">
+    <button type="button">Abholordner hinzufuegen</button></a></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Quarantaene und Abholen</h2>
+  <form method="post" action="{{ url_for('save_settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="blocked_extensions">Gesperrte Dateiendungen</label>
+      <input id="blocked_extensions" name="blocked_extensions" type="text"
+             value="{{ blocked_extensions }}">
+    </div>
+    <p class="hint">Anhaenge mit einer dieser Endungen landen <strong>immer</strong> im
+    Ordner <code>{{ quarantine_folder }}</code> - auch wenn ein Stichwort passt und auch
+    wenn sie aus einem Abholordner kommen. So kann „Rechnung.exe" nicht im
+    Rechnungsordner landen. Gedruckt wird so etwas nie.
+    Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
+    <strong>Leer heisst: keine Pruefung.</strong></p>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="pickup_min_age">Abholordner: Datei gilt als fertig nach (Sekunden)</label>
+        <input id="pickup_min_age" name="pickup_min_age" type="text" value="{{ pickup_min_age }}">
+      </div>
+      <button type="submit">Speichern</button>
+    </div>
+    <p class="hint" style="margin-bottom:0">Wirkt sofort, ohne Neustart. Die
+    <code>.env</code> gibt nur noch den Startwert vor.</p>
+  </form>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">Zustelladressen</h2>
   {% if address_rules %}
   <div class="table-wrap">
@@ -445,7 +561,8 @@ CONFIG_BODY = """
         <span class="hint">&middot; {{ entry.printer_label }}</span>{% endif %}
         {% else %}nein{% endif %}</td>
       <td>{% if entry.archive_attachments %}ja{% if entry.folder %}
-        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}
+        <span class="hint">&middot; {{ entry.folder }}</span>{% endif %}{% if entry.archive_label %}
+        <span class="hint">&middot; {{ entry.archive_label }}</span>{% endif %}
         {% else %}nein{% endif %}</td>
       <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
@@ -490,6 +607,7 @@ CONFIG_BODY = """
     <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
     <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
     <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
+    <dt>Archiv aus der .env</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
     <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
     <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
     <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
@@ -747,10 +865,27 @@ ADDRESS_BODY = """
         {% if not entry or entry.archive_attachments %}checked{% endif %}>
         Anhaenge per SMB ablegen</label>
     </p>
-    <div class="field">
-      <label for="folder">Zielordner (optional)</label>
-      <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
-             placeholder="leer = nach Stichwort-Zuordnungen">
+    <div class="row">
+      <div class="field">
+        <label for="folder">Zielordner (optional)</label>
+        <input id="folder" name="folder" type="text" value="{{ entry.folder if entry else '' }}"
+               placeholder="leer = nach Stichwort-Zuordnungen">
+      </div>
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for item in archives %}
+          <option value="{{ item.key }}"
+            {% if entry and entry.archive == item.key %}selected{% endif %}>{{ item.name }}</option>
+          {% endfor %}
+          {% if entry and entry.archive and entry.archive not in archive_keys %}
+          <option value="{{ entry.archive }}" selected>(geloeschtes Archiv)</option>
+          {% endif %}
+        </select>
+      </div>
+      {% endif %}
     </div>
 
     <p style="margin:.9rem 0 .2rem">
@@ -838,6 +973,214 @@ DISCOVERY_BODY = """
 {% endif %}
 """
 
+ARCHIVE_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Archiv bearbeiten' if archive else 'Archiv hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ archive.name if archive else '' }}"
+               placeholder="z. B. NAS Buero">
+      </div>
+      <div class="field">
+        <label for="backend">Art</label>
+        <select id="backend" name="backend">
+          <option value="smb" {% if not archive or archive.backend == 'smb' %}selected{% endif %}>
+            SMB-Freigabe (nichts gemountet)</option>
+          <option value="local" {% if archive and archive.backend == 'local' %}selected{% endif %}>
+            Gemountetes Verzeichnis</option>
+        </select>
+      </div>
+    </div>
+
+    <p class="hint" style="margin:.9rem 0 .2rem"><strong>Nur fuer SMB:</strong></p>
+    <div class="row">
+      <div class="field">
+        <label for="host">Server (NAS)</label>
+        <input id="host" name="host" type="text" value="{{ archive.host if archive else '' }}"
+               placeholder="nas.lan oder 192.168.1.10">
+      </div>
+      <div class="field">
+        <label for="share">Freigabe</label>
+        <input id="share" name="share" type="text" value="{{ archive.share if archive else '' }}"
+               placeholder="z. B. Belege">
+      </div>
+      <div class="field">
+        <label for="root">Unterordner (optional)</label>
+        <input id="root" name="root" type="text" value="{{ archive.root if archive else '' }}"
+               placeholder="z. B. archiv/2026">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="user">Benutzer</label>
+        <input id="user" name="user" type="text" value="{{ archive.user if archive else '' }}">
+      </div>
+      <div class="field">
+        <label for="password">Passwort{% if archive %}
+          <span class="hint">(leer = unveraendert)</span>{% endif %}</label>
+        <input id="password" name="password" type="password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="domain">Domain (optional)</label>
+        <input id="domain" name="domain" type="text" value="{{ archive.domain if archive else '' }}">
+      </div>
+      <div class="field">
+        <label for="port">Port</label>
+        <input id="port" name="port" type="text" value="{{ archive.port if archive else '445' }}">
+      </div>
+    </div>
+    <p style="margin:.6rem 0 .2rem">
+      <label><input type="checkbox" name="encrypt" value="1"
+        {% if not archive or archive.encrypt %}checked{% endif %}> Verbindung verschluesseln
+        (SMB3; abschalten, wenn der Server das ablehnt)</label>
+    </p>
+
+    <p class="hint" style="margin:.9rem 0 .2rem"><strong>Nur fuer ein gemountetes
+    Verzeichnis:</strong></p>
+    <div class="field">
+      <label for="path">Pfad</label>
+      <input id="path" name="path" type="text" value="{{ archive.path if archive else '' }}"
+             placeholder="/mnt/nas2">
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not archive or archive.enabled %}checked{% endif %}> Archiv aktiv</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dort
+  liegt die Mapping-Datei, und dorthin geht alles, was kein eigenes Archiv nennt.
+  Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
+  mountet nichts.</p>
+</div>
+
+{% if archive %}
+<div class="card">
+  <h2 style="margin-top:0">Verbindung testen</h2>
+  <form method="post" action="{{ url_for('test_archive', archive_id=archive.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Verbindung testen</button>
+    <p class="hint">Schreibt eine winzige Testdatei und loescht sie wieder - so steht
+    fest, dass Zugangsdaten und Schreibrechte stimmen, bevor die erste Rechnung
+    kommt.</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Archiv loeschen</h2>
+  <form method="post" action="{{ url_for('delete_archive', archive_id=archive.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Dieses Archiv loeschen</button>
+    <p class="hint">Die Dateien darauf bleiben unangetastet. Zuordnungen und Adressen,
+    die darauf zeigten, nutzen danach das Standard-Archiv.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
+PICKUP_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">{{ 'Abholordner bearbeiten' if pickup else 'Abholordner hinzufuegen' }}</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="name">Anzeigename</label>
+        <input id="name" name="name" type="text" value="{{ pickup.name if pickup else '' }}"
+               placeholder="z. B. Kopierer Flur">
+      </div>
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="archive">Archiv, auf dem der Ordner liegt</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+          <option value="{{ entry.key }}"
+            {% if pickup and pickup.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="folder">Abholordner</label>
+        <input id="folder" name="folder" type="text" value="{{ pickup.folder if pickup else '' }}"
+               placeholder="z. B. scans/kopierer-flur" required>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:.6rem">
+      {% if archives|length > 1 %}
+      <div class="field">
+        <label for="target_archive">Zielarchiv</label>
+        <select id="target_archive" name="target_archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+          <option value="{{ entry.key }}"
+            {% if pickup and pickup.target_archive == entry.key %}selected{% endif %}>
+            {{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="target_folder">Zielordner <span class="hint">(leer = nach Stichwoertern)</span></label>
+        <input id="target_folder" name="target_folder" type="text"
+               value="{{ pickup.target_folder if pickup else '' }}" placeholder="z. B. scans">
+      </div>
+      {% if printers %}
+      <div class="field">
+        <label for="printer">Drucken</label>
+        <select id="printer" name="printer">
+          <option value="">nicht drucken</option>
+          {% for printer in printers %}
+          <option value="{{ printer.key }}"
+            {% if pickup and pickup.print_attachments and pickup.printer == printer.key %}selected{% endif %}>
+            drucken auf {{ printer.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+    </div>
+
+    <p style="margin:.9rem 0 .2rem">
+      <label><input type="checkbox" name="enabled" value="1"
+        {% if not pickup or pickup.enabled %}checked{% endif %}> Ordner ueberwachen</label>
+    </p>
+    <div class="row" style="margin-top:.6rem">
+      <button type="submit">Speichern</button>
+      <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
+    </div>
+  </form>
+  <p class="hint">Der Ordner ist ein <strong>Postausgang, kein Archiv</strong>: was
+  abgeholt wurde, wird von dort <em>verschoben</em>. Angefasst wird eine Datei erst,
+  wenn sie {{ min_age }} Sekunden unveraendert ist - sonst landet eine noch laufende
+  Uebertragung im Archiv. Unterordner werden mitgelesen; versteckte und halbfertige
+  Dateien (<code>.tmp</code>, <code>.part</code>) bleiben liegen.</p>
+  <p class="hint">Ohne Zielordner entscheiden die Stichwort-Zuordnungen - dabei greifen
+  nur die fuer „alle Postfaecher", denn eine Datei aus einem Ordner gehoert zu keinem
+  Postfach. Gesperrte Dateiendungen kommen auch hier in die Quarantaene.</p>
+</div>
+
+{% if pickup %}
+<div class="card">
+  <h2 style="margin-top:0">Abholordner loeschen</h2>
+  <form method="post" action="{{ url_for('delete_pickup', pickup_id=pickup.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="danger" type="submit">Diesen Abholordner loeschen</button>
+    <p class="hint">Der Ordner selbst und alles darin bleiben unangetastet - es wird
+    nur nicht mehr hineingesehen.</p>
+  </form>
+</div>
+{% endif %}
+"""
+
 PASSWORD_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Passwort aendern</h2>
@@ -865,7 +1208,11 @@ PASSWORD_BODY = """
 
 def create_app(runtime) -> Flask:
     """Build the web UI on top of a Runtime (config, storage, settings, accounts)."""
-    config, storage, settings = runtime.config, runtime.storage, runtime.settings
+    config, settings = runtime.config, runtime.settings
+
+    def storage():
+        """The default archive - looked up per request, because it is editable."""
+        return runtime.storage
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=_secret_key(settings),
@@ -999,10 +1346,10 @@ def create_app(runtime) -> Flask:
         return True, value
 
     def _rules() -> list[Rule]:
-        return load_rules(storage, runtime.mapping_path)
+        return load_rules(storage(), runtime.mapping_path)
 
     def _save(rules: list[Rule]) -> None:
-        save_rules(storage, runtime.mapping_path, rules)
+        save_rules(storage(), runtime.mapping_path, rules)
 
     def _index(rules: list[Rule]) -> int:
         try:
@@ -1023,7 +1370,7 @@ def create_app(runtime) -> Flask:
             flash(str(exc), "error")
 
         try:
-            folders = storage.list_folders()
+            folders = storage().list_folders()
         except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
             folders = []
             logger.warning("Web UI: could not list folders (%s)", exc)
@@ -1046,7 +1393,8 @@ def create_app(runtime) -> Flask:
             account_keys=[account.key for account in accounts] + [ALL_ACCOUNTS],
             printers=printers,
             printer_keys=[printer.key for printer in printers],
-            storage_description=storage.description,
+            **_archive_context(),
+            storage_description=storage().description,
             mapping_path=runtime.mapping_path,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
@@ -1064,9 +1412,10 @@ def create_app(runtime) -> Flask:
             folder = validate_folder(chosen)
             account = _account_choice(request.form.get("account", ALL_ACCOUNTS))
             printing, printer = _print_choice(request.form.get("printer", ""))
+            archive = _archive_choice(request.form.get("archive", ""))
             if new_folder:
-                storage.create_folder(folder)
-            rules.append(Rule.create(keyword, folder, account, printing, printer))
+                _archive_storage(archive).create_folder(folder)
+            rules.append(Rule.create(keyword, folder, account, printing, printer, archive))
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -1102,8 +1451,17 @@ def create_app(runtime) -> Flask:
                 printing, printer = _print_choice(request.form.get("printer", ""))
             else:
                 printing, printer = rule.print_attachments, rule.printer
-            updated = Rule.create(rule.keyword, folder, account, printing, printer)
-            rules[index] = set_printing(set_account(updated, account), printing, printer)
+            # Same for the archive: the dropdown only exists once there is
+            # more than one archive to choose from.
+            archive = (
+                _archive_choice(request.form.get("archive", ""))
+                if request.form.get("archive_fields")
+                else rule.archive
+            )
+            updated = Rule.create(rule.keyword, folder, account, printing, printer, archive)
+            rules[index] = set_archive(
+                set_printing(set_account(updated, account), printing, printer), archive
+            )
             _save(rules)
         except MappingError as exc:
             flash(str(exc), "error")
@@ -1168,9 +1526,14 @@ def create_app(runtime) -> Flask:
             accounts=runtime.accounts.all(),
             printers=_printers(),
             address_rules=_address_rules(),
+            archives=_archives(),
+            pickups=_pickup_rows(),
+            pickup_interval=PICKUP_INTERVAL,
+            blocked_extensions=", ".join(sorted(runtime.blocked_extensions)),
+            pickup_min_age=runtime.pickup_min_age,
             printing_enabled=config.printing_enabled,
             mapping_path=runtime.mapping_path,
-            storage_description=storage.description,
+            storage_description=storage().description,
             storage_backend=config.storage_backend,
             fallback_folder=config.fallback_folder,
             quarantine_folder=config.quarantine_folder,
@@ -1179,6 +1542,31 @@ def create_app(runtime) -> Flask:
             poll_interval=config.poll_interval,
             dry_run=config.dry_run,
         )
+
+    @app.post("/config/settings")
+    @login_required
+    def save_settings():
+        require_csrf()
+        extensions = runtime.set_blocked_extensions(request.form.get("blocked_extensions", ""))
+        try:
+            age = runtime.set_pickup_min_age(request.form.get("pickup_min_age", "20").strip() or 0)
+        except (TypeError, ValueError):
+            age = runtime.pickup_min_age
+            flash("Die Wartezeit muss eine Zahl sein - sie blieb unveraendert.", "error")
+        logger.info(
+            "Web UI: quarantine list set to %d extension(s), pickup age %ss",
+            len(extensions),
+            age,
+        )
+        if extensions:
+            flash("Einstellungen gespeichert.", "ok")
+        else:
+            flash(
+                "Einstellungen gespeichert. Achtung: ohne gesperrte Endungen wird "
+                "nichts mehr in die Quarantaene verschoben.",
+                "error",
+            )
+        return redirect(url_for("config_page"))
 
     @app.post("/config/mapping-path")
     @login_required
@@ -1289,6 +1677,133 @@ def create_app(runtime) -> Flask:
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
 
+    # --- archives -------------------------------------------------------------
+
+    def _archives() -> list:
+        """The archives offered in the dropdowns; empty means "just the one"."""
+        if runtime.archives is None:
+            return []
+        return runtime.archives.all()
+
+    def _archive_context() -> dict:
+        archives = _archives()
+        return {"archives": archives, "archive_keys": [a.key for a in archives]}
+
+    def _archive_choice(value: str, fallback: str = "") -> str:
+        """Read an archive dropdown, refusing one that no longer exists."""
+        value = (value or "").strip()
+        if not value:
+            return ""
+        if value not in {archive.key for archive in _archives()}:
+            raise MappingError("Dieses Archiv gibt es nicht.")
+        return value
+
+    def _archive_storage(key: str):
+        return runtime.storages.get(key) if runtime.storages else storage()
+
+    def _require_archives():
+        if runtime.archives is None:
+            abort(404)
+        return runtime.archives
+
+    def _archive_form() -> dict:
+        backend = request.form.get("backend", "smb").strip().lower()
+        return {
+            "name": request.form.get("name", ""),
+            "backend": backend,
+            "host": request.form.get("host", ""),
+            "share": request.form.get("share", ""),
+            "user": request.form.get("user", ""),
+            "password": request.form.get("password", ""),
+            "domain": request.form.get("domain", ""),
+            "port": request.form.get("port", "445").strip() or "445",
+            "root": request.form.get("root", ""),
+            "encrypt": bool(request.form.get("encrypt")),
+            "path": request.form.get("path", ""),
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    @app.route("/config/archives/new", methods=["GET", "POST"])
+    @login_required
+    def new_archive():
+        archives = _require_archives()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                archives.add(**_archive_form())
+            except ArchiveError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added archive %r", request.form.get("name"))
+                flash("Archiv angelegt. Mit „Verbindung testen\" pruefen, ob es erreichbar ist.", "ok")
+                return redirect(url_for("config_page"))
+        return render(ARCHIVE_BODY, "Archiv", archive=None)
+
+    @app.route("/config/archives/<int:archive_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_archive(archive_id: int):
+        archives = _require_archives()
+        archive = archives.get(archive_id)
+        if archive is None:
+            flash("Dieses Archiv gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            fields = _archive_form()
+            # An empty password field means "keep the stored one", like the
+            # mailbox form - the page never shows the password back.
+            if not fields["password"]:
+                fields["password"] = archive.password
+            try:
+                archives.update(archive_id, **fields)
+            except ArchiveError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated archive %s", archive_id)
+                flash("Archiv gespeichert.", "ok")
+                runtime.mapping_path_changed.set()
+                return redirect(url_for("config_page"))
+            archive = archives.get(archive_id)
+        return render(ARCHIVE_BODY, "Archiv", archive=archive)
+
+    @app.post("/config/archives/<int:archive_id>/test")
+    @login_required
+    def test_archive(archive_id: int):
+        require_csrf()
+        archive = _require_archives().get(archive_id)
+        if archive is None:
+            flash("Dieses Archiv gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            archive.to_storage().check_writable()
+        except SystemExit as exc:
+            flash(f"Nicht erreichbar: {exc}", "error")
+        except Exception as exc:  # noqa: BLE001 - report anything else too
+            logger.exception("Web UI: archive test failed")
+            flash(f"Nicht erreichbar: {exc}", "error")
+        else:
+            flash(f"{archive.location()} ist erreichbar und beschreibbar.", "ok")
+        return redirect(url_for("edit_archive", archive_id=archive_id))
+
+    @app.post("/config/archives/<int:archive_id>/delete")
+    @login_required
+    def delete_archive(archive_id: int):
+        require_csrf()
+        archives = _require_archives()
+        if len(archives.all()) <= 1:
+            flash("Das letzte Archiv kann nicht geloescht werden.", "error")
+            return redirect(url_for("config_page"))
+        archives.delete(archive_id)
+        logger.info("Web UI: deleted archive %s", archive_id)
+        runtime.mapping_path_changed.set()
+        flash(
+            "Archiv geloescht. Zuordnungen, Zustelladressen und Abholordner, die darauf "
+            "zeigten, nutzen jetzt das Standard-Archiv.",
+            "ok",
+        )
+        return redirect(url_for("config_page"))
+
     # --- delivery addresses -------------------------------------------------
 
     def _require_addresses():
@@ -1302,6 +1817,7 @@ def create_app(runtime) -> Flask:
         if runtime.addresses is None:
             return []
         labels = {printer.key: printer.label() for printer in _printers()}
+        archive_names = {archive.key: archive.name for archive in _archives()}
         rules = []
         for rule in runtime.addresses.all():
             rules.append(
@@ -1315,6 +1831,7 @@ def create_app(runtime) -> Flask:
                     printer_label=labels.get(rule.printer, ""),
                     archive_attachments=rule.archive_attachments,
                     folder=rule.folder,
+                    archive_label=archive_names.get(rule.archive, ""),
                     enabled=rule.enabled,
                 )
             )
@@ -1329,6 +1846,7 @@ def create_app(runtime) -> Flask:
             "printer": request.form.get("printer", ""),
             "archive_attachments": bool(request.form.get("archive_attachments")),
             "folder": request.form.get("folder", ""),
+            "archive": request.form.get("archive", ""),
             "enabled": bool(request.form.get("enabled")),
         }
 
@@ -1346,7 +1864,9 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added address rule %r", request.form.get("recipient"))
                 flash("Zustelladresse angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context())
+        return render(
+            ADDRESS_BODY, "Zustelladresse", entry=None, **_printer_context(), **_archive_context()
+        )
 
     @app.route("/config/addresses/<int:address_id>", methods=["GET", "POST"])
     @login_required
@@ -1368,7 +1888,9 @@ def create_app(runtime) -> Flask:
                 flash("Zustelladresse gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             entry = addresses.get(address_id)
-        return render(ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context())
+        return render(
+            ADDRESS_BODY, "Zustelladresse", entry=entry, **_printer_context(), **_archive_context()
+        )
 
     @app.post("/config/addresses/<int:address_id>/delete")
     @login_required
@@ -1377,6 +1899,107 @@ def create_app(runtime) -> Flask:
         _require_addresses().delete(address_id)
         logger.info("Web UI: deleted address rule %s", address_id)
         flash("Zustelladresse geloescht.", "ok")
+        return redirect(url_for("config_page"))
+
+    # --- pickup folders -------------------------------------------------------
+
+    def _require_pickups():
+        if runtime.pickups is None:
+            abort(404)
+        return runtime.pickups
+
+    def _pickups() -> list:
+        return runtime.pickups.all() if runtime.pickups is not None else []
+
+    def _pickup_rows() -> list:
+        """The pickup folders with the names of what they point at."""
+        if runtime.pickups is None:
+            return []
+        archive_names = {archive.key: archive.name for archive in _archives()}
+        printer_labels = {printer.key: printer.label() for printer in _printers()}
+        rows = []
+        for pickup in runtime.pickups.all():
+            rows.append(
+                SimpleNamespace(
+                    id=pickup.id,
+                    name=pickup.name,
+                    folder=pickup.folder,
+                    archive_label=archive_names.get(pickup.archive, ""),
+                    target_folder=pickup.target_folder,
+                    target_archive_label=archive_names.get(pickup.target_archive, ""),
+                    print_attachments=pickup.print_attachments,
+                    printer_label=printer_labels.get(pickup.printer, ""),
+                    enabled=pickup.enabled,
+                )
+            )
+        return rows
+
+    def _pickup_form() -> dict:
+        printing, printer = _print_choice(request.form.get("printer", ""))
+        return {
+            "name": request.form.get("name", ""),
+            "archive": request.form.get("archive", ""),
+            "folder": request.form.get("folder", ""),
+            "target_archive": request.form.get("target_archive", ""),
+            "target_folder": request.form.get("target_folder", ""),
+            # "Drucker des Postfachs" makes no sense here - a folder has none.
+            "print_attachments": bool(printer),
+            "printer": printer,
+            "enabled": bool(request.form.get("enabled")),
+        }
+
+    def _pickup_context() -> dict:
+        return {
+            **_archive_context(),
+            **_printer_context(),
+            "min_age": runtime.pickup_min_age,
+        }
+
+    @app.route("/config/pickups/new", methods=["GET", "POST"])
+    @login_required
+    def new_pickup():
+        pickups = _require_pickups()
+        if request.method == "POST":
+            require_csrf()
+            try:
+                pickups.add(**_pickup_form())
+            except PickupError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: added pickup folder %r", request.form.get("folder"))
+                flash("Abholordner angelegt.", "ok")
+                return redirect(url_for("config_page"))
+        return render(PICKUP_BODY, "Abholordner", pickup=None, **_pickup_context())
+
+    @app.route("/config/pickups/<int:pickup_id>", methods=["GET", "POST"])
+    @login_required
+    def edit_pickup(pickup_id: int):
+        pickups = _require_pickups()
+        pickup = pickups.get(pickup_id)
+        if pickup is None:
+            flash("Diesen Abholordner gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+
+        if request.method == "POST":
+            require_csrf()
+            try:
+                pickups.update(pickup_id, **_pickup_form())
+            except PickupError as exc:
+                flash(str(exc), "error")
+            else:
+                logger.info("Web UI: updated pickup folder %s", pickup_id)
+                flash("Abholordner gespeichert.", "ok")
+                return redirect(url_for("config_page"))
+            pickup = pickups.get(pickup_id)
+        return render(PICKUP_BODY, "Abholordner", pickup=pickup, **_pickup_context())
+
+    @app.post("/config/pickups/<int:pickup_id>/delete")
+    @login_required
+    def delete_pickup(pickup_id: int):
+        require_csrf()
+        _require_pickups().delete(pickup_id)
+        logger.info("Web UI: deleted pickup folder %s", pickup_id)
+        flash("Abholordner geloescht.", "ok")
         return redirect(url_for("config_page"))
 
     # --- printers ---------------------------------------------------------
@@ -1508,6 +2131,8 @@ def create_app(runtime) -> Flask:
         # printer that no longer exists; blank it so it falls back to the
         # mailbox printer instead of silently printing nothing.
         unpinned = runtime.addresses.clear_printer(str(printer_id)) if runtime.addresses else 0
+        if runtime.pickups is not None:
+            unpinned += runtime.pickups.clear_printer(str(printer_id))
         logger.info("Web UI: deleted printer %s", printer_id)
         flash(
             "Drucker geloescht. Postfaecher und Zuordnungen, die auf ihn zeigten, "

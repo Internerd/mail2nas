@@ -92,6 +92,9 @@ class AttachmentPlan:
     archive: bool
     printer: Printer | None
     address: AddressRule | None = None
+    # Which archive the folder is on; "" = the default one. Not to be confused
+    # with `archive` above, which says *whether* to file at all.
+    archive_key: str = ""
 
 
 class Archiver:
@@ -104,6 +107,8 @@ class Archiver:
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
+        storages=None,
+        blocked_extensions=None,
     ):
         self.config = config
         self.mapping = mapping
@@ -114,6 +119,24 @@ class Archiver:
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
+        # A StorageSet once more than one archive can be configured; without
+        # it everything is filed into the one archive from the environment.
+        self.storages = storages
+        # Read through a callable rather than copied from the config: the list
+        # is editable in the web UI and has to take effect without a restart.
+        self._blocked_extensions = blocked_extensions
+
+    @property
+    def blocked_extensions(self) -> frozenset[str]:
+        if self._blocked_extensions is None:
+            return self.config.blocked_extensions
+        return self._blocked_extensions()
+
+    def storage_for(self, archive_key: str):
+        """The archive a plan points at, or the only one there is."""
+        if self.storages is None:
+            return self.storage
+        return self.storages.get(archive_key)
 
     def connect(self) -> IMAPClient:
         client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
@@ -222,14 +245,15 @@ class Archiver:
 
                 if plan.archive:
                     target_parts = self._target_parts(plan.folder)
+                    storage = self.storage_for(plan.archive_key)
                     if self.config.dry_run:
                         logger.info(
                             "[dry-run] would save %s -> %s",
                             out_name,
-                            self.storage.display(target_parts),
+                            storage.display(target_parts),
                         )
                     else:
-                        out_path = self.storage.save_unique(target_parts, out_name, payload)
+                        out_path = storage.save_unique(target_parts, out_name, payload)
                         saved.append(out_path)
                         logger.info(
                             "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
@@ -334,12 +358,13 @@ class Archiver:
         # disk: sanitizing can change the trailing extension, and only the
         # latter is what a file manager will act on when someone opens it.
         extensions = {extension_of(filename), extension_of(sanitize_filename(_decode(filename)))}
-        quarantined = bool(extensions & self.config.blocked_extensions)
+        quarantined = bool(extensions & self.blocked_extensions)
 
         return AttachmentPlan(
             folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
+            archive_key=self._archive_of(rule, address_rule),
             # "Print only" still files anything quarantined: it cannot be
             # printed either, and dropping it without a trace would hide
             # exactly the attachment somebody may need to look at.
@@ -357,6 +382,17 @@ class Archiver:
         if address_rule is not None and address_rule.folder:
             return address_rule.folder
         return rule.folder if rule else self.config.fallback_folder
+
+    def _archive_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
+        """Which archive the folder lives on.
+
+        An address rule that names one wins - it is the more specific
+        statement, even when the folder itself comes from a keyword rule
+        ("file it where it usually goes, but on that NAS").
+        """
+        if address_rule is not None and address_rule.archive:
+            return address_rule.archive
+        return rule.archive if rule else ""
 
     def _printer_for(
         self, rule: Rule | None, quarantined: bool, address_rule: AddressRule | None = None

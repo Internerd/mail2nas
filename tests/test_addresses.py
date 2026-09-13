@@ -19,6 +19,7 @@ def _rule(**overrides) -> AddressRule:
         printer="",
         archive_attachments=True,
         folder="",
+        archive="",
         enabled=True,
     )
     values.update(overrides)
@@ -214,3 +215,29 @@ def test_the_name_defaults_to_the_address(tmp_path):
     rule_id = store.add(recipient="drucker@firma.de")
 
     assert store.get(rule_id).name == "drucker@firma.de"
+
+
+def test_an_older_database_gets_the_archive_column(tmp_path):
+    """Updating must not mean re-entering every delivery address."""
+    import sqlite3
+
+    db = str(tmp_path / "state.db")
+    with sqlite3.connect(db) as conn:
+        # Exactly the table the previous version created.
+        conn.execute(
+            "CREATE TABLE address_rules ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+            "recipient TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', "
+            "print_attachments INTEGER NOT NULL DEFAULT 1, printer TEXT NOT NULL DEFAULT '', "
+            "archive_attachments INTEGER NOT NULL DEFAULT 1, folder TEXT NOT NULL DEFAULT '', "
+            "enabled INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute(
+            "INSERT INTO address_rules (name, recipient, printer) VALUES ('Alt', 'a@b.de', '2')"
+        )
+
+    store = AddressStore(db)
+
+    rule = store.all()[0]
+    assert (rule.name, rule.recipient, rule.printer) == ("Alt", "a@b.de", "2")
+    assert rule.archive == ""  # the archive it always used: the default one

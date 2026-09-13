@@ -19,6 +19,8 @@ genauso als einfacher systemd-Service laufen.
 - [Drucken](#drucken)
   - [Drucker im Netzwerk finden](#drucker-im-netzwerk-finden)
   - [Drucken per Mail-Adresse (Zustelladressen)](#drucken-per-mail-adresse-zustelladressen)
+- [Mehrere Archive (mehrere NAS oder Freigaben)](#mehrere-archive-mehrere-nas-oder-freigaben)
+- [Abholordner (Scan-to-Folder)](#abholordner-scan-to-folder)
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
@@ -718,6 +720,84 @@ Fehlt `lp` (z. B. in einem selbst gebauten aelteren Image), sagt das die
 Fehlermeldung beim Testdruck genau so. Ganz abschalten laesst sich das Ganze
 mit `PRINTING_ENABLED=false` - dann verschwinden auch die Auswahlfelder.
 
+## Mehrere Archive (mehrere NAS oder Freigaben)
+
+Anfangs gibt es genau ein Archiv - das aus der `.env`. Unter **Konfiguration →
+Archive** lassen sich weitere anlegen: eine zweite Freigabe auf demselben NAS,
+ein Geraet im Nebengebaeude, ein gemountetes Verzeichnis. Jedes Archiv ist
+entweder
+
+| Art | Angaben | wann |
+|---|---|---|
+| **SMB-Freigabe** | Server, Freigabe, Benutzer, Passwort, optional Domain/Port/Unterordner | der Normalfall - es wird nichts gemountet |
+| **Gemountetes Verzeichnis** | Pfad, z. B. `/mnt/nas2` | wenn das Betriebssystem die Freigabe ohnehin schon einbindet |
+
+Das **erste aktive** Archiv ist das Standard-Archiv. Dort liegt die
+`mapping.yaml`, und dorthin geht alles, was kein eigenes Archiv nennt. Das
+erste Archiv wird beim ersten Start aus der `.env` uebernommen - eine
+bestehende Installation sieht also genau das, was sie vorher hatte, nur jetzt
+unter einem Namen und editierbar.
+
+Ein Archiv waehlen koennen:
+
+- **jede Zuordnung** (Spalte „Archiv", sobald es mehr als eines gibt) -
+  `Vertrag → vertraege` kann damit auf einem anderen NAS landen als
+  `Rechnung → rechnungen`,
+- **jede Zustelladresse**,
+- **jeder Abholordner**, getrennt fuer Quelle und Ziel.
+
+Ein paar Eigenschaften, die im Betrieb zaehlen:
+
+- **Verbindung testen** schreibt eine winzige Datei und loescht sie wieder.
+  Damit steht fest, dass Zugangsdaten und Schreibrechte stimmen, bevor die
+  erste Rechnung ankommt.
+- Zeigt etwas auf ein **geloeschtes oder pausiertes** Archiv, wird ins
+  Standard-Archiv gelegt und das protokolliert - lieber am falschen Ort als
+  verloren.
+- Ist ein Archiv gerade **nicht erreichbar**, schlaegt das Ablegen fehl, die
+  Mail bleibt ungelesen und wird beim naechsten Durchlauf erneut versucht.
+  Nichts geht verloren, und ein NAS im Standby bremst die anderen nicht.
+- Das Passwort wird nie zurueck ins Formular geschrieben; leer lassen heisst
+  „unveraendert".
+- Das letzte Archiv laesst sich nicht loeschen.
+
+## Abholordner (Scan-to-Folder)
+
+Nicht jedes Geraet mailt seine Scans - viele legen sie per SMB direkt auf dem
+NAS ab. Unter **Konfiguration → Abholordner** wird so ein Ordner eingetragen,
+und mail2nas raeumt ihn ab: dieselben Stichwort-Zuordnungen, dieselbe
+Quarantaene, dieselbe Benennung wie bei Mailanhaengen - nur ganz ohne
+Postfach.
+
+| Feld | Bedeutung |
+|---|---|
+| Abholordner | Ordner, in den das Geraet schreibt, z. B. `scans/kopierer-flur` |
+| Zielordner | wohin die Dokumente sollen. Leer = nach Stichwoertern |
+| Archiv / Zielarchiv | auf welchem NAS Quelle und Ziel liegen |
+| Drucken | zusaetzlich auf einem der angelegten Drucker ausgeben |
+
+Was dabei garantiert ist:
+
+- **Eine Datei wird erst angefasst, wenn sie fertig ist** - konkret: wenn sie
+  eine einstellbare Zeit lang (Default 20 s) unveraendert war. Sonst landet
+  eine noch laufende Uebertragung als halbes PDF im Archiv.
+- **Der Ordner ist ein Postausgang, kein Archiv**: Abgeholtes wird von dort
+  *verschoben*. Bliebe das Original liegen, kaeme es bei jedem Durchlauf
+  erneut.
+- Existiert der Ordner noch nicht, wird er **angelegt** - das Geraet braucht
+  ihn ja, um ueberhaupt hineinschreiben zu koennen.
+- **Unterordner werden mitgelesen** (Geraete legen gern einen pro Benutzer
+  oder Scanprofil an). Versteckte und halbfertige Dateien (`.tmp`, `.part`,
+  `.crdownload`) und leere Dateien bleiben liegen.
+- Ohne Zielordner entscheiden die Zuordnungen - dabei greifen nur die fuer
+  „alle Postfaecher": eine Datei aus einem Ordner gehoert zu keinem Postfach.
+- **Gesperrte Dateiendungen** kommen auch hier in die Quarantaene und werden
+  nie gedruckt.
+- Ein Zielordner *im* Abholordner wird abgelehnt - das waere eine
+  Endlosschleife.
+- Geprueft wird alle 30 Sekunden; ueber SMB ist das ein Verzeichnis-Listing,
+  kein Dauerbetrieb.
+
 ## Konfiguration (Environment-Variablen)
 
 | Variable | Beschreibung | Default |
@@ -745,7 +825,7 @@ mit `PRINTING_ENABLED=false` - dann verschwinden auch die Auswahlfelder.
 | `MAX_ATTACHMENT_SIZE_MB` | Einzelne Anhaenge ueber diesem Limit werden uebersprungen | `25` |
 | `MAX_MESSAGE_SIZE_MB` | Mails ueber diesem Limit werden gar nicht erst geladen | `50` |
 | `MAX_ATTACHMENTS_PER_MESSAGE` | Anhaenge ueber diesem Limit werden nicht mehr verarbeitet | `20` |
-| `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
+| `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen. **Nur Vorbelegung** - danach unter „Konfiguration → Quarantaene und Abholen" gepflegt | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
 | `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
 | `PRINTING_ENABLED` | [Drucken](#drucken) ueberhaupt zulassen; `false` ist der Notausschalter | `true` |
@@ -862,7 +942,8 @@ damit um:
   ueberdimensionierten Mail, die den Host/das Share volllaufen laesst.
 - **Limit fuer Anhaenge pro Mail** (`MAX_ATTACHMENTS_PER_MESSAGE`): schuetzt
   vor Mails mit tausenden Mini-Anhaengen.
-- **Quarantaene fuer ausfuehrbare Dateitypen** (`BLOCKED_EXTENSIONS`,
+- **Quarantaene fuer ausfuehrbare Dateitypen** (in der Weboberflaeche unter
+  „Quarantaene und Abholen", vorbelegt aus `BLOCKED_EXTENSIONS`,
   `QUARANTINE_FOLDER`): Anhaenge mit Endungen wie `.exe`, `.js`, `.ps1`,
   `.jar`, `.lnk`, `.sh` usw. werden IMMER in einen separaten
   Quarantaene-Ordner geschrieben - unabhaengig davon, ob der Dateiname
@@ -969,6 +1050,20 @@ Mailserver/ClamAV) einplanen.
   - Nichts davon im Log -> `PRINTING_ENABLED` steht auf `false`.
 - **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
   selbst ab.
+
+### Im Abholordner bleibt alles liegen
+
+1. Steht im Log eine Zeile mit `Pickup <Name>`? Dann wurde der Ordner
+   angesehen. Ohne Zeile ist der Ordner pausiert oder es gibt ihn nicht -
+   mail2nas legt ihn beim ersten Durchlauf an und sagt das einmal.
+2. Wurde die Datei gerade erst geschrieben? Es wird gewartet, bis sie die
+   eingestellte Zeit unveraendert ist (Konfiguration → Quarantaene und
+   Abholen).
+3. Heisst sie `.tmp`, `.part` oder faengt sie mit einem Punkt an? Dann gilt
+   sie als unfertig. Auch leere Dateien bleiben liegen.
+4. Darf mail2nas in dem Ordner **loeschen**? Ohne Loeschrecht wird bewusst
+   nichts abgeholt, sonst entstuende bei jedem Durchlauf eine weitere Kopie.
+5. Geprueft wird alle 30 Sekunden - ein bisschen Geduld gehoert dazu.
 
 ### Es wird nicht gedruckt, obwohl an die Adresse gemailt wurde
 
@@ -1182,6 +1277,17 @@ wie viele Zuordnungen geladen wurden und welche Postfaecher ueberwacht werden.
   derselben Datenbank. Solange dort nichts steht, aendert sich nichts am
   Verhalten - die Funktion ist ausschliesslich das, was man dort eintraegt,
   siehe [Drucken per Mail-Adresse](#drucken-per-mail-adresse-zustelladressen).
+- **Das erste Archiv** wird beim ersten Start nach dem Update aus der `.env`
+  angelegt (SMB-Zugangsdaten oder `STORAGE_ROOT`, je nach `STORAGE_BACKEND`).
+  Es ist danach unter „Konfiguration → Archive" sichtbar und wird ab dann von
+  dort gepflegt; die `SMB_*`-Variablen dienen nur noch der Uebernahme. Bis ein
+  zweites dazukommt, aendert sich nichts.
+- **Die gesperrten Dateiendungen** werden beim ersten Speichern in der
+  Oberflaeche uebernommen. Bis dahin gilt weiter die `.env` - eine
+  Installation, die nie in die Oberflaeche schaut, verhaelt sich unveraendert.
+- **Zustelladressen aus der Vorversion** bekommen ihre Archiv-Spalte
+  automatisch dazu (Standard-Archiv), ohne dass etwas neu eingegeben werden
+  muss. Abholordner starten mit einer leeren Tabelle.
 - **Neue Konfigurationsvariablen** greifen mit ihren Defaults; eine alte `.env`
   bleibt gueltig. Insbesondere bleibt `WEB_ENABLED` ohne Eintrag auf `false` -
   wer die Weboberflaeche will, ergaenzt nach dem Update:
