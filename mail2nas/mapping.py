@@ -7,9 +7,20 @@ from pathlib import Path
 
 import yaml
 
+from .settings import DEFAULT_SHARE
+
 logger = logging.getLogger(__name__)
 
 ALL_ACCOUNTS = "all"
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where a document goes: a folder on one of the configured shares."""
+
+    folder: str
+    share: str = DEFAULT_SHARE
+    keyword: str | None = None  # the rule that matched, None = fallback
 
 
 @dataclass(frozen=True)
@@ -18,11 +29,13 @@ class Rule:
 
     `account` is either ALL_ACCOUNTS or the id of a single mail account, so a
     rule can be limited to one mailbox when several are configured.
+    `share` is the id of the share to file on, or "" for the default one.
     """
 
     match: str
     folder: str
     account: str = ALL_ACCOUNTS
+    share: str = DEFAULT_SHARE
 
     @property
     def is_wildcard(self) -> bool:
@@ -43,6 +56,9 @@ class Rule:
             return fnmatch.fnmatchcase(haystack, pattern)
         return pattern in haystack
 
+    def target(self) -> Target:
+        return Target(folder=self.folder, share=self.share, keyword=self.match)
+
 
 def _coerce_rules(raw: object) -> list[Rule]:
     """Build the rule list from either mapping-file format.
@@ -53,6 +69,7 @@ def _coerce_rules(raw: object) -> list[Rule]:
           - match: "Rechnung*"
             folder: rechnungen
             account: all
+            share: nas2      # optional, default = the default share
 
     v1 (legacy plain dict, no ordering information):
         RE: rechnungen
@@ -72,7 +89,12 @@ def _coerce_rules(raw: object) -> list[Rule]:
             if not match or not folder:
                 raise ValueError(f"rule #{index} needs both 'match' and 'folder'")
             rules.append(
-                Rule(match=match, folder=folder, account=str(entry.get("account") or ALL_ACCOUNTS))
+                Rule(
+                    match=match,
+                    folder=folder,
+                    account=str(entry.get("account") or ALL_ACCOUNTS),
+                    share=str(entry.get("share") or DEFAULT_SHARE),
+                )
             )
         return rules
 
@@ -87,10 +109,15 @@ def _coerce_rules(raw: object) -> list[Rule]:
 
 def dump_rules(rules: list[Rule]) -> str:
     """Serialize rules back to the v2 format, preserving their order."""
-    payload = {
-        "version": 2,
-        "rules": [{"match": r.match, "folder": r.folder, "account": r.account} for r in rules],
-    }
+    entries = []
+    for rule in rules:
+        entry = {"match": rule.match, "folder": rule.folder, "account": rule.account}
+        # Only written when it is actually used, so single-NAS mapping files
+        # stay exactly as they were before shares existed.
+        if rule.share:
+            entry["share"] = rule.share
+        entries.append(entry)
+    payload = {"version": 2, "rules": entries}
     header = (
         "# mail2nas Zuordnungen\n"
         "#\n"
@@ -103,6 +130,9 @@ def dump_rules(rules: list[Rule]) -> str:
         "#           (z. B. \"Rechnung*\"), sonst als Teilstring gesucht.\n"
         "# folder  - Zielordner relativ zur Wurzel des Shares.\n"
         "# account - 'all' oder die id eines einzelnen Mailkontos.\n"
+        "# share   - id der Ablage (NAS/Share). Fehlt der Eintrag, gilt die\n"
+        "#           Standard-Ablage. Die ids stehen in der Weboberflaeche\n"
+        "#           unter 'Ablagen'.\n"
         "#\n"
         "# Geprueft wird zuerst der Dateiname jedes Anhangs, dann Betreff/Text.\n"
     )
@@ -132,16 +162,24 @@ class Mapping:
     def rules(self) -> list[Rule]:
         return list(self._rules)
 
+    @property
+    def fallback_folder(self) -> str:
+        return self._fallback_folder
+
     def set_path(self, path: str) -> None:
         """Point at a different mapping file and load it immediately."""
         self._path = Path(path)
         self._mtime = None
         self.reload(force=True)
 
+    def set_fallback_folder(self, folder: str) -> None:
+        """Adopt a fallback folder changed in the web UI without a restart."""
+        self._fallback_folder = folder
+
     def reload(self, force: bool = False) -> None:
         try:
             mtime = self._path.stat().st_mtime
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
             if force:
                 logger.warning(
                     "Mapping file %s not found, all mail will go to the fallback folder", self._path
@@ -189,10 +227,10 @@ class Mapping:
             self._mtime = None
         logger.info("Saved %d mapping rule(s) to %s", len(rules), self._path)
 
-    def resolve(self, *texts: str, account: str | None = None) -> tuple[str, str | None]:
-        """Return (target_folder, matched_pattern). Falls back if nothing matches."""
+    def resolve(self, *texts: str, account: str | None = None) -> Target:
+        """Return the Target for these texts, or the fallback if nothing matches."""
         haystack = " ".join(t for t in texts if t).lower()
         for rule in self._rules:
             if rule.applies_to(account) and rule.matches(haystack):
-                return rule.folder, rule.match
-        return self._fallback_folder, None
+                return rule.target()
+        return Target(folder=self._fallback_folder)

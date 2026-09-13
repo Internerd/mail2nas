@@ -5,7 +5,9 @@ from email.message import EmailMessage
 
 from mail2nas.archiver import Archiver
 from mail2nas.config import DEFAULT_BLOCKED_EXTENSIONS, Config
-from mail2nas.mapping import Mapping
+from mail2nas.mapping import Mapping, Target
+from mail2nas.settings import Printer, Share
+from mail2nas.shares import ShareSet
 from mail2nas.state import ProcessedStore
 
 
@@ -44,14 +46,20 @@ def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def _make_archiver(tmp_path, mapping_content: str | None = None, **config_overrides) -> Archiver:
+def _make_archiver(
+    tmp_path,
+    mapping_content: str | None = None,
+    shares=None,
+    printers=None,
+    **config_overrides,
+) -> Archiver:
     config = _make_config(tmp_path, **config_overrides)
     mapping_path = tmp_path / "mapping.yaml"
     if mapping_content is not None:
         _write_mapping(mapping_path, mapping_content)
     mapping = Mapping(str(mapping_path), config.fallback_folder)
     store = ProcessedStore(config.state_db_path)
-    return Archiver(config, mapping, store)
+    return Archiver(config, mapping, store, shares=shares, printers=printers)
 
 
 class FakeIMAPClient:
@@ -123,7 +131,7 @@ def test_iter_attachments_ignores_plain_body(tmp_path):
 def test_build_filename_date_sender_prefix(tmp_path):
     archiver = _make_archiver(tmp_path, filename_prefix="date_sender")
 
-    result = archiver._build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
+    result = archiver.filer.build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
 
     assert result == "2026-08-12_lieferant_example.com_rechnung.pdf"
 
@@ -131,7 +139,7 @@ def test_build_filename_date_sender_prefix(tmp_path):
 def test_build_filename_none_prefix_keeps_original_name(tmp_path):
     archiver = _make_archiver(tmp_path, filename_prefix="none")
 
-    result = archiver._build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
+    result = archiver.filer.build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
 
     assert result == "rechnung.pdf"
 
@@ -139,7 +147,7 @@ def test_build_filename_none_prefix_keeps_original_name(tmp_path):
 def test_build_filename_date_only_prefix(tmp_path):
     archiver = _make_archiver(tmp_path, filename_prefix="date")
 
-    result = archiver._build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
+    result = archiver.filer.build_filename("2026-08-12", "lieferant@example.com", "rechnung.pdf")
 
     assert result == "2026-08-12_rechnung.pdf"
 
@@ -157,39 +165,33 @@ def test_resolve_attachment_folder_prefers_attachment_filename_over_mail_subject
     )
     # Mail-level match would be "rechnungen" (subject contains RE), but this
     # specific attachment's own filename literally says "Lieferschein".
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
+    mail_target = archiver.mapping.resolve("RE-2024-001 mit Lieferschein")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Lieferschein_4711.pdf", mail_folder, mail_keyword
-    )
+    target, quarantined = archiver.filer.classify("Lieferschein_4711.pdf", mail_target)
 
-    assert folder == "lieferscheine"
-    assert keyword == "Lieferschein"
+    assert target.folder == "lieferscheine"
+    assert target.keyword == "Lieferschein"
     assert quarantined is False
 
 
 def test_resolve_attachment_folder_falls_back_to_mail_level_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
-    mail_folder, mail_keyword = archiver.mapping.resolve("RE-2024-001")
+    mail_target = archiver.mapping.resolve("RE-2024-001")
 
     # "anhang1.pdf" itself does not match any keyword.
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "anhang1.pdf", mail_folder, mail_keyword
-    )
+    target, quarantined = archiver.filer.classify("anhang1.pdf", mail_target)
 
-    assert folder == "rechnungen"
-    assert keyword == "RE"
+    assert target.folder == "rechnungen"
+    assert target.keyword == "RE"
     assert quarantined is False
 
 
 def test_resolve_attachment_folder_quarantines_blocked_extension_even_with_keyword_match(tmp_path):
     archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n")
 
-    folder, keyword, quarantined = archiver._resolve_attachment_folder(
-        "Rechnung.exe", "unsorted", None
-    )
+    target, quarantined = archiver.filer.classify("Rechnung.exe", Target(folder="unsorted"))
 
-    assert folder == "quarantaene"
+    assert target.folder == "quarantaene"
     assert quarantined is True
 
 
@@ -316,8 +318,8 @@ def test_process_message_confines_absolute_traversal_target(tmp_path):
 def test_target_dir_rejects_escape_and_uses_fallback(tmp_path):
     archiver = _make_archiver(tmp_path)
 
-    assert archiver._target_dir("../evil") == tmp_path / "unsorted"
-    assert archiver._target_dir("rechnungen") == tmp_path / "rechnungen"
+    assert archiver.filer.directory_for(Target(folder="../evil")) == tmp_path / "unsorted"
+    assert archiver.filer.directory_for(Target(folder="rechnungen")) == tmp_path / "rechnungen"
 
 
 def test_nested_mapping_target_is_supported(tmp_path):
@@ -348,3 +350,202 @@ def test_attachments_are_written_atomically_without_temp_leftovers(tmp_path):
     names = [p.name for p in (tmp_path / "rechnungen").iterdir()]
     assert len(names) == 1
     assert not any(n.startswith(".mail2nas-tmp-") for n in names)
+
+
+# --- several shares / several NAS -------------------------------------------
+
+
+def _two_share_set(tmp_path):
+    """<tmp_path> is the default share, <tmp_path>/nas2-share the second one."""
+    second = tmp_path / "nas2-share"
+    second.mkdir(exist_ok=True)
+    return (
+        ShareSet(
+            [Share(id="nas1", path=str(tmp_path)), Share(id="nas2", path=str(second))],
+            fallback_root=str(tmp_path),
+        ),
+        second,
+    )
+
+
+def test_rule_files_onto_the_share_it_names(tmp_path):
+    shares, second = _two_share_set(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - match: RE
+                folder: rechnungen
+                share: nas2
+        """,
+        shares=shares,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((second / "rechnungen").glob("*"))) == 1
+    assert not (tmp_path / "rechnungen").exists()
+
+
+def test_rule_without_a_share_uses_the_default_one(tmp_path):
+    shares, second = _two_share_set(tmp_path)
+    archiver = _make_archiver(tmp_path, mapping_content="RE: rechnungen\n", shares=shares)
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+    assert not (second / "rechnungen").exists()
+
+
+def test_unmounted_share_diverts_to_the_default_share(tmp_path):
+    """A NAS that is down must not turn its mount point into a local folder."""
+    gone = tmp_path / "nicht-gemountet"
+    shares = ShareSet(
+        [Share(id="nas1", path=str(tmp_path)), Share(id="weg", path=str(gone))],
+        fallback_root=str(tmp_path),
+    )
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - match: RE
+                folder: rechnungen
+                share: weg
+        """,
+        shares=shares,
+    )
+    raw = _build_message("RE-1", [("beleg.pdf", b"DATA")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert not gone.exists()
+    assert len(list((tmp_path / "unsorted").glob("*"))) == 1
+
+
+def test_quarantine_stays_on_the_share_the_rule_named(tmp_path):
+    shares, second = _two_share_set(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="""
+            version: 2
+            rules:
+              - match: RE
+                folder: rechnungen
+                share: nas2
+        """,
+        shares=shares,
+    )
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((second / "quarantaene").glob("*"))) == 1
+
+
+# --- mail from a known device (scan-to-mail) ---------------------------------
+
+
+def _scan_message(sender: str, subject: str, filename: str = "SKM_C250i.pdf") -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg.set_content("Scan")
+    msg.add_attachment(b"scan", maintype="application", subtype="pdf", filename=filename)
+    return bytes(msg)
+
+
+def test_device_with_a_fixed_folder_beats_a_keyword_in_the_subject(tmp_path):
+    """A scanner's subject line is boilerplate - it must not steer the filing."""
+    printer = Printer(id="kopierer", sender="scanner@example.com", target_folder="scans")
+    archiver = _make_archiver(tmp_path, mapping_content="Scan: irgendwo\n", printers=[printer])
+    raw = _scan_message("scanner@example.com", "Scan vom Kopierer")
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((tmp_path / "scans").glob("*"))) == 1
+    assert not (tmp_path / "irgendwo").exists()
+
+
+def test_device_without_a_fixed_folder_leaves_the_rules_in_charge(tmp_path):
+    printer = Printer(id="kopierer", sender="scanner@example.com")
+    archiver = _make_archiver(tmp_path, mapping_content="Rechnung: rechnungen\n", printers=[printer])
+    raw = _scan_message("scanner@example.com", "Rechnung 4711")
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+
+
+def test_mail_from_someone_else_is_not_treated_as_a_device(tmp_path):
+    printer = Printer(id="kopierer", sender="scanner@example.com", target_folder="scans")
+    archiver = _make_archiver(tmp_path, mapping_content="Rechnung: rechnungen\n", printers=[printer])
+    raw = _scan_message("lieferant@example.com", "Rechnung 4711")
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((tmp_path / "rechnungen").glob("*"))) == 1
+    assert not (tmp_path / "scans").exists()
+
+
+def test_device_can_file_onto_another_nas(tmp_path):
+    shares, second = _two_share_set(tmp_path)
+    printer = Printer(
+        id="kopierer", sender="scanner@example.com", target_share="nas2", target_folder="scans"
+    )
+    archiver = _make_archiver(tmp_path, printers=[printer], shares=shares)
+    raw = _scan_message("scanner@example.com", "Scan")
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((second / "scans").glob("*"))) == 1
+
+
+def test_blocked_extension_from_a_device_is_still_quarantined(tmp_path):
+    printer = Printer(id="kopierer", sender="scanner@example.com", target_folder="scans")
+    archiver = _make_archiver(tmp_path, printers=[printer])
+    raw = _scan_message("scanner@example.com", "Scan", filename="scan.exe")
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+    assert not (tmp_path / "scans").exists()
+
+
+# --- encoded filenames -------------------------------------------------------
+
+
+def test_keyword_in_an_rfc2047_encoded_filename_is_found(tmp_path):
+    """Mail clients encode non-ASCII filenames - the keyword is in there too."""
+    archiver = _make_archiver(tmp_path, mapping_content="Angebot: angebote\n")
+    msg = EmailMessage()
+    msg["Subject"] = "ohne Stichwort"
+    msg["From"] = "lieferant@example.com"
+    msg.set_content("Hallo")
+    msg.add_attachment(
+        b"DATA",
+        maintype="application",
+        subtype="pdf",
+        filename=("utf-8", "", "Angebot_Grün.pdf"),
+    )
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=bytes(msg)), 1)
+
+    assert len(list((tmp_path / "angebote").glob("*"))) == 1
+
+
+def test_unusable_quarantine_folder_never_lands_in_a_business_folder(tmp_path):
+    """A broken quarantine path must not put an .exe next to the invoices."""
+    archiver = _make_archiver(
+        tmp_path, mapping_content="RE: rechnungen\n", quarantine_folder="../raus"
+    )
+    raw = _build_message("RE-1", [("Rechnung.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    assert not (tmp_path / "rechnungen").exists()
+    assert not (tmp_path / "unsorted").exists()
+    assert len(list((tmp_path / "quarantaene").glob("*"))) == 1

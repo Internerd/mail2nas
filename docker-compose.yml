@@ -23,6 +23,10 @@ services:
       # ("invalid argument"), and it would also put the SMB password into the
       # daemon's volume metadata. Mounting one level up avoids both.
       - ${NAS_PATH:-/mnt/nas}:/mnt/nas
+      # Weitere Shares/NAS: genauso einhaengen und den Pfad danach unter
+      # "Ablagen" in der Weboberflaeche eintragen (hier: /mnt/nas2).
+      # Auskommentieren und NAS2_PATH in der .env setzen:
+      # - ${NAS2_PATH:-/mnt/nas2}:/mnt/nas2
       - state:/data
 
 volumes:

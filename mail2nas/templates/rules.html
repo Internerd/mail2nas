@@ -1,4 +1,6 @@
 {% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% set multi_share = shares|length > 1 %}
 {% block content %}
 
 {% if status %}
@@ -21,21 +23,32 @@
     z. B. <code>Rechnung*</code>. Ohne Platzhalter wird als Teilstring gesucht.
     Geprueft wird zuerst der Dateiname jedes Anhangs, dann Betreff (und Mailtext, falls aktiviert).
   </p>
+  {% if multi_share %}
+  <p class="hint">
+    <strong>Ablage</strong> bestimmt, auf welches NAS/Share der Zielordner gehoert.
+    „Standard-Ablage“ ist die erste aktive Ablage.
+  </p>
+  {% endif %}
   <p class="hint">Datei: <code>{{ mapping_path }}</code></p>
 
   <table>
     <thead>
-      <tr><th></th><th>Stichwort / Muster</th><th>Zielordner</th><th>Konto</th><th></th></tr>
+      <tr><th></th><th>Stichwort / Muster</th><th>Zielordner</th>{% if multi_share %}<th>Ablage</th>{% endif %}<th>Konto</th><th></th></tr>
     </thead>
     <tbody>
     {% for rule in rules %}
       <tr>
         <td class="prio">{{ loop.index }}</td>
-        <td colspan="3">
+        <td colspan="{{ 4 if multi_share else 3 }}">
           <form method="post" action="{{ url_for('rule_update', index=loop.index0) }}" class="row">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div><input type="text" name="match" value="{{ rule.match }}" required></div>
             <div><input type="text" name="folder" value="{{ rule.folder }}" required></div>
+            {% if multi_share %}
+              <div>{{ m.share_select('share', rule.share) }}</div>
+            {% else %}
+              <input type="hidden" name="share" value="{{ rule.share }}">
+            {% endif %}
             <div>
               <select name="account">
                 <option value="{{ ALL_ACCOUNTS }}" {{ 'selected' if rule.account == ALL_ACCOUNTS }}>Alle Konten</option>
@@ -64,7 +77,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="5" class="hint">Noch keine Zuordnungen. Alle Anhaenge landen im Fallback-Ordner.</td></tr>
+      <tr><td colspan="6" class="hint">Noch keine Zuordnungen. Alle Anhaenge landen im Fallback-Ordner.</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -82,6 +95,12 @@
       <label>Zielordner</label>
       <input type="text" name="folder" placeholder="z. B. rechnungen" required>
     </div>
+    {% if multi_share %}
+    <div>
+      <label>Ablage</label>
+      {{ m.share_select('share', '') }}
+    </div>
+    {% endif %}
     <div>
       <label>Gilt fuer</label>
       <select name="account">

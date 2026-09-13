@@ -1,9 +1,11 @@
 # mail2nas
 
 Holt Mails per IMAP ab, sortiert Anhaenge anhand eines konfigurierbaren
-Mapping-Files (Stichwort im Betreff -> Zielordner) und legt sie auf einem
-SMB-Share ab. Gedacht zum Betrieb als Container auf Proxmox (LXC/Docker),
-kann aber genauso als einfacher systemd-Service laufen.
+Mapping-Files (Stichwort im Betreff -> Zielordner) und legt sie auf einem oder
+mehreren SMB-Shares ab. Scanner und Multifunktionsdrucker koennen ihre
+Dokumente per Mail schicken oder direkt in einen Ordner auf dem NAS legen, den
+mail2nas ueberwacht. Gedacht zum Betrieb als Container auf Proxmox
+(LXC/Docker), kann aber genauso als einfacher systemd-Service laufen.
 
 ## Inhaltsverzeichnis
 
@@ -18,6 +20,8 @@ kann aber genauso als einfacher systemd-Service laufen.
 - [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
 - [Zuordnungen: Prioritaet, Platzhalter, Mailkonten](#zuordnungen-prioritaet-platzhalter-mailkonten)
 - [Mehrere Mailkonten](#mehrere-mailkonten)
+- [Ablagen: mehrere Shares und mehrere NAS](#ablagen-mehrere-shares-und-mehrere-nas)
+- [Drucker und Scanner](#drucker-und-scanner)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
 - [Betrieb & Troubleshooting](#betrieb--troubleshooting)
 - [Tests](#tests)
@@ -35,17 +39,20 @@ kann aber genauso als einfacher systemd-Service laufen.
 2. Liest ungelesene Mails und prueft die Zuordnungen aus `mapping.yaml` -
    zuerst gegen den Dateinamen jedes einzelnen Anhangs, dann gegen Betreff
    (und optional den Mailtext).
-3. Die **erste passende Zuordnung** bestimmt den Zielordner unterhalb des
-   Shares. Die Reihenfolge der Zuordnungen ist die Prioritaet und laesst sich
-   in der Weboberflaeche mit Pfeilen verschieben. Ohne Treffer landen Anhaenge
-   im Fallback-Ordner (Default: `unsorted/`).
+3. Die **erste passende Zuordnung** bestimmt Zielordner und Ablage (Share).
+   Die Reihenfolge der Zuordnungen ist die Prioritaet und laesst sich in der
+   Weboberflaeche mit Pfeilen verschieben. Ohne Treffer landen Anhaenge im
+   Fallback-Ordner (Default: `unsorted/`).
 4. Anhaenge werden mit Datums-/Absender-Praefix atomar gespeichert,
    Namenskollisionen durch einen Zaehler-Suffix vermieden.
 5. Die Mail wird als gelesen markiert (und optional in einen anderen
    IMAP-Ordner verschoben). Zusaetzlich wird die Message-ID lokal in SQLite
    vermerkt, damit nichts doppelt verarbeitet wird.
-6. Konfiguriert wird ueber die **Weboberflaeche**; `mapping.yaml` liegt auf
-   dem Share und wird bei jedem Zyklus neu eingelesen.
+6. Parallel dazu werden die **Abholordner** angelegter Drucker/Scanner auf den
+   Shares ueberwacht: fertige Scans werden von dort nach denselben Regeln in
+   den Archivordner verschoben - ganz ohne Mailkonto.
+7. Konfiguriert wird ueber die **Weboberflaeche**; `mapping.yaml` liegt auf
+   dem Basis-Share und wird bei jedem Zyklus neu eingelesen.
 
 ## Voraussetzungen
 
@@ -327,20 +334,29 @@ konfigurierten `MAPPING_PATH`) kopieren.
 
 ## Weboberflaeche
 
-Unter `http://<container-ip>:8080` gibt es eine Konfigurationsseite mit drei
+Unter `http://<container-ip>:8080` gibt es eine Konfigurationsseite mit fuenf
 Bereichen:
 
 - **Zuordnungen** - Regeln anlegen, bearbeiten, loeschen und mit den Pfeilen
   `↑`/`↓` in der Prioritaet verschieben. Je Regel ein Dropdown, ob sie fuer
-  *alle* Konten oder nur fuer ein bestimmtes gilt. Oben steht der
-  Verbindungsstatus je Konto.
+  *alle* Konten oder nur fuer ein bestimmtes gilt - und, sobald mehr als eine
+  Ablage existiert, auf welches NAS/Share der Zielordner gehoert. Oben steht
+  der Verbindungsstatus je Konto.
 - **Mailkonten** - beliebig viele IMAP-Postfaecher anlegen und bearbeiten
   (Server, Port, TLS, Benutzer, Passwort, Ordner, Abrufmodus, aktiv/inaktiv).
+- **Drucker** - Scanner und Multifunktionsgeraete anlegen: ueber ihre
+  Absenderadresse (Scan-to-Mail) und/oder ueber einen Abholordner auf einem
+  der Shares (Scan-to-Folder). Siehe
+  [Drucker und Scanner](#drucker-und-scanner).
+- **Ablagen** - die Shares/NAS, auf denen archiviert wird, mit Live-Status
+  ("gemountet und beschreibbar"). Siehe
+  [Ablagen](#ablagen-mehrere-shares-und-mehrere-nas).
 - **Einstellungen** - Speicherort der `mapping.yaml`, Fallback- und
-  Quarantaene-Ordner, Dateinamens-Praefix, Abrufintervall und die Grenzwerte.
+  Quarantaene-Ordner, **die gesperrten Dateiendungen**, Dateinamens-Praefix,
+  Abrufintervall und die Grenzwerte.
 
-Aenderungen werden sofort gespeichert; die Konten-Worker starten automatisch
-neu, ein Container-Neustart ist nicht noetig.
+Aenderungen werden sofort gespeichert; die Worker starten automatisch neu, ein
+Container-Neustart ist nicht noetig.
 
 ### Zugang einrichten
 
@@ -362,8 +378,8 @@ einen Reverse-Proxy mit TLS davorsetzen.
 
 | Was | Wo | Warum dort |
 |---|---|---|
-| Mailkonten, Grenzwerte, Ablage-Einstellungen | `/data/config.yaml` im Container (`0600`) | enthaelt IMAP-Passwoerter - liegt daher im Docker-Volume, **nicht** auf dem Share |
-| Zuordnungen | `mapping.yaml` auf dem Share | soll ohne Weboberflaeche editier- und sicherbar sein |
+| Mailkonten, Drucker, Ablagen, Grenzwerte, gesperrte Endungen | `/data/config.yaml` im Container (`0600`) | enthaelt IMAP-Passwoerter - liegt daher im Docker-Volume, **nicht** auf dem Share |
+| Zuordnungen | `mapping.yaml` auf dem Basis-Share (`STORAGE_ROOT`) | soll ohne Weboberflaeche editier- und sicherbar sein |
 
 Beim ersten Start wird `config.yaml` automatisch aus den bestehenden
 `IMAP_*`-Variablen der `.env` erzeugt - vorhandene Installationen laufen also
@@ -434,7 +450,7 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `IMAP_PROCESSED_FOLDER` | Optional: Zielordner fuer verarbeitete Mails | leer (nur `\Seen`) |
 | `IMAP_MODE` | `idle` (Push) oder `poll` | `poll` |
 | `POLL_INTERVAL_SECONDS` | Intervall im Poll-Modus bzw. IDLE-Refresh | `300` |
-| `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten SMB-Shares | `/mnt/nas` |
+| `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten SMB-Shares (Basis-Ablage; weitere siehe [Ablagen](#ablagen-mehrere-shares-und-mehrere-nas)) | `/mnt/nas` |
 | `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zu `STORAGE_ROOT` | `mapping.yaml` |
 | `FALLBACK_FOLDER` | Zielordner ohne Mapping-Treffer | `unsorted` |
 | `MATCH_BODY` | Zusaetzlich den Mailtext durchsuchen | `false` |
@@ -444,7 +460,7 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `MAX_ATTACHMENT_SIZE_MB` | Einzelne Anhaenge ueber diesem Limit werden uebersprungen | `25` |
 | `MAX_MESSAGE_SIZE_MB` | Mails ueber diesem Limit werden gar nicht erst geladen | `50` |
 | `MAX_ATTACHMENTS_PER_MESSAGE` | Anhaenge ueber diesem Limit werden nicht mehr verarbeitet | `20` |
-| `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen | siehe `.env.example` |
+| `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen. **Nur Vorbelegung** - danach in der Weboberflaeche gepflegt | siehe `.env.example` |
 | `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
 | `NAS_PATH` | Pfad des bereits gemounteten Shares auf dem Docker-Host, wird nach `/mnt/nas` im Container gebunden | `/mnt/nas` |
 | `WEB_ENABLED` | Weboberflaeche starten | `true` |
@@ -453,14 +469,18 @@ privilegierten Container bleibt es bei `uid=1000`.
 | `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
 | `LOG_LEVEL` | Log-Level | `INFO` |
 
-Die mit **(UI)** nutzbaren Werte - Mailkonten, Mapping-Pfad, Fallback- und
-Quarantaene-Ordner, `MATCH_BODY`, `FILENAME_PREFIX`, Abrufintervall und die
-Grenzwerte - werden nach dem ersten Start aus `/data/config.yaml` gelesen und
-in der [Weboberflaeche](#weboberflaeche) gepflegt. Die Variablen hier dienen
-dann nur noch als Startwerte fuer die einmalige Uebernahme. Rein
-infrastrukturelle Variablen (`STORAGE_ROOT`, `NAS_PATH`, `STATE_DB_PATH`,
-`BLOCKED_EXTENSIONS`, `WEB_*`, `LOG_LEVEL`, `DRY_RUN`) kommen weiterhin
-ausschliesslich aus der `.env`.
+Die in der Oberflaeche pflegbaren Werte - Mailkonten, Drucker, Ablagen,
+Mapping-Pfad, Fallback- und Quarantaene-Ordner, gesperrte Dateiendungen,
+`MATCH_BODY`, `FILENAME_PREFIX`, Abrufintervall und die Grenzwerte - werden
+nach dem ersten Start aus `/data/config.yaml` gelesen und in der
+[Weboberflaeche](#weboberflaeche) gepflegt. Die Variablen hier dienen dann nur
+noch als Startwerte fuer die einmalige Uebernahme. Rein infrastrukturelle
+Variablen (`STORAGE_ROOT`, `NAS_PATH`, `STATE_DB_PATH`, `WEB_*`, `LOG_LEVEL`,
+`DRY_RUN`) kommen weiterhin ausschliesslich aus der `.env`.
+
+Beim Update einer aelteren Installation wird `BLOCKED_EXTENSIONS` einmalig aus
+der `.env` in die `config.yaml` uebernommen - die Quarantaene bleibt also
+unveraendert aktiv, laesst sich danach aber ohne Container-Neustart aendern.
 
 **Keine SMB-Zugangsdaten in der `.env`.** Das Share wird vom Betriebssystem
 gemountet, nicht von Docker - die Zugangsdaten liegen daher in einer
@@ -487,6 +507,10 @@ rules:
   - match: LS
     folder: lieferscheine
     account: privatkonto           # nur fuer dieses eine Konto
+  - match: Vertrag
+    folder: vertraege
+    account: all
+    share: nas2                    # optional: auf ein bestimmtes NAS ablegen
 ```
 
 **Prioritaet = Reihenfolge.** Die erste passende Regel gewinnt. In der
@@ -513,6 +537,12 @@ Zuordnungen verhalten sich also unveraendert.
 sonst die id eines einzelnen Kontos. So kann dieselbe Mail-Art aus zwei
 Postfaechern in unterschiedlichen Ordnern landen.
 
+**Ablage-Zuordnung**: `share` ist optional. Ohne Angabe gilt die
+Standard-Ablage (die erste aktive unter "Ablagen"); mit Angabe landet der
+Zielordner auf genau diesem NAS/Share. Solange nur eine Ablage existiert,
+blendet die Weboberflaeche die Spalte aus und die `mapping.yaml` bleibt
+unveraendert wie bisher.
+
 **Mehrere Anhaenge pro Mail werden einzeln behandelt.** Jeder Anhang wird
 zuerst anhand seines EIGENEN Dateinamens geprueft; erst wenn der Dateiname
 nichts hergibt, greift der Treffer aus Betreff/Mailtext. Eine Mail mit
@@ -538,6 +568,120 @@ wuerden sie stillschweigend nie wieder greifen.
 Deaktivierte Konten (Haken "Aktiv" entfernt) bleiben gespeichert, werden aber
 nicht abgerufen.
 
+## Ablagen: mehrere Shares und mehrere NAS
+
+Unter **Ablagen** laesst sich mehr als ein Ziel hinterlegen - mehrere Shares
+auf demselben NAS genauso wie mehrere NAS-Geraete. Jede Ablage ist nur ein
+Pfad, unter dem ein Share **bereits gemountet** ist; mail2nas mountet
+weiterhin nichts selbst (siehe
+[Warum der SMB-Mount auf dem Host passiert](#warum-der-smb-mount-auf-dem-host-passiert)).
+
+- Die **erste aktive** Ablage ist die Standard-Ablage. Alles ohne eigene
+  Angabe landet dort - also auch der Fallback- und der Quarantaene-Ordner.
+- Jede Zuordnung und jeder Drucker waehlt per Dropdown eine Ablage.
+- Die Seite zeigt je Ablage, ob der Mountpoint da und beschreibbar ist.
+- Ist eine Ablage nicht erreichbar (NAS aus, Mount weg), wird auf die
+  Standard-Ablage ausgewichen und das protokolliert. Das ist Absicht: ein
+  weggebrochener CIFS-Mount hinterlaesst ein leeres lokales Verzeichnis, und
+  ohne diese Pruefung wuerden Rechnungen unbemerkt in den Container schreiben
+  statt aufs NAS.
+- Die `mapping.yaml` liegt immer auf dem Basis-Share (`STORAGE_ROOT`), egal
+  wie viele Ablagen es gibt - so wandert die Regeldatei nicht mit, wenn sich
+  die Ablagen aendern.
+- Die letzte verbleibende Ablage laesst sich nicht loeschen. Wird eine andere
+  geloescht, fallen die daran gebundenen Zuordnungen und Drucker automatisch
+  auf die Standard-Ablage zurueck.
+
+### Ein zweites NAS einbinden
+
+Drei Schritte - zwei davon ausserhalb von mail2nas, weil der Mount zum
+Betriebssystem gehoert:
+
+```bash
+# 1) Auf dem Proxmox-HOST: Share mounten (analog zum ersten Share)
+mkdir -p /mnt/nas2-host
+cat > /etc/mail2nas-smb-credentials-nas2 <<'EOF'
+username=archiv
+password=GEHEIM
+EOF
+chmod 600 /etc/mail2nas-smb-credentials-nas2
+echo '//nas2.lan/archiv /mnt/nas2-host cifs credentials=/etc/mail2nas-smb-credentials-nas2,uid=100000,gid=100000,file_mode=0660,dir_mode=0770,vers=3.0,_netdev,nofail 0 0' >> /etc/fstab
+mount /mnt/nas2-host
+
+# 2) In die LXC durchreichen (CTID anpassen) und Container neu starten
+pct set <CTID> -mp1 /mnt/nas2-host,mp=/mnt/nas2
+pct reboot <CTID>
+```
+
+```yaml
+# 3) In der LXC: docker-compose.yml um das Volume ergaenzen
+    volumes:
+      - ${NAS_PATH:-/mnt/nas}:/mnt/nas
+      - ${NAS2_PATH:-/mnt/nas2}:/mnt/nas2      # neu
+      - state:/data
+```
+
+```bash
+docker compose up -d
+```
+
+Danach in der Weboberflaeche unter **Ablagen** eine neue Ablage mit dem Pfad
+`/mnt/nas2` anlegen - der Status muss "gemountet und beschreibbar" zeigen.
+Ohne Docker (systemd-Variante) entfaellt Schritt 3: dort reicht der Mount auf
+dem System selbst.
+
+## Drucker und Scanner
+
+Multifunktionsgeraete liefern Scans auf zwei Wegen. Beide lassen sich unter
+**Drucker** anlegen, einzeln oder kombiniert:
+
+| Weg | Was am Geraet eingestellt wird | Was in mail2nas eingetragen wird |
+|---|---|---|
+| **Scan-to-Mail** | Scans an die Archiv-Adresse schicken | Absenderadresse des Geraets |
+| **Scan-to-Folder** | Scans per SMB in einen Ordner auf dem NAS legen | Ablage + Abholordner |
+
+**Scan-to-Mail**: Die Mail muss ueber eines der [Mailkonten](#mehrere-mailkonten)
+hereinkommen. Erkannt wird das Geraet an der Absenderadresse - exakt
+(`scanner@example.com`), als ganze Domain (`@scanner.lan`) oder mit
+Platzhaltern (`kopierer-*@example.com`). Ist ein **Zielordner** hinterlegt,
+landen die Anhaenge dort, ohne dass Stichwoerter mitreden: Betreff und
+Dateiname eines Scanners (`SKM_C250i23081512.pdf`, "Scan vom 12.08.") sagen
+nichts aus, und ein zufaelliger Treffer waere schlechter als gar keiner. Ohne
+Zielordner entscheiden die normalen Zuordnungen.
+
+**Scan-to-Folder**: Das Geraet legt die Datei direkt auf dem NAS ab, mail2nas
+holt sie von dort ab - dafuer braucht es kein Mailkonto. Der Abholordner ist
+ein Ordner auf einer der [Ablagen](#ablagen-mehrere-shares-und-mehrere-nas),
+z. B. `scans/kopierer-flur`. Unterordner werden mitgelesen, Geraete legen dort
+gern je Benutzer oder Scanprofil einen an.
+
+Wichtig dabei:
+
+- Der Abholordner ist ein **Postausgang, kein Archiv**: abgeholte Dateien
+  werden von dort **verschoben**. Bliebe das Original liegen, wuerde es bei
+  jedem Durchlauf erneut abgelegt.
+- Eine Datei wird erst angefasst, wenn sie eine Weile unveraendert ist
+  (Einstellungen -> "Scan gilt als fertig nach", Default 20 Sekunden). Sonst
+  landet eine noch laufende Uebertragung als halbe Datei im Archiv.
+- Ignoriert werden versteckte Dateien, leere Dateien und typische
+  Transfer-Endungen (`.tmp`, `.part`, `.crdownload`, ...).
+- Abholordner werden mindestens einmal pro Minute geprueft, auch wenn das
+  Abrufintervall fuer IMAP groesser ist.
+- Ohne Zielordner greifen die Stichwortregeln - aber nur die fuer "Alle
+  Konten": eine Datei aus einem Ordner gehoert zu keinem Postfach.
+- Gesperrte Dateiendungen landen auch hier in der Quarantaene, und auch hier
+  kann kein Ordner aus dem Share ausbrechen.
+- Die Groessenlimits fuer Mails gelten nicht - die Datei liegt schon auf dem
+  NAS und wird gestreamt statt in den Speicher geladen.
+- Ein Zielordner *innerhalb* des Abholordners wird abgelehnt, sonst wuerde
+  dasselbe Dokument endlos wieder eingelesen.
+- Kann mail2nas im Abholordner nicht loeschen (Rechte), wird nichts
+  abgeholt und einmal geloggt - statt bei jedem Durchlauf eine weitere Kopie
+  anzulegen.
+
+Deaktivierte Geraete ("Aktiv" abwaehlen) bleiben gespeichert, werden aber
+weder erkannt noch abgeholt.
+
 ## Sicherheit: Angriffsflaeche ueber Mail/Anhaenge
 
 Mails und ihre Anhaenge kommen von aussen und sind grundsaetzlich nicht
@@ -553,7 +697,7 @@ damit um:
   `mapping.yaml` sind nicht vertrauenswuerdig - die Datei liegt auf dem Share
   und ist damit fuer jeden mit Schreibrechten aenderbar. `safe_join()` weist
   absolute Pfade und `..`-Komponenten ab und prueft zusaetzlich, dass das
-  Ergebnis unterhalb von `STORAGE_ROOT` bleibt; abgewiesene Ziele landen im
+  Ergebnis unterhalb der jeweiligen Ablage bleibt; abgewiesene Ziele landen im
   `FALLBACK_FOLDER` statt ausserhalb des Shares. (Ohne diese Pruefung wuerde
   bereits ein Eintrag wie `RE: /etc/cron.d` genuegen: in Python ersetzt ein
   absoluter rechter Operand beim Pfad-Join den kompletten Wurzelpfad.)
@@ -569,15 +713,23 @@ damit um:
   ueberdimensionierten Mail, die den Host/das Share volllaufen laesst.
 - **Limit fuer Anhaenge pro Mail** (`MAX_ATTACHMENTS_PER_MESSAGE`): schuetzt
   vor Mails mit tausenden Mini-Anhaengen.
-- **Quarantaene fuer ausfuehrbare Dateitypen** (`BLOCKED_EXTENSIONS`,
-  `QUARANTINE_FOLDER`): Anhaenge mit Endungen wie `.exe`, `.js`, `.ps1`,
+- **Quarantaene fuer ausfuehrbare Dateitypen** (Einstellungen ->
+  "Quarantaene: gesperrte Dateiendungen", vorbelegt aus `BLOCKED_EXTENSIONS`):
+  Anhaenge mit Endungen wie `.exe`, `.js`, `.ps1`,
   `.jar`, `.lnk`, `.sh` usw. werden IMMER in einen separaten
   Quarantaene-Ordner geschrieben - unabhaengig davon, ob der Dateiname
   zufaellig auf ein Mapping-Stichwort passt. Das verhindert, dass ein
   Angreifer eine Datei einfach `Rechnung.exe` nennt, um sie in den
   Rechnungsordner zu schleusen. Die Datei wird dabei nicht geloescht,
   sondern bleibt fuer eine manuelle Pruefung erhalten - **niemals von dort
-  oeffnen/ausfuehren**, ohne den Inhalt vorher zu verifizieren.
+  oeffnen/ausfuehren**, ohne den Inhalt vorher zu verifizieren. Die Liste ist
+  in der Weboberflaeche aenderbar; leert man sie, ist die Pruefung aus. Ist
+  der konfigurierte Quarantaene-Ordner unbrauchbar, wird auf `quarantaene/`
+  ausgewichen - eine gesperrte Datei landet nie im Fallback-Ordner zwischen
+  den Rechnungen.
+- **Dateien aus Drucker-Abholordnern werden genauso behandelt**: dieselben
+  Zuordnungen, dieselbe Quarantaene, dieselbe `safe_join()`-Pruefung. Der
+  Abholordner selbst wird nie zum Ziel (Endlos-Import).
 - **Kein automatisches Entpacken/Ausfuehren**: mail2nas speichert Anhaenge
   ausschliesslich als Rohbytes. ZIP-/Office-/PDF-Inhalte werden nicht
   entpackt, geparst oder ausgefuehrt - das eliminiert ganze Klassen von
@@ -640,6 +792,18 @@ Mailserver/ClamAV) einplanen.
 - **CIFS-Mount schlaegt fehl**: SMB-Protokollversion pruefen (`vers=3.0` ist
   meist am kompatibelsten), sowie ob der SMB-Benutzer tatsaechlich
   Schreibrechte auf dem Share hat.
+- **Eine Ablage zeigt "existiert nicht"**: der Mount fehlt oder ist
+  weggebrochen. Bis er wieder da ist, landen die betroffenen Dokumente auf der
+  Standard-Ablage - sie gehen nicht verloren, liegen aber woanders.
+- **Scans bleiben im Abholordner liegen**: Logzeilen mit `[<drucker-id>]`
+  pruefen. Haeufig ist es (a) die Wartezeit, solange das Geraet noch
+  uebertraegt, (b) ein Abholordner, in dem mail2nas nicht loeschen darf -
+  dann wird bewusst nichts abgeholt, statt Kopien zu vervielfachen, oder
+  (c) ein Zielordner innerhalb des Abholordners.
+- **Scans vom Kopierer landen im falschen Ordner**: dem Geraet unter
+  "Drucker" einen festen Zielordner geben. Ohne den entscheiden die
+  Stichwoerter - und Scanner-Dateinamen wie `SKM_C250i23081512.pdf` treffen
+  eher zufaellig.
 
 ## Tests
 
@@ -651,7 +815,9 @@ venv/bin/pytest
 
 Die Suite deckt unter anderem die oben beschriebenen Schutzmassnahmen ab
 (Traversal-Versuche ueber Zielordner, Quarantaene, Groessen- und
-Anzahl-Limits, kaputte `mapping.yaml`, Konfigurationsvalidierung).
+Anzahl-Limits, kaputte `mapping.yaml`, Konfigurationsvalidierung) sowie
+mehrere Ablagen (inkl. nicht gemounteter Shares), die Drucker-Erkennung per
+Absenderadresse und das Abholen aus Ordnern.
 
 `scripts/bootstrap.sh` enthaelt eine eingebettete Kopie aller Projektdateien
 und wird generiert, nicht von Hand gepflegt. Nach Aenderungen an einer

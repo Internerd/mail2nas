@@ -1,0 +1,10 @@
+{# Shared form snippets. Imported "with context" so the injected share list
+   and DEFAULT_SHARE are available inside. #}
+{% macro share_select(name, selected, default_label='Standard-Ablage') -%}
+  <select name="{{ name }}">
+    <option value="{{ DEFAULT_SHARE }}" {{ 'selected' if not selected }}>{{ default_label }}</option>
+    {% for s in shares %}
+      <option value="{{ s.id }}" {{ 'selected' if selected == s.id }}>{{ s.display_name() }}{{ '' if s.enabled else ' (inaktiv)' }}</option>
+    {% endfor %}
+  </select>
+{%- endmacro %}

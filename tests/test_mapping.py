@@ -20,10 +20,10 @@ def test_resolve_matches_case_insensitive(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    folder, keyword = mapping.resolve("Ihre re 12345")
+    target = mapping.resolve("Ihre re 12345")
 
-    assert folder == "rechnungen"
-    assert keyword == "RE"
+    assert target.folder == "rechnungen"
+    assert target.keyword == "RE"
 
 
 def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
@@ -31,10 +31,10 @@ def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
     _write_mapping(mapping_path, "RE: rechnungen\n")
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    folder, keyword = mapping.resolve("Newsletter August")
+    target = mapping.resolve("Newsletter August")
 
-    assert folder == "unsorted"
-    assert keyword is None
+    assert target.folder == "unsorted"
+    assert target.keyword is None
 
 
 def test_resolve_prefers_longer_keyword_match(tmp_path):
@@ -45,26 +45,26 @@ def test_resolve_prefers_longer_keyword_match(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    folder, keyword = mapping.resolve("Rechnungskorrektur zur RE-2024-01")
+    target = mapping.resolve("Rechnungskorrektur zur RE-2024-01")
 
-    assert folder == "korrekturen"
-    assert keyword == "Rechnungskorrektur"
+    assert target.folder == "korrekturen"
+    assert target.keyword == "Rechnungskorrektur"
 
 
 def test_missing_mapping_file_falls_back_to_default(tmp_path):
     mapping = Mapping(str(tmp_path / "does-not-exist.yaml"), fallback_folder="unsorted")
 
-    folder, keyword = mapping.resolve("Rechnung 123")
+    target = mapping.resolve("Rechnung 123")
 
-    assert folder == "unsorted"
-    assert keyword is None
+    assert target.folder == "unsorted"
+    assert target.keyword is None
 
 
 def test_reload_picks_up_changes(tmp_path):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("RE 1").folder == "rechnungen"
 
     _write_mapping(mapping_path, "RE: invoices\n")
     # Nudge mtime forward in case the filesystem has coarse timestamp resolution.
@@ -73,7 +73,7 @@ def test_reload_picks_up_changes(tmp_path):
 
     mapping.reload()
 
-    assert mapping.resolve("RE 1")[0] == "invoices"
+    assert mapping.resolve("RE 1").folder == "invoices"
 
 
 def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
@@ -81,7 +81,7 @@ def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
     mapping_path = tmp_path / "mapping.yaml"
     _write_mapping(mapping_path, "RE: rechnungen\n")
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("RE 1").folder == "rechnungen"
 
     mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
     stat = mapping_path.stat()
@@ -89,7 +89,7 @@ def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
 
     mapping.reload()  # must not raise
 
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("RE 1").folder == "rechnungen"
 
 
 def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
@@ -103,7 +103,7 @@ def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
 
     mapping.reload()
 
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("RE 1").folder == "rechnungen"
 
 
 def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
@@ -141,7 +141,7 @@ def test_v2_order_defines_priority_not_keyword_length(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "rechnungen"
+    assert mapping.resolve("Rechnungskorrektur zur RE-1").folder == "rechnungen"
 
 
 def test_v2_reordering_changes_the_winner(tmp_path):
@@ -156,7 +156,7 @@ def test_v2_reordering_changes_the_winner(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+    assert mapping.resolve("Rechnungskorrektur zur RE-1").folder == "korrekturen"
 
 
 def test_v1_dict_format_still_works_with_length_priority(tmp_path):
@@ -167,7 +167,7 @@ def test_v1_dict_format_still_works_with_length_priority(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
+    assert mapping.resolve("Rechnungskorrektur zur RE-1").folder == "korrekturen"
 
 
 @pytest.mark.parametrize(
@@ -192,7 +192,7 @@ def test_wildcards(tmp_path, pattern, text, expected):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert (mapping.resolve(text)[0] == "treffer") is expected
+    assert (mapping.resolve(text).folder == "treffer") is expected
 
 
 def test_plain_keyword_stays_a_substring_match(tmp_path):
@@ -205,7 +205,7 @@ def test_plain_keyword_stays_a_substring_match(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("Ihre Rechnung 4711")[0] == "rechnungen"
+    assert mapping.resolve("Ihre Rechnung 4711").folder == "rechnungen"
 
 
 def test_wildcards_are_case_insensitive(tmp_path):
@@ -218,7 +218,7 @@ def test_wildcards_are_case_insensitive(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("rechnung_1.pdf")[0] == "rechnungen"
+    assert mapping.resolve("rechnung_1.pdf").folder == "rechnungen"
 
 
 def test_rule_limited_to_one_account_is_skipped_for_others(tmp_path):
@@ -235,8 +235,8 @@ def test_rule_limited_to_one_account_is_skipped_for_others(tmp_path):
     """)
     mapping = Mapping(str(mapping_path), fallback_folder="unsorted")
 
-    assert mapping.resolve("Rechnung 1", account="privatkonto")[0] == "privat"
-    assert mapping.resolve("Rechnung 1", account="firmenkonto")[0] == "firma"
+    assert mapping.resolve("Rechnung 1", account="privatkonto").folder == "privat"
+    assert mapping.resolve("Rechnung 1", account="firmenkonto").folder == "firma"
 
 
 def test_dump_rules_roundtrips_through_the_loader(tmp_path):
@@ -260,7 +260,7 @@ def test_save_persists_order_and_is_reloaded(tmp_path):
     mapping.save([Rule(match="LS", folder="lieferscheine"), Rule(match="RE", folder="rechnungen")])
 
     assert Mapping(str(mapping_path), "unsorted").rules == mapping.rules
-    assert mapping.resolve("RE und LS")[0] == "lieferscheine"
+    assert mapping.resolve("RE und LS").folder == "lieferscheine"
 
 
 def test_rule_missing_folder_is_rejected_and_previous_rules_kept(tmp_path):
@@ -273,4 +273,4 @@ def test_rule_missing_folder_is_rejected_and_previous_rules_kept(tmp_path):
     os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
     mapping.reload()
 
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("RE 1").folder == "rechnungen"

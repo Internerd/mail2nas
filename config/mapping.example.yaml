@@ -24,6 +24,9 @@
 #           ("rechnungen/2026"), ausserhalb des Shares nicht.
 # account - "all" oder die id eines einzelnen Mailkontos. Die ids stehen in
 #           der Weboberflaeche unter "Mailkonten".
+# share   - optional: id der Ablage (NAS/Share), auf die der Zielordner
+#           gehoert. Fehlt der Eintrag, gilt die Standard-Ablage (die erste
+#           aktive). Die ids stehen in der Weboberflaeche unter "Ablagen".
 #
 # Geprueft wird zuerst der Dateiname jedes einzelnen Anhangs, danach Betreff
 # (und Mailtext, falls MATCH_BODY aktiviert ist). Dadurch koennen mehrere
@@ -35,6 +38,7 @@ rules:
   - match: Rechnungskorrektur
     folder: korrekturen
     account: all
+    # share: nas2      # optional, sonst Standard-Ablage
   - match: Gutschrift
     folder: gutschriften
     account: all

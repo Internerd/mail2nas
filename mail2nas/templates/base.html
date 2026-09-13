@@ -58,6 +58,8 @@
   <nav>
     <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint=='index' }}">Zuordnungen</a>
     <a href="{{ url_for('accounts_page') }}" class="{{ 'active' if request.endpoint=='accounts_page' }}">Mailkonten</a>
+    <a href="{{ url_for('printers_page') }}" class="{{ 'active' if request.endpoint=='printers_page' }}">Drucker</a>
+    <a href="{{ url_for('shares_page') }}" class="{{ 'active' if request.endpoint=='shares_page' }}">Ablagen</a>
     <a href="{{ url_for('settings_page') }}" class="{{ 'active' if request.endpoint=='settings_page' }}">Einstellungen</a>
   </nav>
   <form method="post" action="{{ url_for('logout') }}" style="margin-left:auto">

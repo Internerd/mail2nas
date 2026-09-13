@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% macro printer_form(p=None) %}
+  <form method="post" action="{{ url_for('printer_save') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="id" value="{{ p.id if p else '' }}">
+    <div class="row">
+      <div>
+        <label>Bezeichnung</label>
+        <input type="text" name="label" value="{{ p.label if p else '' }}" placeholder="z. B. Kopierer Flur" required>
+      </div>
+      <div>
+        <label>Absenderadresse (Scan-to-Mail)</label>
+        <input type="text" name="sender" value="{{ p.sender if p else '' }}" placeholder="scanner@example.com, @scanner.lan oder kopierer-*@example.com">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 200px">
+        <label>Abholordner liegt auf</label>
+        {{ m.share_select('source_share', p.source_share if p else '') }}
+      </div>
+      <div>
+        <label>Abholordner (Scan-to-Folder)</label>
+        <input type="text" name="source_folder" value="{{ p.source_folder if p else '' }}" placeholder="z. B. scans/kopierer-flur">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 200px">
+        <label>Ablage fuer die Dokumente</label>
+        {{ m.share_select('target_share', p.target_share if p else '') }}
+      </div>
+      <div>
+        <label>Zielordner <span class="hint">(leer = nach Stichwortregeln)</span></label>
+        <input type="text" name="target_folder" value="{{ p.target_folder if p else '' }}" placeholder="z. B. scans">
+      </div>
+      <div style="flex:0 0 auto; padding-bottom:6px">
+        <label>&nbsp;</label>
+        <label class="hint"><input type="checkbox" name="enabled" {{ 'checked' if not p or p.enabled }}> Aktiv</label>
+      </div>
+      <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+    </div>
+  </form>
+{% endmacro %}
+
+{% block content %}
+
+{% if status %}
+<div class="card">
+  <h2>Status</h2>
+  {% for s in status %}
+    {% if s.id == 'drucker' %}
+      <div><span class="dot {{ 'up' if s.alive else 'down' }}"></span>{{ s.label }}
+        {% if s.error %}<span class="hint">- letzter Fehler: {{ s.error }}</span>{% endif %}
+      </div>
+    {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Drucker und Scanner</h2>
+  <p class="hint">
+    Multifunktionsgeraete liefern Scans auf zwei Wegen - beide lassen sich hier anlegen,
+    einzeln oder zusammen:
+  </p>
+  <p class="hint">
+    <strong>Scan-to-Mail:</strong> das Geraet schickt den Scan per Mail. Die
+    <em>Absenderadresse</em> erkennt es wieder, sodass seine Dokumente unabhaengig vom
+    (meist nichtssagenden) Dateinamen abgelegt werden. Die Mail muss ueber eines der
+    Mailkonten hereinkommen.
+  </p>
+  <p class="hint">
+    <strong>Scan-to-Folder:</strong> das Geraet legt den Scan direkt auf dem lokalen NAS ab.
+    Der <em>Abholordner</em> wird ueberwacht und fertige Dateien werden von dort in den
+    Zielordner <em>verschoben</em> - dafuer braucht es kein Mailkonto.
+    Eine Datei wird erst angefasst, wenn sie eine Weile unveraendert ist, damit kein halb
+    uebertragener Scan abgelegt wird (Wartezeit siehe Einstellungen).
+  </p>
+  <p class="hint">
+    Ohne Zielordner entscheiden die normalen Stichwortregeln. Dabei greifen nur Regeln,
+    die fuer „Alle Konten“ gelten - ein Scan aus einem Ordner gehoert zu keinem Postfach.
+    Gesperrte Dateiendungen landen auch hier in der Quarantaene.
+  </p>
+</div>
+
+{% for p in printers %}
+  <div class="card">
+    <h2>{{ p.display_name() }} <span class="hint">- id: <code>{{ p.id }}</code></span></h2>
+    <p class="hint">
+      {% if p.sender %}Mail von <code>{{ p.sender }}</code>. {% endif %}
+      {{ pickup_state(p) }}{% if not p.enabled %} - <strong>inaktiv</strong>{% endif %}
+    </p>
+    {{ printer_form(p) }}
+    <form method="post" action="{{ url_for('printer_delete', printer_id=p.id) }}" style="margin-top:10px"
+          onsubmit="return confirm('Drucker „{{ p.display_name() }}“ wirklich loeschen?')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger">Drucker loeschen</button>
+    </form>
+  </div>
+{% endfor %}
+
+<div class="card">
+  <h2>Neuer Drucker / Scanner</h2>
+  {{ printer_form() }}
+</div>
+
+{% endblock %}

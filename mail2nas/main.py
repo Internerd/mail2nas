@@ -11,6 +11,7 @@ from .filenames import safe_join
 from .mapping import Mapping
 from .runner import Runner
 from .settings import Settings
+from .shares import ShareSet
 from .state import ProcessedStore
 
 logger = logging.getLogger("mail2nas")
@@ -34,6 +35,24 @@ def _check_storage_root(config: Config) -> None:
             f"STORAGE_ROOT {config.storage_root} is not writable by uid {os.getuid()} - "
             "check the mount options (uid/gid/file_mode) and the share permissions."
         )
+
+
+def _check_shares(settings: Settings, config: Config) -> None:
+    """Report additional shares that are not mounted, without refusing to start.
+
+    STORAGE_ROOT is fatal when it is missing (see _check_storage_root) because
+    nothing can be archived at all. A second NAS being down is different: the
+    rest keeps working, and documents for the missing share are diverted to
+    the default one rather than written into an empty mount point.
+    """
+    shares = ShareSet.from_settings(settings, config.storage_root)
+    for status in shares.status():
+        if not status.enabled:
+            logger.info("Share '%s' (%s) is disabled", status.label, status.path)
+        elif status.problem:
+            logger.error("Share '%s' is not usable: %s", status.label, status.problem)
+        else:
+            logger.info("Share '%s' -> %s", status.label, status.path)
 
 
 def _start_web(config: Config, settings: Settings, mapping: Mapping, runner: Runner) -> None:
@@ -77,6 +96,7 @@ def main() -> None:
     _check_storage_root(config)
 
     settings = Settings.load(config)
+    _check_shares(settings, config)
     try:
         mapping_full_path = safe_join(config.storage_root, settings.mapping_path)
     except ValueError as exc:
@@ -85,9 +105,10 @@ def main() -> None:
     store = ProcessedStore(config.state_db_path)
 
     logger.info(
-        "Starting mail2nas: %d account(s), storage=%s dry_run=%s",
+        "Starting mail2nas: %d account(s), %d device(s), %d share(s), dry_run=%s",
         len(settings.enabled_accounts()),
-        config.storage_root,
+        len(settings.enabled_printers()),
+        len(settings.enabled_shares()),
         config.dry_run,
     )
 

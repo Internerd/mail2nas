@@ -45,6 +45,32 @@
         Auch den Mailtext nach Stichwoertern durchsuchen (sonst nur Dateiname und Betreff)
       </label>
     </p>
+    <p class="hint">
+      Die Ordner liegen auf der Standard-Ablage bzw. auf der Ablage, die die passende
+      Zuordnung nennt. Mehrere NAS/Shares werden unter „Ablagen“ verwaltet.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Quarantaene: gesperrte Dateiendungen</h2>
+    <div class="row">
+      <div>
+        <label>Endungen, komma- oder leerzeichengetrennt (ohne Punkt)</label>
+        <input type="text" name="blocked_extensions" value="{{ blocked_extensions }}"
+               placeholder="exe, com, scr, bat, ...">
+      </div>
+    </div>
+    <p class="hint">
+      Anhaenge mit einer dieser Endungen landen <strong>immer</strong> im Quarantaene-Ordner
+      „<code>{{ settings.quarantine_folder }}</code>“ - auch wenn der Dateiname auf ein
+      Stichwort passt. So kann „Rechnung.exe“ nicht im Rechnungsordner landen.
+      Leer lassen schaltet die Pruefung ab (nicht empfohlen).
+      Gilt fuer Mailanhaenge und fuer Dateien aus Drucker-Abholordnern.
+    </p>
+    <p class="hint">
+      Diese Liste ersetzt die Umgebungsvariable <code>BLOCKED_EXTENSIONS</code>; die wird nur
+      noch beim allerersten Start als Vorbelegung gelesen.
+    </p>
   </div>
 
   <div class="card">
@@ -66,11 +92,19 @@
         <label>Max. Anhaenge je Mail</label>
         <input type="number" name="max_attachments_per_message" value="{{ settings.max_attachments_per_message }}" min="1">
       </div>
+      <div>
+        <label>Scan gilt als fertig nach (Sekunden)</label>
+        <input type="number" name="printer_min_age_seconds" value="{{ settings.printer_min_age_seconds }}" min="0">
+      </div>
     </div>
     <p class="hint">
       Die Grenzwerte begrenzen, was eine einzelne Mail an Speicher und Plattenplatz
-      verursachen kann. Die Liste gesperrter Dateiendungen wird ueber die
-      Umgebungsvariable <code>BLOCKED_EXTENSIONS</code> gesetzt.
+      verursachen kann; fuer Dateien aus Drucker-Abholordnern gelten sie nicht, die
+      liegen bereits auf dem NAS und werden gestreamt.
+      Die Wartezeit sorgt dafuer, dass ein Scan erst abgeholt wird, wenn er eine Weile
+      unveraendert ist - sonst wird eine noch laufende Uebertragung abgelegt.
+      Abholordner werden mindestens einmal pro Minute geprueft, auch wenn das
+      Abrufintervall groesser ist.
     </p>
   </div>
 

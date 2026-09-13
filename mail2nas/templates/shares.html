@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% macro share_form(s=None) %}
+  <form method="post" action="{{ url_for('share_save') }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="id" value="{{ s.id if s else '' }}">
+    <div>
+      <label>Bezeichnung</label>
+      <input type="text" name="label" value="{{ s.label if s else '' }}" placeholder="z. B. NAS Buero">
+    </div>
+    <div style="flex:2 1 260px">
+      <label>Mountpoint (Pfad, an dem das Share bereits gemountet ist)</label>
+      <input type="text" name="path" value="{{ s.path if s else '' }}" placeholder="/mnt/nas2" required>
+    </div>
+    <div style="flex:0 0 auto; padding-bottom:6px">
+      <label>&nbsp;</label>
+      <label class="hint"><input type="checkbox" name="enabled" {{ 'checked' if not s or s.enabled }}> Aktiv</label>
+    </div>
+    <div style="flex:0 0 auto"><button class="primary">Speichern</button></div>
+  </form>
+{% endmacro %}
+
+{% block content %}
+
+<div class="card">
+  <h2>Ablagen (NAS / Shares)</h2>
+  <p class="hint">
+    Anhaenge koennen auf mehrere Shares verteilt werden - auch auf verschiedene NAS.
+    Jede Zuordnung und jeder Drucker waehlt eine dieser Ablagen; die <strong>erste
+    aktive</strong> ist die Standard-Ablage fuer alles, was keine eigene nennt.
+  </p>
+  <p class="hint">
+    mail2nas mountet nichts selbst. Das Share muss vom Betriebssystem gemountet sein
+    (z. B. per <code>/etc/fstab</code> und Bind-Mount in den Container), hier steht nur der Pfad,
+    unter dem es hier erreichbar ist. Ist ein Mountpoint nicht da oder nicht beschreibbar,
+    wird auf die Standard-Ablage ausgewichen, statt ins leere Verzeichnis zu schreiben.
+  </p>
+  <p class="hint">
+    <code>STORAGE_ROOT</code> dieser Instanz: <code>{{ storage_root }}</code> -
+    dort liegt auch die Mapping-Datei.
+  </p>
+
+  <table>
+    <thead><tr><th>Ablage</th><th>Pfad</th><th>Status</th></tr></thead>
+    <tbody>
+    {% for st in status %}
+      <tr>
+        <td><span class="dot {{ 'up' if st.ok and st.enabled else 'down' }}"></span>{{ st.label }}
+            <span class="hint">- id: <code>{{ st.id }}</code></span></td>
+        <td><code>{{ st.path }}</code></td>
+        <td class="hint">
+          {% if not st.enabled %}inaktiv
+          {% elif st.problem %}{{ st.problem }}
+          {% else %}gemountet und beschreibbar{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% for s in shares %}
+  <div class="card">
+    <h2>{{ s.display_name() }} <span class="hint">- id: <code>{{ s.id }}</code></span></h2>
+    {{ share_form(s) }}
+    {% if shares|length > 1 %}
+    <form method="post" action="{{ url_for('share_delete', share_id=s.id) }}" style="margin-top:10px"
+          onsubmit="return confirm('Ablage „{{ s.display_name() }}“ wirklich loeschen? Daran gebundene Zuordnungen nutzen danach die Standard-Ablage.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger">Ablage loeschen</button>
+    </form>
+    {% endif %}
+  </div>
+{% endfor %}
+
+<div class="card">
+  <h2>Neue Ablage</h2>
+  {{ share_form() }}
+  <p class="hint">
+    Beispiel: ein zweites NAS liegt auf dem Host unter <code>/mnt/nas2</code> und ist in den
+    Container gemountet - dann hier <code>/mnt/nas2</code> eintragen.
+  </p>
+</div>
+
+{% endblock %}

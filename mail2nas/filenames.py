@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -96,6 +97,30 @@ def unique_path(directory: str | Path, filename: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def copy_atomic(source: str | Path, path: str | Path) -> None:
+    """Copy `source` to `path` via a temporary file plus rename.
+
+    Same reasoning as write_atomic, but streamed: files picked up from a
+    printer's folder are already on disk and can be arbitrarily large, so
+    there is no reason to pull them through memory. Works across shares,
+    where os.replace() would fail with EXDEV.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".mail2nas-tmp-")
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def write_atomic(path: str | Path, data: bytes) -> None:
