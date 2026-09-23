@@ -1487,3 +1487,299 @@ def test_a_failing_mailbox_test_says_why(client, env, monkeypatch):
         "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
 
     assert "AUTHENTICATIONFAILED" in response.get_data(as_text=True)
+
+
+# --- read mail per mailbox ------------------------------------------------------
+
+
+def _account_form(**overrides):
+    form = {
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "ssl": "1",
+        "user": "u", "password": "geheim", "folder": "INBOX", "mode": "poll",
+        "processed_folder": "", "oversized_folder": "", "enabled": "1",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_an_account_can_include_read_mail(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/accounts/new", data={
+        **_account_form(include_seen="1", seen_since="2026-01-15"),
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    (account,) = runtime.accounts.all()
+    assert account.include_seen and account.seen_since == "2026-01-15"
+    assert "auch gelesene ab 2026-01-15" in client.get("/config").get_data(as_text=True)
+
+
+def test_a_bad_read_mail_date_is_refused(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/accounts/new", data={
+        **_account_form(include_seen="1", seen_since="2999-01-01"),
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    assert "Zukunft" in response.get_data(as_text=True)
+    assert runtime.accounts.all() == []
+
+
+def test_an_account_form_without_the_new_fields_keeps_them(client, env):
+    _, _, _, _, runtime = env
+    account_id = runtime.accounts.add(name="A", host="h", user="u", password="p",
+                                      include_seen=True, seen_since="2026-02-01")
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        **_account_form(), "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    assert runtime.accounts.get(account_id).include_seen
+
+
+# --- retention ------------------------------------------------------------------
+
+
+def test_the_retention_can_be_set(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/settings", data={
+        **_settings_form(retention_days="365"), "csrf_token": _csrf(client, "/settings")})
+    assert runtime.options.retention_days == 365
+
+    response = client.post("/settings", data={
+        **_settings_form(retention_days="5"), "csrf_token": _csrf(client, "/settings")})
+    assert "zwischen" in response.get_data(as_text=True) or runtime.options.retention_days == 365
+    assert runtime.options.retention_days == 365
+
+
+# --- the log page ------------------------------------------------------------------
+
+
+def test_the_log_page_shows_the_journal_and_filters_it(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FILED, subject="Rechnung 4711", filename="r.pdf",
+                           target="/nas/rechnungen/r.pdf")
+    runtime.journal.record("Postfach A", j.NOT_PRINTED, subject="Lieferschein <b>",
+                           filename="l.pdf", detail="Drucker aus")
+    _login(client)
+
+    page = client.get("/log").get_data(as_text=True)
+    assert "Rechnung 4711" in page and "Drucker aus" in page
+    assert "Lieferschein &lt;b&gt;" in page
+
+    problems = client.get("/log?problems=1").get_data(as_text=True)
+    assert "Drucker aus" in problems and "Rechnung 4711" not in problems
+
+    found = client.get("/log?q=4711").get_data(as_text=True)
+    assert "Rechnung 4711" in found and "Drucker aus" not in found
+
+
+def test_the_log_page_pages(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    for number in range(130):
+        runtime.journal.record("A", j.FILED, subject=f"Mail {number}")
+    _login(client)
+
+    first = client.get("/log").get_data(as_text=True)
+    second = client.get("/log?page=2").get_data(as_text=True)
+
+    assert "Mail 129" in first and "Mail 0<" not in first
+    assert "Seite 2 von 2" in second and "Mail 0" in second
+
+
+def test_the_service_log_is_shown(client, env):
+    _, _, _, _, runtime = env
+    runtime.logs.add("WARNING", "mail2nas.archiver", "Drucker antwortet nicht")
+    runtime.logs.add("INFO", "mail2nas.archiver", "alles gut")
+    _login(client)
+
+    page = client.get("/log?view=log&level=WARNING").get_data(as_text=True)
+
+    assert "Drucker antwortet nicht" in page and "alles gut" not in page
+
+
+def test_the_journal_can_be_exported_as_csv(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FILED, subject="Rechnung; 1", filename="r.pdf")
+    runtime.journal.record("Postfach A", j.FILED, subject="=HYPERLINK(\"http://x\")")
+    _login(client)
+
+    response = client.get("/log/export.csv")
+
+    assert response.headers["Content-Type"].startswith("text/csv")
+    text = response.get_data().decode("utf-8-sig")
+    assert text.splitlines()[0].startswith("Zeit;Quelle;Aktion")
+    assert '"Rechnung; 1"' in text
+    assert "'=HYPERLINK" in text
+
+
+def test_the_log_needs_a_login(client):
+    assert client.get("/log").status_code == 302
+    assert client.get("/log/export.csv").status_code == 302
+    assert client.get("/backup/download").status_code == 302
+
+
+# --- backup and restore ---------------------------------------------------------------
+
+
+def test_a_backup_can_be_downloaded_and_restored(client, env):
+    import io
+
+    from mail2nas import backup
+
+    _, _, _, _, runtime = env
+    runtime.accounts.add(name="Original", host="h", user="u", password="p")
+    _login(client)
+
+    response = client.get("/backup/download")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["Content-Disposition"]
+    data = response.get_data()
+    assert backup.check(data)["imap_accounts"] == 1
+
+    runtime.accounts.add(name="Spaeter", host="h", user="u", password="p")
+    response = client.post("/backup/restore", data={
+        "confirm": "1",
+        "backup_file": (io.BytesIO(data), "sicherung.db.gz"),
+        "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert "Wiederhergestellt" in response.get_data(as_text=True)
+    assert [a.name for a in runtime.accounts.all()] == ["Original"]
+    # Still logged in afterwards.
+    assert client.get("/overview").status_code == 200
+
+
+def test_a_restore_needs_confirmation_and_a_real_backup(client, env):
+    import io
+
+    _, _, _, _, runtime = env
+    runtime.accounts.add(name="Bleibt", host="h", user="u", password="p")
+    _login(client)
+
+    response = client.post("/backup/restore", data={
+        "backup_file": (io.BytesIO(b"x"), "a.db"), "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert "bestaetigen" in response.get_data(as_text=True)
+
+    response = client.post("/backup/restore", data={
+        "confirm": "1", "backup_file": (io.BytesIO(b"kein backup"), "a.db"),
+        "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert "Nicht wiederhergestellt" in response.get_data(as_text=True)
+    assert [a.name for a in runtime.accounts.all()] == ["Bleibt"]
+
+
+def test_automatic_backups_can_be_set_up_and_run(client, env, tmp_path):
+    from mail2nas import backup
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/backup/settings", data={
+        "enabled": "1", "folder": "sicherung", "keep": "3",
+        "csrf_token": _csrf(client, "/backup")})
+    assert backup.BackupStore(runtime.settings).load().keep == 3
+
+    response = client.post("/backup/now", data={"csrf_token": _csrf(client, "/backup")},
+                           follow_redirects=True)
+    assert "Gesichert nach" in response.get_data(as_text=True)
+    assert any((tmp_path / "sicherung").glob("mail2nas-sicherung-*.db.gz"))
+
+
+# --- notifications -----------------------------------------------------------------------
+
+
+def _notify_form(**overrides):
+    form = {
+        "enabled": "1", "recipients": "it@firma.de", "smtp_host": "smtp.firma.de",
+        "smtp_port": "587", "smtp_security": "starttls", "smtp_user": "m@firma.de",
+        "smtp_password": "geheim", "sender": "", "delay_minutes": "30",
+        "on_connection": "1", "on_failures": "1", "on_recovery": "1",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_notifications_are_configured_in_the_ui(client, env):
+    from mail2nas.notify import NotifyStore
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    value = NotifyStore(runtime.settings).load()
+    assert value.enabled and value.recipients == "it@firma.de"
+    page = client.get("/config/notifications").get_data(as_text=True)
+    assert "geheim" not in page
+    assert "it@firma.de" in client.get("/config").get_data(as_text=True)
+
+
+def test_invalid_notification_settings_are_refused(client, env):
+    from mail2nas.notify import NotifyStore
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/notifications", data={
+        **_notify_form(recipients="kaputt"), "csrf_token": _csrf(client, "/config/notifications")})
+
+    assert "Keine gueltige Mailadresse" in response.get_data(as_text=True)
+    assert not NotifyStore(runtime.settings).load().enabled
+
+
+def test_a_test_mail_can_be_sent(client, env, monkeypatch):
+    from mail2nas import web
+
+    sent = []
+    monkeypatch.setattr(web, "send_mail", lambda settings, subject, body, timeout: sent.append(subject))
+    _login(client)
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    response = client.post("/config/notifications/test", data={
+        "csrf_token": _csrf(client, "/config/notifications")}, follow_redirects=True)
+
+    assert sent == ["mail2nas: Testmail"]
+    assert "Testmail an it@firma.de gesendet" in response.get_data(as_text=True)
+
+
+def test_a_failing_test_mail_is_reported(client, env, monkeypatch):
+    from mail2nas import web
+
+    def broken(*args, **kwargs):
+        raise OSError("Verbindung abgelehnt")
+
+    monkeypatch.setattr(web, "send_mail", broken)
+    _login(client)
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    response = client.post("/config/notifications/test", data={
+        "csrf_token": _csrf(client, "/config/notifications")}, follow_redirects=True)
+
+    assert "Verbindung abgelehnt" in response.get_data(as_text=True)
+
+
+def test_the_overview_mentions_recent_problems(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FAILED, detail="kaputt")
+    _login(client)
+
+    page = client.get("/overview").get_data(as_text=True)
+
+    assert "1 Problem(e)" in page

@@ -51,6 +51,9 @@ EMBEDDED_FILES = (
     "mail2nas/mapping.py",
     "mail2nas/filenames.py",
     "mail2nas/state.py",
+    "mail2nas/journal.py",
+    "mail2nas/backup.py",
+    "mail2nas/notify.py",
     "mail2nas/archiver.py",
     "mail2nas/scanning.py",
     "mail2nas/web.py",
@@ -71,6 +74,9 @@ EMBEDDED_FILES = (
     "tests/test_discovery.py",
     "tests/test_main.py",
     "tests/test_migrate.py",
+    "tests/test_journal.py",
+    "tests/test_notify.py",
+    "tests/test_backup.py",
 )
 
 HEADER = """\
@@ -111,7 +117,21 @@ echo "  Danach alles Weitere in der Weboberflaeche (http://<ip>:8080/)."
 """
 
 
+def _check_complete() -> None:
+    """Every module of the package has to be in the script, or the rebuilt
+    project does not even import. Easy to forget when adding one."""
+    embedded = set(EMBEDDED_FILES) | set(TOUCH_FILES)
+    missing = sorted(
+        path.relative_to(REPO).as_posix()
+        for path in (REPO / "mail2nas").glob("*.py")
+        if path.relative_to(REPO).as_posix() not in embedded
+    )
+    if missing:
+        raise SystemExit(f"Not embedded in bootstrap.sh: {', '.join(missing)}")
+
+
 def build() -> str:
+    _check_complete()
     dirs = " ".join(f'"$TARGET"/{d}' for d in DIRECTORIES)
     out = [HEADER % {"dirs": dirs}]
 

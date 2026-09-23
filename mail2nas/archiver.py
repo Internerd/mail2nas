@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import email
+import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 from email.header import decode_header, make_header
 from email.message import Message
+from email.parser import BytesHeaderParser
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
@@ -13,6 +16,7 @@ from .accounts import Account
 from .addresses import AddressRule, AddressStore
 from .archives import StorageSet
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
+from . import journal as j
 from .mapping import Mapping, Rule
 from .options import Options
 from .printers import Printer
@@ -42,6 +46,15 @@ MAX_RECIPIENTS = 50
 # Seconds a single IMAP command may take. Without a timeout a server that
 # stops answering mid-session blocks the worker forever - no error, no retry.
 IMAP_TIMEOUT = 60
+# Asked for before the whole message: enough to recognise a mail that was
+# already processed, without downloading it again. PEEK, so asking does not
+# mark anything as read.
+HEADER_PART = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"
+# The processed-message list is pruned after the retention period. A mailbox
+# that also processes read mail must therefore never look back that far, or a
+# forgotten mail still sitting in the folder would be filed a second time. The
+# margin covers the time between a mail's arrival and its processing.
+SEEN_WINDOW_MARGIN_DAYS = 2
 
 
 def _decode(value: str | None) -> str:
@@ -80,6 +93,26 @@ def _message_id(msg: Message, uid: int, account_key: str) -> str:
     return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
+def part_key(index: int, payload: bytes) -> str:
+    """Identifies one attachment of a mail for the retry check: its position
+    and its content, so a different file at the same position never counts
+    as already done."""
+    return f"{index}:{hashlib.sha256(payload).hexdigest()[:20]}"
+
+
+def _header_part(entry: dict) -> bytes | None:
+    """The fetched Message-ID header, or None if the server did not send it.
+
+    Servers echo the section name in different spellings, so the key is
+    found by its prefix rather than by an exact match.
+    """
+    for key, value in entry.items():
+        name = key.decode("ascii", "replace") if isinstance(key, bytes) else str(key)
+        if name.upper().startswith("BODY[HEADER"):
+            return value or b""
+    return None
+
+
 @dataclass(frozen=True)
 class AttachmentPlan:
     """What is to happen with one attachment, decided before anything happens.
@@ -110,6 +143,7 @@ class Archiver:
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
+        journal=None,
     ):
         # `options` is an Options snapshot or a callable returning the current
         # one. The callable is what the service uses: the settings page takes
@@ -125,6 +159,15 @@ class Archiver:
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
+        # What happened to each attachment; also what makes a retry skip the
+        # attachments that were already filed or printed. Optional for tests.
+        self.journal = journal
+        # UIDs known to be processed in the current IMAP session, so a mailbox
+        # that also looks at read mail does not ask about them every cycle.
+        self._done_uids: set[int] = set()
+        # Failures already written to the journal in this session - a mail
+        # that keeps failing is recorded once, not on every retry.
+        self._reported: set[tuple[int, str]] = set()
 
     @property
     def options(self) -> Options:
@@ -146,7 +189,37 @@ class Archiver:
         )
         client.login(self.account.user, self.account.password)
         client.select_folder(self.account.folder)
+        # UIDs are only meaningful within one session (UIDVALIDITY).
+        self._done_uids.clear()
+        self._reported.clear()
         return client
+
+    @property
+    def source(self) -> str:
+        """How this mailbox is named in the journal."""
+        return f"Postfach {self.account.name}"
+
+    def _record(self, action: str, **fields) -> None:
+        if self.journal is not None:
+            self.journal.record(self.source, action, **fields)
+
+    def seen_since(self, today: date | None = None) -> date:
+        """The oldest arrival date considered when read mail is included."""
+        today = today or date.today()
+        retention = getattr(self.options, "retention_days", j.DEFAULT_RETENTION_DAYS)
+        earliest = today - timedelta(days=max(1, retention - SEEN_WINDOW_MARGIN_DAYS))
+        try:
+            wanted = date.fromisoformat(self.account.seen_since) if self.account.seen_since else today
+        except ValueError:
+            wanted = today
+        return max(wanted, earliest)
+
+    def search_criteria(self, today: date | None = None) -> list:
+        """What to ask the server for: unread mail, and - if the mailbox is set
+        to - read mail since the configured date as well."""
+        if not self.account.include_seen:
+            return ["UNSEEN"]
+        return ["OR", "UNSEEN", "SINCE", self.seen_since(today)]
 
     def _match(self, *texts: str) -> Rule | None:
         # Rules can be limited to a single mailbox, so the account has to be
@@ -156,7 +229,7 @@ class Archiver:
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
         self.mapping.reload()
-        uids = client.search(["UNSEEN"])
+        uids = [uid for uid in client.search(self.search_criteria()) if uid not in self._done_uids]
         if not uids:
             return 0
 
@@ -165,16 +238,46 @@ class Archiver:
             try:
                 if self._process_message(client, uid):
                     processed += 1
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to process message UID %s, leaving it for retry", uid)
+                reason = f"{exc.__class__.__name__}: {exc}"
+                if (uid, reason) not in self._reported:
+                    self._reported.add((uid, reason))
+                    self._record(
+                        j.FAILED,
+                        message_key=f"uid:{uid}",
+                        detail=f"Mail (UID {uid}) nicht verarbeitet, wird erneut versucht - {reason}",
+                    )
         return processed
+
+    def _already_processed(self, client: IMAPClient, uid: int, entry: dict) -> bool:
+        """Recognise a processed mail from its header alone.
+
+        Returns False when that is not possible (the server did not return the
+        header) - the full message is then fetched and checked as before.
+        """
+        header = _header_part(entry)
+        if header is None:
+            return False
+        parsed = BytesHeaderParser().parsebytes(header)
+        message_id = _message_id(parsed, uid, self.account.key)
+        if not self.store.is_processed(message_id):
+            return False
+        self._done_uids.add(uid)
+        flags = entry.get(b"FLAGS") or ()
+        if b"\\Seen" not in flags and not self.options.dry_run:
+            logger.info("UID %s (%s) already processed, marking seen", uid, message_id)
+            client.add_flags([uid], [b"\\Seen"])
+        return True
 
     def _process_message(self, client: IMAPClient, uid: int) -> bool:
         # Check the message size *before* pulling the full body into memory -
         # a hostile/broken sender could otherwise use an oversized message to
         # exhaust memory/disk on every poll cycle.
-        size_reply = client.fetch([uid], ["RFC822.SIZE"])
-        message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
+        head = client.fetch([uid], ["RFC822.SIZE", "FLAGS", HEADER_PART]).get(uid, {})
+        if self._already_processed(client, uid, head):
+            return False
+        message_size = head.get(b"RFC822.SIZE", 0)
         max_message_bytes = self.options.max_message_size_mb * 1024 * 1024
         if message_size and message_size > max_message_bytes:
             logger.warning(
@@ -185,6 +288,16 @@ class Archiver:
                 self.options.max_message_size_mb,
             )
             if not self.options.dry_run:
+                self._record(
+                    j.TOO_LARGE,
+                    message_key=f"uid:{uid}",
+                    detail=(
+                        f"Mail ist {message_size / (1024 * 1024):.1f} MB gross, erlaubt sind "
+                        f"{self.options.max_message_size_mb} MB - nicht verarbeitet"
+                        + (f", verschoben nach {self.account.oversized_folder}"
+                           if self.account.oversized_folder else "")
+                    ),
+                )
                 client.add_flags([uid], [b"\\Seen"])
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
@@ -196,7 +309,9 @@ class Archiver:
 
         if self.store.is_processed(message_id):
             logger.info("UID %s (%s) already processed, marking seen and skipping", uid, message_id)
-            client.add_flags([uid], [b"\\Seen"])
+            self._done_uids.add(uid)
+            if not self.options.dry_run:
+                client.add_flags([uid], [b"\\Seen"])
             return False
 
         subject = _decode(msg.get("Subject"))
@@ -226,12 +341,16 @@ class Archiver:
             attachments = attachments[: self.options.max_attachments_per_message]
 
         saved: list[str] = []
+        context = dict(message_key=message_id, subject=subject, sender=sender_addr)
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
+            if not self.options.dry_run:
+                self._record(j.NO_ATTACHMENTS, **context)
         else:
             date_prefix = self._date_prefix(msg)
             max_attachment_bytes = self.options.max_attachment_size_mb * 1024 * 1024
-            for filename, payload in attachments:
+            for index, (filename, payload) in enumerate(attachments):
+                shown = sanitize_filename(_decode(filename))
                 if len(payload) > max_attachment_bytes:
                     logger.warning(
                         "UID %s '%s': attachment '%s' is %.1f MB, exceeds "
@@ -242,23 +361,38 @@ class Archiver:
                         len(payload) / (1024 * 1024),
                         self.options.max_attachment_size_mb,
                     )
+                    if not self.options.dry_run:
+                        self._record(
+                            j.SKIPPED, filename=shown, **context,
+                            detail=(f"Anhang ist {len(payload) / (1024 * 1024):.1f} MB gross, "
+                                    f"erlaubt sind {self.options.max_attachment_size_mb} MB"),
+                        )
                     continue
 
+                part = part_key(index, payload)
                 plan = self._plan_attachment(filename, mail_rule, address_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
+                item = dict(context, part_key=part, filename=shown)
+
+                # A retry of a mail that failed half-way: what already happened
+                # to this attachment is not done a second time.
+                already_filed = self._done(message_id, part, j.FILED_ACTIONS)
+                already_printed = self._done(message_id, part, (j.PRINTED,))
 
                 if plan.archive:
-                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                    if already_filed:
+                        logger.info("UID %s: attachment '%s' was already filed, skipping",
+                                    uid, filename)
+                    else:
+                        self._file(plan, out_name, payload, uid, subject, filename, saved, item)
 
                 # Printing comes after filing, deliberately: the share is the
                 # archive and paper is the copy, so a printer that is offline
                 # or out of paper must never be the reason an attachment was
                 # not stored.
-                printed = False
-                if plan.printer is not None:
-                    printed = self.printing.send(
-                        plan.printer, payload, out_name, job_title(subject, filename)
-                    )
+                printed = already_printed
+                if plan.printer is not None and not already_printed:
+                    printed = self._print(plan, payload, out_name, subject, filename, item)
 
                 if not plan.archive and not printed:
                     # "Print only" and yet nothing came out - no printer, a
@@ -272,7 +406,8 @@ class Archiver:
                         subject,
                         filename,
                     )
-                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                    if not already_filed:
+                        self._file(plan, out_name, payload, uid, subject, filename, saved, item)
                 elif not plan.archive:
                     logger.info(
                         "UID %s '%s': attachment '%s' printed, not archived (%s)",
@@ -286,19 +421,55 @@ class Archiver:
 
         if not self.options.dry_run:
             self.store.mark_processed(message_id)
+            self._done_uids.add(uid)
             client.add_flags([uid], [b"\\Seen"])
             if self.account.processed_folder:
                 client.move([uid], self.account.processed_folder)
         return True
 
-    def _file(self, plan, out_name, payload, uid, subject, filename, saved) -> None:
+    def _done(self, message_key: str, part: str, actions) -> bool:
+        if self.journal is None or self.options.dry_run:
+            return False
+        try:
+            return self.journal.done(message_key, part, actions)
+        except Exception:  # noqa: BLE001 - better a duplicate than a lost attachment
+            logger.exception("Could not read the journal - processing the attachment again")
+            return False
+
+    def _print(self, plan, payload, out_name, subject, filename, item) -> bool:
+        # The spooler knows about the test mode itself and only logs then.
+        printed = self.printing.send(plan.printer, payload, out_name, job_title(subject, filename))
+        if self.options.dry_run:
+            self._record(j.DRY_RUN, target=plan.printer.label(), detail="wuerde gedruckt", **item)
+        elif printed:
+            self._record(j.PRINTED, target=plan.printer.label(), **item)
+        else:
+            self._record(
+                j.NOT_PRINTED, target=plan.printer.label(), **item,
+                detail="Druckauftrag nicht angenommen oder Dateityp nicht druckbar - "
+                       "Details im Protokoll",
+            )
+        return printed
+
+    def _file(self, plan, out_name, payload, uid, subject, filename, saved, item=None) -> None:
         target_parts = self._target_parts(plan.folder)
         storage = self.storage_for(plan.archive_key)
         if self.options.dry_run:
             logger.info("[dry-run] would save %s -> %s", out_name, storage.display(target_parts))
+            self._record(j.DRY_RUN, target=storage.display(target_parts, out_name),
+                         detail="wuerde abgelegt", **(item or {}))
             return
         out_path = storage.save_unique(target_parts, out_name, payload)
         saved.append(out_path)
+        self._record(
+            j.QUARANTINED if plan.quarantined else j.FILED,
+            target=out_path,
+            detail=("gesperrte Dateiendung" if plan.quarantined
+                    else f"Stichwort {plan.keyword}" if plan.keyword
+                    else f"Adresse {plan.address.name}" if plan.address is not None
+                    else "kein Treffer - Fallback-Ordner"),
+            **(item or {}),
+        )
         logger.info(
             "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
             uid,

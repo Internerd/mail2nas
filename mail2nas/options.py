@@ -39,6 +39,7 @@ LIMITS = {
     "max_attachments_per_message": (1, 1_000),
     "pickup_min_age": (0, 86_400),
     "print_timeout": (5, 3_600),
+    "retention_days": (30, 3_650),
 }
 
 # Keys under which each value is stored. Two predate this module and keep
@@ -75,6 +76,8 @@ class Options:
         default_factory=lambda: parse_extension_list(DEFAULT_PRINTABLE_EXTENSIONS)
     )
     dry_run: bool = False
+    # How long the journal, the log and the list of processed mails are kept.
+    retention_days: int = 183
 
 
 def _key(name: str) -> str:
@@ -208,6 +211,14 @@ def _whole(form: Mapping[str, str], name: str, label: str) -> int:
     return value
 
 
+def _whole_or(form: Mapping[str, str], name: str, label: str, current: int) -> int:
+    """Like `_whole`, but a field the form did not send keeps its value -
+    for settings added later, so an older form (or script) still saves."""
+    if name not in form:
+        return current
+    return _whole(form, name, label)
+
+
 def validate(form: Mapping[str, str], current: Options | None = None) -> Options:
     """Turn the submitted settings form into Options, or explain what is wrong.
 
@@ -244,4 +255,7 @@ def validate(form: Mapping[str, str], current: Options | None = None) -> Options
         print_timeout=_whole(form, "print_timeout", "Die Zeitgrenze fuer Druckauftraege"),
         printable_extensions=parse_extension_list(form.get("printable_extensions", "")),
         dry_run=bool(form.get("dry_run")),
+        retention_days=_whole_or(
+            form, "retention_days", "Die Aufbewahrungsdauer", current.retention_days
+        ),
     )

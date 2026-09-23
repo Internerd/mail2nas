@@ -18,6 +18,7 @@ import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,12 @@ class Account:
     printer: str = ""
     # Off means "print only": attachments are not written to the share.
     archive_attachments: bool = True
+    # Also process mail that is already marked as read - somebody opened it
+    # in their mail client before mail2nas got to it. Only mail that arrived
+    # on or after `seen_since` (YYYY-MM-DD) is considered, so ticking the box
+    # does not suddenly file years of old correspondence.
+    include_seen: bool = False
+    seen_since: str = ""
 
     @property
     def key(self) -> str:
@@ -70,6 +77,8 @@ class Account:
             self.print_attachments,
             self.printer,
             self.archive_attachments,
+            self.include_seen,
+            self.seen_since,
         )
 
 
@@ -124,12 +133,14 @@ class AccountStore:
             print_attachments=bool(row[12]),
             printer=row[13] or "",
             archive_attachments=bool(row[14]),
+            include_seen=bool(row[15]),
+            seen_since=row[16] or "",
         )
 
     _COLUMNS = (
         "id, name, host, port, ssl, user, password, folder, mode, "
         "processed_folder, oversized_folder, enabled, "
-        "print_attachments, printer, archive_attachments"
+        "print_attachments, printer, archive_attachments, include_seen, seen_since"
     )
 
     def all(self) -> list[Account]:
@@ -153,10 +164,10 @@ class AccountStore:
             cursor = conn.execute(
                 "INSERT INTO imap_accounts (name, host, port, ssl, user, password, folder, "
                 "mode, processed_folder, oversized_folder, enabled, print_attachments, "
-                "printer, archive_attachments) "
+                "printer, archive_attachments, include_seen, seen_since) "
                 "VALUES (:name, :host, :port, :ssl, :user, :password, :folder, :mode, "
                 ":processed_folder, :oversized_folder, :enabled, :print_attachments, "
-                ":printer, :archive_attachments)",
+                ":printer, :archive_attachments, :include_seen, :seen_since)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -181,6 +192,8 @@ class AccountStore:
                 "print_attachments": current.print_attachments,
                 "printer": current.printer,
                 "archive_attachments": current.archive_attachments,
+                "include_seen": current.include_seen,
+                "seen_since": current.seen_since,
                 **fields,
             }
         )
@@ -191,7 +204,8 @@ class AccountStore:
                 "user = :user, password = :password, folder = :folder, mode = :mode, "
                 "processed_folder = :processed_folder, oversized_folder = :oversized_folder, "
                 "enabled = :enabled, print_attachments = :print_attachments, "
-                "printer = :printer, archive_attachments = :archive_attachments WHERE id = :id",
+                "printer = :printer, archive_attachments = :archive_attachments, "
+                "include_seen = :include_seen, seen_since = :seen_since WHERE id = :id",
                 values,
             )
 
@@ -213,6 +227,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         ("print_attachments", "INTEGER NOT NULL DEFAULT 0"),
         ("printer", "TEXT NOT NULL DEFAULT ''"),
         ("archive_attachments", "INTEGER NOT NULL DEFAULT 1"),
+        ("include_seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("seen_since", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE imap_accounts ADD COLUMN {column} {definition}")
@@ -235,7 +251,20 @@ def _defaults(fields: dict) -> dict:
         "print_attachments": 1 if fields.get("print_attachments", False) else 0,
         "printer": str(fields.get("printer") or "").strip(),
         "archive_attachments": 1 if fields.get("archive_attachments", True) else 0,
+        "include_seen": 1 if fields.get("include_seen", False) else 0,
+        "seen_since": _since(fields.get("include_seen", False), fields.get("seen_since")),
     }
+
+
+def _since(include_seen, value) -> str:
+    """A valid YYYY-MM-DD, or today when read mail is included without one."""
+    text = str(value or "").strip()
+    if text:
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            raise ValueError(f"Kein gueltiges Datum: {text!r} (erwartet JJJJ-MM-TT)") from None
+    return date.today().isoformat() if include_seen else ""
 
 
 def seed_from_config(store: AccountStore, settings, config) -> None:

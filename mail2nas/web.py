@@ -15,12 +15,14 @@ to the internet without a TLS-terminating reverse proxy in front.
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import os
 import secrets
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 
@@ -53,6 +55,17 @@ from .mapping import (
 )
 from .addresses import AddressError
 from .migrate import SETTING_RULES_NOTE
+from . import backup
+from .journal import LEVELS as LOG_LEVELS, cutoff
+from .notify import (
+    DELAY_LIMITS,
+    DIGEST_INTERVAL,
+    SECURITY,
+    NotifyError,
+    NotifyStore,
+    send_mail,
+)
+from .notify import validate as validate_notify
 from .options import FILENAME_PREFIXES, LIMITS, OptionsError
 from .options import validate as validate_options
 from .archives import ArchiveError
@@ -68,6 +81,8 @@ SETTING_SECRET_KEY = "web_secret_key"
 SETTING_SESSION_VERSION = "web_session_version"
 
 MIN_PASSWORD_LENGTH = 8
+LOG_PAGE_SIZE = 100
+CSV_LIMIT = 100_000
 SESSION_HOURS = 12
 
 # Login throttling. Single-password auth is only as good as the number of
@@ -141,7 +156,8 @@ BASE_TEMPLATE = """
   td.keyword { font-weight: 600; overflow-wrap: break-word; min-width: 9rem; }
   .table-wrap { overflow-x: auto; }
   input, select, button { font: inherit; color: inherit; }
-  input[type=text], input[type=password], select {
+  input[type=text], input[type=password], input[type=date], input[type=email],
+  input[type=file], select {
     background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
     padding: .4rem .5rem; width: 100%; max-width: 22rem; }
   button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
@@ -181,6 +197,13 @@ BASE_TEMPLATE = """
   code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
          padding: 0 .25rem; font-size: .85em; }
   a { color: var(--accent); }
+  .tabs { display: flex; gap: 1rem; margin-bottom: .8rem; }
+  .tabs a { text-decoration: none; padding-bottom: .2rem; }
+  .tabs a.active { border-bottom: 2px solid var(--accent); font-weight: 600; }
+  table.log td { font-size: .85rem; vertical-align: top; }
+  td.when { white-space: nowrap; color: var(--muted); }
+  td.detail { overflow-wrap: anywhere; }
+  .pager { display: flex; gap: 1rem; align-items: center; margin-top: .6rem; }
 </style>
 </head>
 <body>
@@ -193,6 +216,8 @@ BASE_TEMPLATE = """
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
       <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
       <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
+      <a href="{{ url_for('log_page') }}">Protokoll</a> &middot;
+      <a href="{{ url_for('backup_page') }}">Sicherung</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -457,7 +482,8 @@ CONFIG_BODY = """
       <td>{{ account.user }}<br><span class="hint">{{ account.host }}:{{ account.port }}{%
         if not account.ssl %} &middot; ohne TLS{% endif %}</span></td>
       <td>{{ account.folder }}</td>
-      <td>{{ account.mode }}</td>
+      <td>{{ account.mode }}{% if account.include_seen %}<br>
+        <span class="hint">auch gelesene ab {{ account.seen_since }}</span>{% endif %}</td>
       <td>{% if account.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('edit_account', account_id=account.id) }}">Bearbeiten</a>
@@ -613,6 +639,20 @@ CONFIG_BODY = """
     <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">Benachrichtigungen</h2>
+  {% if notify.enabled %}
+  <p style="margin-top:0">Aktiv - Mails gehen an <strong>{{ notify.recipients }}</strong>
+  (ueber {{ notify.smtp_host }}).</p>
+  {% else %}
+  <p class="hint" style="margin-top:0">Aus. Eingerichtet schickt mail2nas eine Mail, wenn ein
+  Postfach, Archiv, Abholordner oder die Sicherung laenger nicht funktioniert oder beim
+  Verarbeiten etwas schiefgeht.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('notifications_page') }}">
+    <button type="button">Benachrichtigungen einrichten</button></a></p>
+</div>
+
 <p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
 Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
 <a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
@@ -683,6 +723,23 @@ ACCOUNT_BODY = """
       <label><input type="checkbox" name="enabled" value="1"
         {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
     </p>
+
+    <h2>Bereits gelesene Mails</h2>
+    <div class="row">
+      <p style="margin:.2rem 0"><label><input type="checkbox" name="include_seen" value="1"
+        {% if account and account.include_seen %}checked{% endif %}>
+        Auch bereits gelesene Mails verarbeiten</label></p>
+      <div class="field">
+        <label for="seen_since">Angekommen ab</label>
+        <input id="seen_since" name="seen_since" type="date"
+               value="{{ account.seen_since if account and account.seen_since else today }}">
+      </div>
+    </div>
+    <p class="hint">Normalerweise holt mail2nas nur ungelesene Mails. Mit Haken auch die,
+    die jemand schon geoeffnet hat - etwa in Outlook, bevor mail2nas an der Reihe war.
+    Jede Mail wird trotzdem nur einmal verarbeitet. Beruecksichtigt werden Mails ab dem
+    Datum, hoechstens so weit zurueck, wie das Protokoll aufbewahrt wird
+    ({{ retention_days }} Tage, unter Einstellungen).</p>
 
     {% if printers %}
     <input type="hidden" name="print_fields" value="1">
@@ -1240,6 +1297,22 @@ OVERVIEW_BODY = """
             <span class="hint">({{ row.last_error_at }})</span>{% endif %}</td>
     </tr>
     {% endfor %}
+    {% if backup_status.ok is not none %}
+    <tr>
+      <td class="keyword">Automatische Sicherung</td>
+      <td>{% if backup_status.ok %}<span class="state-ok">ok</span>
+          {% else %}<span class="state-bad">Fehler</span>{% endif %}</td>
+      <td>{{ backup_status.detail }}</td>
+    </tr>
+    {% endif %}
+    {% if recent_problems %}
+    <tr>
+      <td class="keyword">Verarbeitung</td>
+      <td><span class="state-bad">{{ recent_problems }} Problem(e)</span></td>
+      <td>in den letzten 24 Stunden -
+        <a href="{{ url_for('log_page', problems=1) }}">im Protokoll ansehen</a></td>
+    </tr>
+    {% endif %}
     {% for problem in pickup_problems %}
     <tr><td class="keyword">Abholordner</td><td><span class="state-bad">Problem</span></td>
       <td>{{ problem }}</td></tr>
@@ -1253,7 +1326,7 @@ OVERVIEW_BODY = """
   gelesen markiert, nur protokolliert.</p>
   {% endif %}
   <p class="hint" style="margin-bottom:0">Stand {{ now }} &middot; laeuft seit {{ started }}.
-  Details stehen im Container-Log (<code>docker compose logs -f</code>).</p>
+  Was mit jeder Mail passiert ist, steht im <a href="{{ url_for('log_page') }}">Protokoll</a>.</p>
 </div>
 
 <div class="card">
@@ -1374,6 +1447,20 @@ SETTINGS_BODY = """
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">Protokoll</h2>
+    <div class="field">
+      <label for="retention_days">Protokoll aufbewahren (Tage)</label>
+      <input id="retention_days" name="retention_days" type="number"
+             value="{{ o.retention_days }}" min="{{ limits.retention_days[0] }}"
+             max="{{ limits.retention_days[1] }}">
+    </div>
+    <p class="hint" style="margin-bottom:0">So lange bleiben das Verarbeitungsprotokoll (was
+    mit welchem Anhang passiert ist), das Dienstprotokoll und die Liste der verarbeiteten
+    Mails erhalten - Standard 183 Tage, also ein halbes Jahr. Aeltere Eintraege werden
+    einmal taeglich geloescht; die abgelegten Dateien selbst bleiben natuerlich.</p>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">Testmodus</h2>
     <p style="margin-top:0"><label><input type="checkbox" name="dry_run" value="1"
       {% if o.dry_run %}checked{% endif %}> Nur protokollieren - nichts ablegen, nichts
@@ -1386,6 +1473,285 @@ SETTINGS_BODY = """
   <button type="submit">Einstellungen speichern</button>
   <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
 </form>
+"""
+
+LOG_BODY = """
+<div class="tabs">
+  <a href="{{ url_for('log_page') }}" class="{{ 'active' if view == 'journal' }}">Verarbeitung</a>
+  <a href="{{ url_for('log_page', view='log') }}" class="{{ 'active' if view == 'log' }}">Dienstprotokoll</a>
+</div>
+
+{% if view == 'journal' %}
+<div class="card">
+  <form method="get" class="row">
+    <div class="field">
+      <label for="q">Suche (Betreff, Absender, Datei, Ziel)</label>
+      <input id="q" name="q" type="text" value="{{ q }}">
+    </div>
+    <div class="field">
+      <label for="source">Quelle</label>
+      <select id="source" name="source">
+        <option value="">alle</option>
+        {% for name in sources %}
+          <option value="{{ name }}" {% if name == selected_source %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <p style="margin:0 0 .45rem"><label><input type="checkbox" name="problems" value="1"
+      {% if problems %}checked{% endif %}> nur Probleme</label></p>
+    <button type="submit">Filtern</button>
+    <a href="{{ url_for('export_journal', q=q or None, source=selected_source or None, problems=1 if problems else None) }}">
+      <button class="secondary" type="button">Als CSV herunterladen</button></a>
+  </form>
+</div>
+
+<div class="card">
+  {% if entries %}
+  <div class="table-wrap">
+  <table class="log">
+    <tr><th>Zeit</th><th>Quelle</th><th>Was</th><th>Mail / Datei</th><th>Ziel / Details</th></tr>
+    {% for e in entries %}
+    <tr>
+      <td class="when">{{ e.local_at }}</td>
+      <td>{{ e.source }}</td>
+      <td>{% if e.failed %}<span class="state-bad">{{ e.action_label }}</span>
+          {% elif e.action == 'quarantaene' %}<span class="state-wait">{{ e.action_label }}</span>
+          {% else %}{{ e.action_label }}{% endif %}</td>
+      <td class="detail">{% if e.subject %}{{ e.subject }}{% endif %}
+        {% if e.sender %}<br><span class="hint">{{ e.sender }}</span>{% endif %}
+        {% if e.filename %}<br><strong>{{ e.filename }}</strong>{% endif %}</td>
+      <td class="detail">{% if e.target %}{{ e.target }}{% endif %}
+        {% if e.detail %}<br><span class="hint">{{ e.detail }}</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Keine Eintraege{% if q or selected_source or problems %} fuer diesen Filter{% endif %}.</p>
+  {% endif %}
+  {{ pager }}
+</div>
+{% else %}
+<div class="card">
+  <form method="get" class="row">
+    <input type="hidden" name="view" value="log">
+    <div class="field">
+      <label for="q">Suche</label>
+      <input id="q" name="q" type="text" value="{{ q }}">
+    </div>
+    <div class="field">
+      <label for="level">Mindestens</label>
+      <select id="level" name="level">
+        {% for name in levels %}
+          <option value="{{ name }}" {% if name == level %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit">Filtern</button>
+  </form>
+</div>
+
+<div class="card">
+  {% if lines %}
+  <div class="table-wrap">
+  <table class="log">
+    <tr><th>Zeit</th><th>Stufe</th><th>Meldung</th></tr>
+    {% for line in lines %}
+    <tr>
+      <td class="when">{{ line.local_at }}</td>
+      <td>{% if line.level in ('ERROR', 'CRITICAL') %}<span class="state-bad">{{ line.level }}</span>
+          {% elif line.level == 'WARNING' %}<span class="state-wait">{{ line.level }}</span>
+          {% else %}{{ line.level }}{% endif %}</td>
+      <td class="detail">{{ line.message }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Keine Eintraege.</p>
+  {% endif %}
+  {{ pager }}
+</div>
+{% endif %}
+<p class="hint">Aufbewahrt werden {{ retention_days }} Tage (einstellbar unter
+<a href="{{ url_for('settings_page') }}">Einstellungen</a>). Vollstaendige Fehlermeldungen
+mit Stacktrace stehen zusaetzlich im Container-Log (<code>docker compose logs</code>).</p>
+"""
+
+PAGER = """
+{% if pages > 1 %}
+<div class="pager">
+  {% if page > 1 %}<a href="{{ prev_url }}">&larr; neuer</a>{% endif %}
+  <span class="hint">Seite {{ page }} von {{ pages }} &middot; {{ total }} Eintraege</span>
+  {% if page < pages %}<a href="{{ next_url }}">aelter &rarr;</a>{% endif %}
+</div>
+{% elif total %}
+<p class="hint" style="margin-bottom:0">{{ total }} Eintraege</p>
+{% endif %}
+"""
+
+BACKUP_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Sicherung herunterladen</h2>
+  <p style="margin-top:0">Die komplette Konfiguration in einer Datei: Postfaecher, Archive,
+  Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Benachrichtigungen,
+  Passwort der Oberflaeche und das Protokoll.</p>
+  <p><a href="{{ url_for('download_backup') }}"><button type="button">Jetzt sichern und
+    herunterladen</button></a></p>
+  <p class="hint" style="margin-bottom:0"><strong>Die Datei enthaelt die Passwoerter der
+  Postfaecher und NAS-Freigaben im Klartext</strong> - so sicher aufbewahren wie diese.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Automatische Sicherung aufs NAS</h2>
+  <form method="post" action="{{ url_for('backup_settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="margin-top:0"><label><input type="checkbox" name="enabled" value="1"
+      {% if b.enabled %}checked{% endif %}> Taeglich sichern</label></p>
+    <div class="row">
+      {% if archives %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+            <option value="{{ entry.key }}" {% if b.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="folder">Ordner</label>
+        <input id="folder" name="folder" type="text" value="{{ b.folder }}">
+      </div>
+      <div class="field">
+        <label for="keep">Anzahl aufbewahren</label>
+        <input id="keep" name="keep" type="number" value="{{ b.keep }}" min="{{ keep_limits[0] }}"
+               max="{{ keep_limits[1] }}">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.8rem">
+      <button type="submit">Speichern</button>
+    </div>
+  </form>
+  <form method="post" action="{{ url_for('backup_now') }}" style="margin-top:.6rem">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Jetzt aufs NAS sichern</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">
+    {% if last_when %}Letzte automatische Sicherung: {{ last_when }} &middot; {{ last_path }}<br>{% endif %}
+    {% if status.ok is sameas false %}<span class="state-bad">{{ status.detail }}</span><br>{% endif %}
+    Einmal am Tag wird eine Datei <code>mail2nas-sicherung-DATUM.db.gz</code> in den Ordner
+    geschrieben; aeltere ueber die Anzahl hinaus werden geloescht. Der Ordner sollte nur fuer
+    Berechtigte lesbar sein. Bei einem Fehler wird stuendlich neu versucht (und, falls
+    eingerichtet, per Mail benachrichtigt).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Wiederherstellen</h2>
+  <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="backup_file">Sicherungsdatei (.db.gz oder .db)</label>
+        <input id="backup_file" name="backup_file" type="file" accept=".gz,.db" required>
+      </div>
+    </div>
+    <p><label><input type="checkbox" name="confirm" value="1" required> Ja, die aktuelle
+      Konfiguration komplett durch die Sicherung ersetzen</label></p>
+    <button class="danger" type="submit">Wiederherstellen</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">Ersetzt alles - auch das Passwort der Oberflaeche:
+  danach gilt das aus der Sicherung. Der bisherige Stand wird vorher im Container unter
+  <code>/data/backups</code> abgelegt (die letzten {{ local_keep }}). Die Postfaecher
+  verbinden sich danach innerhalb weniger Sekunden neu; ein Neustart ist nicht noetig.
+  {% if local_backups %}<br>Vorhandene Sicherungen vor Wiederherstellungen:
+  {% for name in local_backups %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}</p>
+</div>
+"""
+
+NOTIFY_BODY = """
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="card">
+    <h2 style="margin-top:0">Benachrichtigungen per Mail</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="enabled" value="1"
+      {% if n.enabled %}checked{% endif %}> Benachrichtigungen senden</label></p>
+    <div class="field">
+      <label for="recipients">Empfaenger (mehrere mit Komma trennen)</label>
+      <input id="recipients" name="recipients" type="text" style="max-width:100%"
+             value="{{ n.recipients }}" placeholder="it@firma.de, chef@firma.de">
+    </div>
+    <h2>Wann</h2>
+    <p style="margin:.2rem 0"><label><input type="checkbox" name="on_connection" value="1"
+      {% if n.on_connection %}checked{% endif %}> Postfach, Archiv, Abholordner oder Sicherung
+      funktioniert nicht</label></p>
+    <div class="field" style="margin:.4rem 0 .4rem 1.6rem">
+      <label for="delay_minutes">... seit mindestens (Minuten)</label>
+      <input id="delay_minutes" name="delay_minutes" type="number" value="{{ n.delay_minutes }}"
+             min="{{ delay_limits[0] }}" max="{{ delay_limits[1] }}">
+    </div>
+    <p style="margin:.2rem 0 .2rem 1.6rem"><label><input type="checkbox" name="on_recovery"
+      value="1" {% if n.on_recovery %}checked{% endif %}> Entwarnung, wenn es wieder geht</label></p>
+    <p style="margin:.2rem 0"><label><input type="checkbox" name="on_failures" value="1"
+      {% if n.on_failures %}checked{% endif %}> Probleme bei der Verarbeitung (Druck
+      fehlgeschlagen, Mail oder Anhang zu gross, Mail nicht verarbeitbar)</label></p>
+    <p class="hint" style="margin-bottom:0">Verarbeitungsprobleme werden gesammelt und
+    hoechstens alle {{ digest_minutes }} Minuten als eine Mail verschickt.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Postausgangsserver (SMTP)</h2>
+    <div class="row">
+      <div class="field">
+        <label for="smtp_host">Server</label>
+        <input id="smtp_host" name="smtp_host" type="text" value="{{ n.smtp_host }}"
+               placeholder="smtp.example.com">
+      </div>
+      <div class="field">
+        <label for="smtp_port">Port</label>
+        <input id="smtp_port" name="smtp_port" type="text" value="{{ n.smtp_port }}">
+      </div>
+      <div class="field">
+        <label for="smtp_security">Verschluesselung</label>
+        <select id="smtp_security" name="smtp_security">
+          {% for value, text in security.items() %}
+            <option value="{{ value }}" {% if n.smtp_security == value %}selected{% endif %}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="smtp_user">Benutzer (leer = ohne Anmeldung)</label>
+        <input id="smtp_user" name="smtp_user" type="text" value="{{ n.smtp_user }}">
+      </div>
+      <div class="field">
+        <label for="smtp_password">Passwort</label>
+        <input id="smtp_password" name="smtp_password" type="password" autocomplete="new-password"
+               {% if n.smtp_password %}placeholder="unveraendert lassen: leer"{% endif %}>
+      </div>
+      <div class="field">
+        <label for="sender">Absender (leer = Benutzer)</label>
+        <input id="sender" name="sender" type="text" value="{{ n.sender }}"
+               placeholder="mail2nas@firma.de">
+      </div>
+    </div>
+  </div>
+  <button type="submit">Speichern</button>
+  <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
+</form>
+
+<div class="card" style="margin-top:1rem">
+  <h2 style="margin-top:0">Testmail</h2>
+  <form method="post" action="{{ url_for('test_notification') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Testmail an die Empfaenger senden</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">Verwendet die gespeicherten Einstellungen - vorher
+  speichern. {% if last_sent %}Zuletzt gesendet: {{ last_sent }}.{% endif %}
+  {% if last_error %}<br><span class="state-bad">Letzter Fehler: {{ last_error }}</span>{% endif %}</p>
+</div>
 """
 
 PASSWORD_BODY = """
@@ -1412,6 +1778,12 @@ PASSWORD_BODY = """
   <code>docker compose exec mail2nas python -m mail2nas.cli reset-password</code></p>
 </div>
 """
+
+
+def _csv_cell(value: str) -> str:
+    """Subjects and file names come from strangers' mail: a cell starting
+    with "=" would be a formula to Excel. A leading apostrophe keeps it text."""
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
 
 
 def test_imap(account, timeout: int = 20) -> int:
@@ -1848,6 +2220,7 @@ def create_app(runtime) -> Flask:
             pickups=_pickup_rows(),
             pickup_interval=PICKUP_INTERVAL,
             printing_enabled=runtime.options.printing_enabled,
+            notify=NotifyStore(settings).load(),
         )
 
     # --- general settings ----------------------------------------------------
@@ -1952,6 +2325,9 @@ def create_app(runtime) -> Flask:
             pickup_problems=problems,
             ready=runtime.status.archive.ok,
             dry_run=runtime.options.dry_run,
+            backup_status=runtime.backup_status,
+            recent_problems=runtime.journal.count(problems_only=True, since=cutoff(1))
+            if runtime.journal is not None else 0,
             initial_password=read_initial_password(config.data_dir) is not None,
             now=_when(time.time()),
             started=_when(runtime.status.started_at),
@@ -2012,6 +2388,30 @@ def create_app(runtime) -> Flask:
             "processed_folder": request.form.get("processed_folder", ""),
             "oversized_folder": request.form.get("oversized_folder", ""),
             "enabled": bool(request.form.get("enabled")),
+            **_seen_fields(account),
+        }
+
+    def _seen_fields(account) -> dict:
+        """The "also read mail" part of the account form."""
+        if "seen_since" not in request.form and account is not None:
+            # A form without the field (an older page, a script): unchanged.
+            return {"include_seen": account.include_seen, "seen_since": account.seen_since}
+        include = bool(request.form.get("include_seen"))
+        since = request.form.get("seen_since", "").strip()
+        if since:
+            try:
+                since = date.fromisoformat(since).isoformat()
+            except ValueError:
+                raise MappingError("Bitte ein gueltiges Datum angeben (JJJJ-MM-TT).") from None
+            if since > date.today().isoformat():
+                raise MappingError("Das Datum fuer gelesene Mails liegt in der Zukunft.")
+        return {"include_seen": include, "seen_since": since}
+
+    def _account_context() -> dict:
+        return {
+            **_printer_context(),
+            "today": date.today().isoformat(),
+            "retention_days": runtime.options.retention_days,
         }
 
     @app.route("/config/accounts/new", methods=["GET", "POST"])
@@ -2028,7 +2428,7 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ACCOUNT_BODY, "Postfach", account=None, **_printer_context())
+        return render(ACCOUNT_BODY, "Postfach", account=None, **_account_context())
 
     @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
     @login_required
@@ -2050,7 +2450,7 @@ def create_app(runtime) -> Flask:
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             account = runtime.accounts.get(account_id)
-        return render(ACCOUNT_BODY, "Postfach", account=account, **_printer_context())
+        return render(ACCOUNT_BODY, "Postfach", account=account, **_account_context())
 
     @app.post("/config/accounts/<int:account_id>/delete")
     @login_required
@@ -2552,6 +2952,283 @@ def create_app(runtime) -> Flask:
             "ok",
         )
         return redirect(url_for("config_page"))
+
+    # --- log -------------------------------------------------------------------
+
+    def _page_number() -> int:
+        try:
+            return max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            return 1
+
+    def _pager(page: int, total: int, endpoint: str, **args) -> Markup:
+        args = {key: value for key, value in args.items() if value}
+        pages = max(1, -(-total // LOG_PAGE_SIZE))
+        return Markup(render_template_string(
+            PAGER,
+            page=page,
+            pages=pages,
+            total=total,
+            prev_url=url_for(endpoint, page=page - 1, **args),
+            next_url=url_for(endpoint, page=page + 1, **args),
+        ))
+
+    def _journal_filter() -> dict:
+        return {
+            "search": request.args.get("q", "").strip()[:200],
+            "source": request.args.get("source", "").strip()[:200],
+            "problems_only": bool(request.args.get("problems")),
+        }
+
+    @app.get("/log")
+    @login_required
+    def log_page():
+        view = "log" if request.args.get("view") == "log" else "journal"
+        page = _page_number()
+        offset = (page - 1) * LOG_PAGE_SIZE
+        context = {"view": view, "retention_days": runtime.options.retention_days}
+        if view == "journal":
+            wanted = _journal_filter()
+            journal = runtime.journal
+            total = journal.count(**wanted) if journal else 0
+            context.update(
+                entries=journal.entries(limit=LOG_PAGE_SIZE, offset=offset, **wanted)
+                if journal else [],
+                sources=journal.sources() if journal else [],
+                q=wanted["search"],
+                # Not "source": that is render_template_string's own argument.
+                selected_source=wanted["source"],
+                problems=wanted["problems_only"],
+                pager=_pager(page, total, "log_page", q=wanted["search"],
+                             source=wanted["source"],
+                             problems=1 if wanted["problems_only"] else None),
+            )
+        else:
+            q = request.args.get("q", "").strip()[:200]
+            level = request.args.get("level", "INFO")
+            if level not in LOG_LEVELS:
+                level = "INFO"
+            logs = runtime.logs
+            total = logs.count(min_level=level, search=q) if logs else 0
+            context.update(
+                lines=logs.entries(min_level=level, search=q, limit=LOG_PAGE_SIZE,
+                                   offset=offset) if logs else [],
+                q=q,
+                level=level,
+                levels=[name for name in LOG_LEVELS if name != "CRITICAL"],
+                pager=_pager(page, total, "log_page", view="log", q=q,
+                             level=level if level != "INFO" else None),
+            )
+        return render(LOG_BODY, "Protokoll", **context)
+
+    @app.get("/log/export.csv")
+    @login_required
+    def export_journal():
+        wanted = _journal_filter()
+        buffer = io.StringIO()
+        # Semicolons and a BOM: what a German Excel opens without asking.
+        buffer.write("﻿")
+        writer = csv.writer(buffer, delimiter=";")
+        writer.writerow(["Zeit", "Quelle", "Aktion", "Betreff", "Absender", "Datei", "Ziel",
+                         "Details"])
+        if runtime.journal is not None:
+            for e in runtime.journal.entries(limit=CSV_LIMIT, **wanted):
+                writer.writerow([_csv_cell(value) for value in (
+                    e.local_at, e.source, e.action_label, e.subject, e.sender,
+                    e.filename, e.target, e.detail)])
+        name = f"mail2nas-protokoll-{datetime.now().strftime('%Y-%m-%d')}.csv"
+        return (
+            buffer.getvalue().encode("utf-8"),
+            200,
+            {
+                "Content-Type": "text/csv; charset=utf-8",
+                "Content-Disposition": f'attachment; filename="{name}"',
+            },
+        )
+
+    # --- backup ------------------------------------------------------------------
+
+    @app.get("/backup")
+    @login_required
+    def backup_page():
+        when, path = backup.last_success(settings)
+        folder = os.path.join(config.data_dir, backup.LOCAL_DIR)
+        try:
+            local = sorted(
+                (name for name in os.listdir(folder) if name.endswith(backup.SUFFIX)),
+                reverse=True,
+            )
+        except OSError:
+            local = []
+        return render(
+            BACKUP_BODY,
+            "Sicherung",
+            b=backup.BackupStore(settings).load(),
+            archives=_archives(),
+            keep_limits=backup.KEEP_LIMITS,
+            status=runtime.backup_status,
+            last_when=when,
+            last_path=path,
+            local_backups=local,
+            local_keep=backup.LOCAL_KEEP,
+        )
+
+    @app.get("/backup/download")
+    @login_required
+    def download_backup():
+        try:
+            data = backup.dump(config.state_db_path)
+        except Exception as exc:  # noqa: BLE001 - report in the UI
+            logger.exception("Web UI: backup download failed")
+            flash(f"Sicherung fehlgeschlagen: {exc}", "error")
+            return redirect(url_for("backup_page"))
+        logger.info("Web UI: backup downloaded (%d bytes)", len(data))
+        return (
+            data,
+            200,
+            {
+                "Content-Type": "application/gzip",
+                "Content-Disposition": f'attachment; filename="{backup.backup_name()}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/backup/settings")
+    @login_required
+    def backup_settings():
+        require_csrf()
+        try:
+            value = backup.validate(request.form, [a.key for a in _archives()])
+        except backup.BackupError as exc:
+            flash(str(exc), "error")
+        else:
+            backup.BackupStore(settings).save(value)
+            logger.info("Web UI: backup settings saved (enabled=%s)", value.enabled)
+            flash("Gespeichert." + (" Die erste Sicherung folgt in wenigen Sekunden."
+                                    if value.enabled else ""), "ok")
+            _changed()
+        return redirect(url_for("backup_page"))
+
+    @app.post("/backup/now")
+    @login_required
+    def backup_now():
+        require_csrf()
+        if runtime.default_archive() is None:
+            flash("Erst ein Archiv einrichten - dorthin wird gesichert.", "error")
+            return redirect(url_for("backup_page"))
+        try:
+            path = backup.BackupScheduler(runtime).run()
+        except Exception as exc:  # noqa: BLE001 - report in the UI
+            flash(f"Sicherung fehlgeschlagen: {exc}", "error")
+        else:
+            flash(f"Gesichert nach {path}.", "ok")
+        return redirect(url_for("backup_page"))
+
+    @app.post("/backup/restore")
+    @login_required
+    def restore_backup():
+        # The only request that may be large; everything else keeps the
+        # small global limit.
+        request.max_content_length = backup.MAX_UPLOAD
+        require_csrf()
+        upload = request.files.get("backup_file")
+        if not request.form.get("confirm"):
+            flash("Bitte bestaetigen, dass die Konfiguration ersetzt werden soll.", "error")
+            return redirect(url_for("backup_page"))
+        if upload is None or not upload.filename:
+            flash("Bitte eine Sicherungsdatei auswaehlen.", "error")
+            return redirect(url_for("backup_page"))
+        current_hash = settings.get(SETTING_PASSWORD_HASH)
+        try:
+            saved, counts = backup.restore(config.state_db_path, upload.read(), config.data_dir)
+        except backup.BackupError as exc:
+            flash(f"Nicht wiederhergestellt: {exc}", "error")
+            return redirect(url_for("backup_page"))
+        runtime.after_restore()
+        restored_hash = settings.get(SETTING_PASSWORD_HASH)
+        if not restored_hash and current_hash:
+            settings.set(SETTING_PASSWORD_HASH, current_hash)
+            restored_hash = current_hash
+        # Sessions stay signed with the key this process started with.
+        settings.set(SETTING_SECRET_KEY, app.config["SECRET_KEY"])
+        initial = read_initial_password(config.data_dir)
+        if initial is not None and not (
+            restored_hash and check_password_hash(restored_hash, initial)
+        ):
+            path = initial_password_path(config.data_dir)
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        session["auth_version"] = session_version()
+        logger.warning("Web UI: configuration restored from %s", upload.filename)
+        flash(
+            "Wiederhergestellt: "
+            f"{counts.get('imap_accounts', 0)} Postfach/Postfaecher, "
+            f"{counts.get('archives', 0)} Archiv(e), {counts.get('mapping_rules', 0)} "
+            f"Zuordnung(en), {counts.get('printers', 0)} Drucker. Ab jetzt gilt das Passwort "
+            f"aus der Sicherung. Der vorherige Stand liegt in {saved}.",
+            "ok",
+        )
+        return redirect(url_for("overview_page"))
+
+    # --- notifications -------------------------------------------------------------
+
+    @app.route("/config/notifications", methods=["GET", "POST"])
+    @login_required
+    def notifications_page():
+        store = NotifyStore(settings)
+        current = store.load()
+        shown = current
+        if request.method == "POST":
+            require_csrf()
+            try:
+                value = validate_notify(request.form, current)
+            except NotifyError as exc:
+                flash(str(exc), "error")
+                shown = current
+            else:
+                store.save(value)
+                logger.info("Web UI: notification settings saved (enabled=%s)", value.enabled)
+                flash("Benachrichtigungen gespeichert.", "ok")
+                return redirect(url_for("notifications_page"))
+        notifier = getattr(runtime, "notifier", None)
+        return render(
+            NOTIFY_BODY,
+            "Benachrichtigungen",
+            n=shown,
+            security=SECURITY,
+            delay_limits=DELAY_LIMITS,
+            digest_minutes=DIGEST_INTERVAL // 60,
+            last_sent=_when(notifier.last_sent) if notifier and notifier.last_sent else "",
+            last_error=notifier.last_error if notifier else "",
+        )
+
+    @app.post("/config/notifications/test")
+    @login_required
+    def test_notification():
+        require_csrf()
+        value = NotifyStore(settings).load()
+        if not value.smtp_host or not value.recipient_list or not value.from_address:
+            flash("Bitte zuerst Server, Absender und Empfaenger speichern.", "error")
+            return redirect(url_for("notifications_page"))
+        try:
+            send_mail(
+                value,
+                "mail2nas: Testmail",
+                "Diese Mail kommt von mail2nas. Die Benachrichtigungen sind richtig "
+                "eingerichtet.\n\nSie wurde ueber die Weboberflaeche ausgeloest "
+                f"({datetime.now().strftime('%d.%m.%Y %H:%M')}).",
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 - report every failure in the UI
+            logger.info("Web UI: test notification failed: %s", exc)
+            flash(f"Senden fehlgeschlagen: {exc.__class__.__name__}: {exc}", "error")
+        else:
+            logger.info("Web UI: test notification sent to %s", value.recipients)
+            flash(f"Testmail an {value.recipients} gesendet.", "ok")
+        return redirect(url_for("notifications_page"))
 
     @app.route("/password", methods=["GET", "POST"])
     @login_required

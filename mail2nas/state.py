@@ -43,6 +43,22 @@ class ProcessedStore:
             )
             self._conn.commit()
 
+    def prune(self, before: str) -> int:
+        """Forget messages processed before `before` (UTC, SQLite format).
+
+        A forgotten message is only processed again if it turns up as a
+        candidate again - marked unread by somebody, or still in the folder
+        of a mailbox that also processes read mail. The archiver's search for
+        the latter never reaches back further than the retention period, so
+        that cannot happen by itself.
+        """
+        with self._lock:
+            removed = self._conn.execute(
+                "DELETE FROM processed_messages WHERE processed_at < ?", (before,)
+            ).rowcount
+            self._conn.commit()
+        return removed
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

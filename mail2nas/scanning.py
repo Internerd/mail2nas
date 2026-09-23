@@ -19,6 +19,7 @@ import logging
 import time
 from datetime import datetime
 
+from . import journal as j
 from .filenames import extension_of, sanitize_filename
 from .pickups import MAX_DEPTH, Pickup, PickupStore
 from .printing import job_title
@@ -41,6 +42,7 @@ class PickupRunner:
         storages,
         pickups: PickupStore,
         printing=None,
+        journal=None,
     ):
         # Options snapshot or a callable returning the current one, like the
         # archiver: quarantine list, folders and waiting time are all live.
@@ -49,9 +51,12 @@ class PickupRunner:
         self.storages = storages
         self.pickups = pickups
         self.printing = printing
+        self.journal = journal
         # Remembers the last problem reported per folder, so one that stays
         # unreachable is logged once instead of on every cycle.
         self._reported: dict[int, str] = {}
+        # Files whose failure is already in the journal (once, not per cycle).
+        self._failed: set[tuple[int, str, str]] = set()
 
     @property
     def options(self):
@@ -131,12 +136,17 @@ class PickupRunner:
             try:
                 if self._file_one(pickup, source, target, entry):
                     filed += 1
-            except Exception:  # noqa: BLE001 - leave it in place and try again later
+            except Exception as exc:  # noqa: BLE001 - leave it in place and try again later
                 logger.exception(
                     "Pickup %s: could not file %s, leaving it in place",
                     pickup.name,
                     entry.relative,
                 )
+                reason = f"{exc.__class__.__name__}: {exc}"
+                if (pickup.id, entry.relative, reason) not in self._failed:
+                    self._failed.add((pickup.id, entry.relative, reason))
+                    self._record(pickup, j.FAILED, entry,
+                                 detail=f"nicht abgeholt, wird erneut versucht - {reason}")
         return filed
 
     # --- one document ---------------------------------------------------------
@@ -175,9 +185,15 @@ class PickupRunner:
         # (nor leave the scan in the folder to be printed again next cycle).
         printer = self._printer_for(pickup, quarantined)
         if printer is not None:
-            self.printing.send(
+            printed = self.printing.send(
                 printer, source.read_bytes(entry.relative), entry.name,
                 job_title(pickup.name, entry.name),
+            )
+            self._record(
+                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
+                target=printer.label(),
+                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
+                                          "druckbar - Details im Protokoll",
             )
 
         if source is target:
@@ -188,6 +204,13 @@ class PickupRunner:
             out_path = target.save_unique(parts, out_name, source.read_bytes(entry.relative))
             source.remove_file(entry.relative)
 
+        self._record(
+            pickup, j.QUARANTINED if quarantined else j.FILED, entry, target=out_path,
+            detail=("gesperrte Dateiendung" if quarantined
+                    else "fester Zielordner" if pickup.has_fixed_target
+                    else f"Stichwort {rule.keyword}" if rule is not None
+                    else "kein Treffer - Fallback-Ordner"),
+        )
         logger.info(
             "Pickup %s: '%s' matched '%s'%s -> %s",
             pickup.name,
@@ -197,6 +220,13 @@ class PickupRunner:
             out_path,
         )
         return True
+
+    def _record(self, pickup: Pickup, action: str, entry, **fields) -> None:
+        if self.journal is not None:
+            self.journal.record(
+                f"Abholordner {pickup.name}", action, filename=entry.name,
+                message_key=f"pickup:{pickup.id}:{entry.relative}", **fields,
+            )
 
     def _printer_for(self, pickup: Pickup, quarantined: bool):
         if self.printing is None or not self.options.printing_enabled:

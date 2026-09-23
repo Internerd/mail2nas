@@ -5,7 +5,8 @@ mail2nas verarbeitet unaufgefordert eingehende Mails/Anhaenge (siehe
 und Zugangsdaten fuer IMAP- und SMB-Systeme. Diese Zugangsdaten und die
 gesamte Konfiguration liegen in der SQLite-Datenbank im Docker-Volume `state`
 (`/data/state.db` im Container) und werden ausschliesslich ueber die
-passwortgeschuetzte Weboberflaeche gepflegt. Meldungen zu Sicherheitsluecken
+passwortgeschuetzte Weboberflaeche gepflegt; dieselben Daten stecken in den
+Sicherungsdateien. Meldungen zu Sicherheitsluecken
 sind daher ausdruecklich willkommen.
 
 ## Unterstuetzte Version
@@ -48,6 +49,11 @@ Insbesondere relevant fuer dieses Projekt:
   auf Datenbank, `.env` oder `/data/initial-password.txt`).
 - Umgehen der Anmeldung, der CSRF-Pruefung oder der Anmeldesperre der
   Weboberflaeche.
+- Wege, ueber eine praeparierte Sicherungsdatei (Wiederherstellen) mehr zu
+  erreichen als das Ersetzen der Konfiguration - etwa Dateien ausserhalb der
+  Datenbank zu schreiben.
+- Offenlegung der SMTP-Zugangsdaten der Benachrichtigungen oder Einschleusen
+  fremder Kopfzeilen/Empfaenger in Benachrichtigungsmails.
 - Unsichere Defaults in `docker-compose.yml`, `Dockerfile` oder den
   Installations-, Update- und Bootstrap-Skripten (`scripts/`).
 

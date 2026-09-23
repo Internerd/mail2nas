@@ -8,9 +8,10 @@ wird.
 
 **Eingerichtet wird alles in der Weboberflaeche** - Postfaecher,
 NAS-Freigaben, Zuordnungen, Drucker, Adressen, Abholordner und alle
-Einstellungen. Die Installation fragt nach keinem einzigen Passwort; die
-Konfiguration liegt in einer Datenbank im Container, nicht in Dateien und nicht
-auf dem NAS. Gedacht fuer eine LXC auf Proxmox, laeuft aber ueberall, wo
+Einstellungen, Benachrichtigungen per Mail und Sicherungen. Die Installation
+fragt nach keinem einzigen Passwort; die Konfiguration liegt in einer
+Datenbank im Container, nicht in Dateien und nicht auf dem NAS. Was mit jeder
+Mail passiert ist, steht ein halbes Jahr lang im Protokoll der Oberflaeche. Gedacht fuer eine LXC auf Proxmox, laeuft aber ueberall, wo
 Docker laeuft.
 
 ## Inhaltsverzeichnis
@@ -23,6 +24,9 @@ Docker laeuft.
 - [Archive: wohin abgelegt wird](#archive-wohin-abgelegt-wird)
 - [Drucken](#drucken)
 - [Abholordner (Scan-to-Folder)](#abholordner-scan-to-folder)
+- [Protokoll](#protokoll)
+- [Benachrichtigungen](#benachrichtigungen)
+- [Sicherung und Wiederherstellung](#sicherung-und-wiederherstellung)
 - [Wo die Konfiguration liegt](#wo-die-konfiguration-liegt)
 - [Updates](#updates)
 - [Kommandozeile](#kommandozeile)
@@ -39,7 +43,8 @@ Docker laeuft.
 ## Funktionsweise
 
 1. mail2nas ueberwacht ein oder mehrere IMAP-Postfaecher (IDLE-Push oder
-   Polling, je Postfach einstellbar) und liest die ungelesenen Mails.
+   Polling, je Postfach einstellbar) und liest die ungelesenen Mails - auf
+   Wunsch je Postfach auch die, die schon jemand geoeffnet hat.
 2. Jeder Anhang wird zuerst anhand **seines eigenen Dateinamens** gegen die
    Zuordnungen geprueft, dann anhand des Betreffs (auf Wunsch auch des
    Mailtexts). Die Liste wird **von oben nach unten** geprueft, die erste
@@ -55,9 +60,13 @@ Docker laeuft.
    bestimmte Adresse geschickt wurde. Siehe [Drucken](#drucken).
 5. Die Mail wird als gelesen markiert (optional in einen anderen IMAP-Ordner
    verschoben) und ihre Message-ID vermerkt, damit nichts doppelt verarbeitet
-   wird - auch wenn jemand das Gelesen-Flag zuruecksetzt.
+   wird - auch wenn jemand das Gelesen-Flag zuruecksetzt. Jeder Anhang steht
+   mit Ziel und Grund im [Protokoll](#protokoll).
 6. Abholordner werden alle 30 Sekunden geleert: fertige Scans werden nach
    denselben Regeln einsortiert (und optional gedruckt).
+7. Klemmt etwas laenger (Postfach, NAS, Drucker, Sicherung), kommt auf Wunsch
+   eine [Mail](#benachrichtigungen). Die ganze Konfiguration wird taeglich
+   aufs NAS [gesichert](#sicherung-und-wiederherstellung).
 
 Anhaenge mit ausfuehrbaren Dateiendungen (`.exe`, `.js`, `.ps1` ...) landen
 immer in einem Quarantaene-Ordner - auch wenn sie `Rechnung.exe` heissen - und
@@ -206,6 +215,8 @@ die Einrichtung. Die Reihenfolge:
    `mapping.yaml` aus einer anderen Installation laesst sich importieren.
 5. Optional: **Drucker**, **Zustelladressen**, **Abholordner**, und unter
    **Einstellungen** Ordnernamen, Grenzwerte und den Testmodus.
+6. Empfohlen: **Benachrichtigungen** (Konfiguration) einrichten und unter
+   **Sicherung** die taegliche Sicherung aufs NAS einschalten.
 
 Solange kein Archiv eingerichtet und erfolgreich getestet ist, holt mail2nas
 **keine** Mail ab - die Oberflaeche sagt das auf jeder Seite. So kann nichts
@@ -213,7 +224,7 @@ an einem Ort landen, an dem es niemand erwartet.
 
 **Zum Ausprobieren** gibt es unter Einstellungen den **Testmodus**: es wird
 nichts abgelegt, gedruckt oder als gelesen markiert, nur protokolliert, was
-passieren wuerde (`docker compose logs -f`).
+passieren wuerde (Protokoll -> Verarbeitung, Aktion "Testmodus").
 
 ## Die Weboberflaeche
 
@@ -223,10 +234,12 @@ http://<container-ip>:8080/
 
 | Seite | Inhalt |
 |---|---|
-| **Uebersicht** | Einrichtungsschritte, Zustand des Archivs, je Postfach: verbunden / Fehler / zuletzt ok, Anzahl verarbeiteter Mails, Probleme mit Abholordnern |
+| **Uebersicht** | Einrichtungsschritte, Zustand des Archivs, je Postfach: verbunden / Fehler / zuletzt ok, Anzahl verarbeiteter Mails, Probleme mit Abholordnern, Probleme der letzten 24 Stunden, Zustand der automatischen Sicherung |
 | **Zuordnungen** | Stichwort -> Ordner, Reihenfolge mit Pfeilen, je Zeile Postfach, Archiv und Drucken; Export und Import als `mapping.yaml` |
-| **Konfiguration** | Postfaecher, Archive, Drucker (inkl. Suche im Netzwerk), Zustelladressen, Abholordner - jeweils mit Test-Knopf |
-| **Einstellungen** | Ordner fuer Unsortiertes und Quarantaene, Dateinamen, gesperrte Dateitypen, Abrufintervall, Grenzwerte, Drucken, Testmodus |
+| **Konfiguration** | Postfaecher, Archive, Drucker (inkl. Suche im Netzwerk), Zustelladressen, Abholordner, Benachrichtigungen - jeweils mit Test-Knopf |
+| **Einstellungen** | Ordner fuer Unsortiertes und Quarantaene, Dateinamen, gesperrte Dateitypen, Abrufintervall, Grenzwerte, Drucken, Aufbewahrung des Protokolls, Testmodus |
+| **Protokoll** | was mit jedem Anhang passiert ist, und das Dienstprotokoll - filterbar, als CSV |
+| **Sicherung** | Konfiguration herunterladen, taegliche Sicherung aufs NAS, Wiederherstellen |
 | **Passwort** | eigenes Passwort setzen |
 
 Jede Aenderung wirkt sofort - **ein Neustart des Containers ist nie noetig**.
@@ -297,6 +310,13 @@ moeglich. Je Postfach einstellbar:
   gar nicht geladen, nur markiert (und ggf. verschoben).
 - **Alle Anhaenge drucken**, **Drucker** und **Im Archiv ablegen** - siehe
   [Drucken](#drucken).
+- **Auch bereits gelesene Mails verarbeiten**, mit Datum "angekommen ab"
+  (Standard: der Tag, an dem der Haken gesetzt wird). Fuer Postfaecher, in die
+  auch Menschen schauen: eine Mail, die in Outlook schon geoeffnet wurde,
+  bevor mail2nas an der Reihe war, wird trotzdem abgelegt. Jede Mail wird
+  weiterhin nur einmal verarbeitet (Message-ID). Zurueck reicht das hoechstens
+  so weit, wie das Protokoll aufbewahrt wird - aeltere Mails bleiben liegen,
+  damit nach dem Aufraeumen der Message-ID-Liste nichts doppelt kommt.
 
 Wird ein Postfach geloescht, bleiben seine Zuordnungen stehen und greifen
 nicht mehr - die Oberflaeche zeigt sie als "(geloeschtes Postfach)".
@@ -317,6 +337,7 @@ nicht mehr - die Oberflaeche zeigt sie als "(geloeschtes Postfach)".
 | Drucken erlaubt | Notschalter fuer alles Drucken | an |
 | Druckbare Dateitypen | nur diese gehen an einen Drucker; leer = Standardliste | PDF, PS, Text, Bilder |
 | Zeitgrenze je Druckauftrag | danach gilt er als gescheitert | 120 s |
+| Protokoll aufbewahren | Verarbeitungs- und Dienstprotokoll, Liste verarbeiteter Mails (30 Tage - 10 Jahre) | 183 Tage |
 | Testmodus | nichts ablegen, drucken oder markieren - nur protokollieren | aus |
 
 Ungueltige Werte (Buchstaben im Intervall, ein Ordner ausserhalb des Archivs,
@@ -588,11 +609,105 @@ derselben Benennung wie bei Mailanhaengen.
   Endlosschleife.
 - Geprueft wird alle 30 Sekunden.
 
+## Protokoll
+
+Unter **Protokoll** steht, was mail2nas getan hat - ohne Shell und ohne
+`docker compose logs`:
+
+- **Verarbeitung**: je Anhang eine Zeile - Zeit, Quelle (Postfach oder
+  Abholordner), was passiert ist (abgelegt, Quarantaene, gedruckt, nicht
+  gedruckt, uebersprungen, Mail zu gross, ohne Anhang, Fehler), Betreff,
+  Absender, Dateiname, Zielpfad bzw. Drucker und der Grund (welches
+  Stichwort, welche Adresse, Fallback). Filter nach Suchtext, Quelle und "nur
+  Probleme"; **als CSV herunterladen** (Semikolon, oeffnet sich direkt in
+  Excel).
+- **Dienstprotokoll**: die Meldungen des Dienstes selbst (Verbindungen,
+  Fehler, Aenderungen in der Oberflaeche, Anmeldungen), filterbar nach Stufe.
+
+Beides wird in der Datenbank gehalten und ueberlebt Neustarts und Updates.
+**Aufbewahrt wird ein halbes Jahr** (183 Tage, unter Einstellungen zwischen 30
+Tagen und 10 Jahren einstellbar); aeltere Eintraege loescht mail2nas einmal
+am Tag. Mit derselben Frist wird die Liste der verarbeiteten Message-IDs
+aufgeraeumt, damit die Datenbank nicht endlos waechst. Die abgelegten Dateien
+selbst werden natuerlich nie angefasst.
+
+Die Uebersicht zeigt, wie viele Probleme es in den letzten 24 Stunden gab,
+mit einem Link auf die gefilterte Liste.
+
+### Kein Anhang doppelt
+
+Faellt das NAS **mitten** in einer Mail mit mehreren Anhaengen aus, bleibt die
+Mail ungelesen und wird spaeter erneut verarbeitet. Dabei wird fuer jeden
+Anhang (erkannt an Position und Inhalt) im Protokoll nachgesehen, ob er schon
+abgelegt bzw. schon gedruckt wurde - das passiert dann nicht noch einmal.
+Eine Mail, die dauerhaft scheitert, steht einmal als "Fehler" im Protokoll,
+nicht bei jedem Versuch.
+
+## Benachrichtigungen
+
+Unter **Konfiguration -> Benachrichtigungen** wird ein Postausgangsserver
+(SMTP) eingetragen und **an wen** die Mails gehen (eine oder mehrere
+Adressen). Dann meldet sich mail2nas per Mail:
+
+- wenn ein **Postfach, das Archiv, ein Abholordner oder die automatische
+  Sicherung** laenger als eine einstellbare Zeit (Standard 30 Minuten) nicht
+  funktioniert - einmal, nicht alle paar Minuten - und auf Wunsch noch einmal,
+  wenn es wieder geht;
+- bei **Problemen in der Verarbeitung**: Druckauftrag abgelehnt, Anhang oder
+  Mail zu gross, Mail nicht verarbeitbar. Diese werden gesammelt und
+  hoechstens alle 15 Minuten als eine Mail verschickt.
+
+| Feld | Bedeutung |
+|---|---|
+| Empfaenger | Adressen, mit Komma getrennt |
+| Server, Port, Verschluesselung | STARTTLS (587), SSL/TLS (465) oder unverschluesselt (nur im eigenen Netz) |
+| Benutzer, Passwort | leer = ohne Anmeldung (z. B. ein interner Relay) |
+| Absender | leer = der Benutzer |
+| ... seit mindestens | wie lange ein Verbindungsproblem dauern muss (0 = sofort) |
+
+**Testmail senden** prueft die gespeicherten Einstellungen sofort; ein
+Fehler steht direkt auf der Seite. Die Mails tragen `Auto-Submitted:
+auto-generated`, damit Abwesenheitsnotizen nicht darauf antworten.
+
+## Sicherung und Wiederherstellung
+
+Die Datenbank ist die ganze Installation. Unter **Sicherung**:
+
+- **Jetzt sichern und herunterladen**: eine Datei
+  `mail2nas-sicherung-DATUM.db.gz` mit allem - Postfaecher, Archive,
+  Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen,
+  Benachrichtigungen, Passwort der Oberflaeche, Protokoll. Konsistent im
+  laufenden Betrieb (SQLite-Backup-API), gzip-komprimiert.
+- **Automatische Sicherung aufs NAS**: einmal am Tag in einen Ordner auf
+  einem der Archive (Standard: `mail2nas-sicherung` im Standard-Archiv), die
+  letzten N werden behalten (Standard 14), aeltere geloescht. Andere Dateien
+  im Ordner bleiben unberuehrt. Schlaegt sie fehl, wird stuendlich neu
+  versucht; der Fehler steht in der Uebersicht und - falls eingerichtet -
+  kommt per Mail. "Jetzt aufs NAS sichern" loest sie sofort aus.
+- **Wiederherstellen**: Datei hochladen, Haken setzen. Die Datei wird zuerst
+  geprueft (SQLite, unbeschaedigt, wirklich von mail2nas); der aktuelle Stand
+  wird vorher unter `/data/backups/vor-wiederherstellung-*.db.gz` abgelegt
+  (die letzten 5). Danach gilt die Konfiguration **und das Passwort** aus der
+  Sicherung - die laufende Sitzung bleibt angemeldet, die Postfaecher
+  verbinden sich innerhalb weniger Sekunden neu, ein Neustart ist nicht
+  noetig. Sicherungen aelterer Versionen werden dabei auf den aktuellen Stand
+  gebracht. Mails, die seit der Sicherung verarbeitet wurden, bleiben als
+  verarbeitet markiert - es wird nichts doppelt abgelegt.
+
+So zieht eine Installation auch um: auf der neuen LXC installieren, anmelden,
+Sicherung der alten hochladen.
+
+**Die Sicherung enthaelt die Passwoerter der Postfaecher und NAS-Freigaben im
+Klartext** - so wie die Datenbank selbst. Den Sicherungsordner auf dem NAS
+nur fuer Berechtigte lesbar machen; mail2nas selbst legt die Datei mit
+`chmod 600` an, auf einer SMB-Freigabe entscheiden aber deren Rechte.
+
 ## Wo die Konfiguration liegt
 
 | Was | Wo |
 |---|---|
-| Postfaecher, Archive, Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Passwort-Hash, verarbeitete Message-IDs | SQLite-Datenbank `/data/state.db` im Docker-Volume `state` (`chmod 600`) |
+| Postfaecher, Archive, Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Benachrichtigungen, Passwort-Hash, verarbeitete Message-IDs, Protokoll | SQLite-Datenbank `/data/state.db` im Docker-Volume `state` (`chmod 600`) |
+| Stand vor einer Wiederherstellung | `/data/backups/` im Volume |
 | Port, Zeitzone, Log-Level | `/opt/mail2nas/.env` |
 | Startpasswort (bis es geaendert wird) | `/data/initial-password.txt` im Volume |
 
@@ -621,8 +736,9 @@ Update-Skript raeumt sie anschliessend aus der `.env`.
 
 ### Sichern
 
-Die Datenbank ist die ganze Konfiguration. Sichern im laufenden Betrieb
-(konsistent, per SQLite-Backup-API):
+Am einfachsten in der Oberflaeche, siehe
+[Sicherung und Wiederherstellung](#sicherung-und-wiederherstellung). Ohne
+Browser geht es auch (konsistent, per SQLite-Backup-API):
 
 ```bash
 cd /opt/mail2nas
@@ -631,9 +747,8 @@ docker compose cp mail2nas:/data/state.db.bak ./state-$(date +%F).db
 chmod 600 ./state-*.db
 ```
 
-Die Sicherung enthaelt die Passwoerter - entsprechend ablegen. Die
-Zuordnungen allein gibt es zusaetzlich als lesbaren Export in der Oberflaeche.
-Ein Proxmox-Backup der LXC enthaelt das Volume ohnehin.
+Die Sicherung enthaelt die Passwoerter - entsprechend ablegen. Ein
+Proxmox-Backup der LXC enthaelt das Volume ohnehin.
 
 ## Updates
 
@@ -774,7 +889,9 @@ sollte vor dem Postfach filtern (beim Provider oder per ClamAV).
 
 Der erste Blick gehoert immer der **Uebersicht** in der Weboberflaeche: dort
 steht der Zustand des Archivs und je Postfach der letzte Fehler im Klartext.
-Details liefert das Log:
+Was mit einer bestimmten Mail passiert ist, zeigt das **Protokoll** (nach
+Betreff oder Absender suchen). Vollstaendige Fehlermeldungen mit Stacktrace
+stehen im Container-Log:
 
 ```bash
 cd /opt/mail2nas && docker compose logs -f
@@ -803,7 +920,13 @@ cd /opt/mail2nas && docker compose logs -f
   sie uebernommen wurden. War die alte `mapping.yaml` fehlerhaft, liegt sie
   unveraendert auf dem NAS - korrigieren und importieren.
 - **Es passiert gar nichts**: im Testmodus? (Hinweis in der Uebersicht.)
-  Liegen im ueberwachten Ordner ueberhaupt *ungelesene* Mails?
+  Liegen im ueberwachten Ordner ueberhaupt *ungelesene* Mails? Sonst beim
+  Postfach "Auch bereits gelesene Mails verarbeiten" einschalten.
+- **Keine Benachrichtigung**: "Testmail senden" auf der Seite
+  Benachrichtigungen - der Fehler des SMTP-Servers steht dann dort. Ein
+  Verbindungsproblem wird erst nach der eingestellten Wartezeit gemeldet.
+- **Sicherung schlaegt fehl**: der Grund steht in der Uebersicht und auf der
+  Seite Sicherung; meist fehlen Schreibrechte auf den Sicherungsordner.
 - **Weboberflaeche nicht erreichbar**: `docker compose ps` (laeuft der
   Container, ist er "healthy"?), `curl http://localhost:8080/healthz` in der
   LXC. `Web UI cannot listen on ...` im Log heisst: Port belegt - `WEB_PORT`
@@ -811,7 +934,7 @@ cd /opt/mail2nas && docker compose logs -f
 - **Passwort vergessen**: `docker compose exec mail2nas python -m mail2nas.cli reset-password`.
 - **"Zu viele Fehlversuche"**: die Sperre laeuft nach einer Minute ab.
 - **Es wird nicht gedruckt**: zuerst "Testseite drucken" beim Drucker - die
-  Fehlermeldung kommt direkt von CUPS. Im Log:
+  Fehlermeldung kommt direkt von CUPS. Im Protokoll (Dienstprotokoll):
   - `lp nicht gefunden` -> Image zu alt, `mail2nas-update`.
   - `no usable printer is configured` -> Drucken ist gewuenscht, aber kein
     aktiver Drucker gewaehlt.
@@ -829,14 +952,15 @@ cd /opt/mail2nas && docker compose logs -f
 
 ## Bekannte Grenzen
 
-- **Nur ungelesene Mails** werden verarbeitet. Wer eine Mail im Mailprogramm
-  oeffnet, bevor mail2nas sie gesehen hat, nimmt sie ihm weg - daher ein
-  eigenes Postfach bzw. ein eigener Ordner.
-- Scheitert das Ablegen **mitten** in einer Mail mit mehreren Anhaengen (NAS
-  faellt aus), wird die ganze Mail spaeter erneut verarbeitet; die schon
-  abgelegten Anhaenge liegen dann doppelt (mit Zaehler im Namen) vor.
-- Die Liste verarbeiteter Message-IDs waechst mit jeder Mail (wenige Bytes pro
-  Mail - auch nach Jahren unkritisch).
+- Standardmaessig werden **nur ungelesene Mails** verarbeitet. Wer eine Mail
+  im Mailprogramm oeffnet, bevor mail2nas sie gesehen hat, nimmt sie ihm weg -
+  ausser beim Postfach ist "Auch bereits gelesene Mails verarbeiten" an.
+- Gelesene Mails werden nur innerhalb der Aufbewahrungsfrist des Protokolls
+  beruecksichtigt (siehe [Mehrere Postfaecher](#mehrere-postfaecher)).
+- Wird eine Mail erneut verarbeitet, weil sie jemand wieder als ungelesen
+  markiert hat, nachdem ihre Message-ID aus der Liste gefallen ist (nach der
+  Aufbewahrungsfrist), wird sie noch einmal abgelegt.
+- Benachrichtigungen gehen nur per Mail (kein Push, kein Webhook).
 - Ein Passwort fuer alle, keine Benutzerrollen, kein TLS von Haus aus.
 
 ## Tests und Entwicklung
@@ -852,6 +976,12 @@ Importe, Quarantaene, Groessenlimits), die Uebernahme aller alten
 `.env`-Generationen und der `mapping.yaml`, die Bereitschaftspruefung, die
 Weboberflaeche und das Update-Skript (gegen nachgebaute Installationen aller
 Generationen, mit einem stellvertretenden `docker`).
+
+Bei jedem Push und Pull Request laeuft die **CI** (GitHub Actions,
+`.github/workflows/ci.yml`): pyflakes, pytest, Pruefung von
+`scripts/bootstrap.sh`, `bash -n` und shellcheck fuer die Skripte, ein Aufbau
+des Projekts aus dem Offline-Bootstrap samt Tests, und das Docker-Image wird
+gebaut und ohne Konfiguration gestartet (Healthcheck, `cli status`).
 
 `scripts/bootstrap.sh` wird generiert, nicht von Hand gepflegt:
 
@@ -869,6 +999,9 @@ Aufbau des Codes:
 | `options.py` | allgemeine Einstellungen in der Datenbank |
 | `legacy.py`, `migrate.py` | Uebernahme aelterer Installationen |
 | `archiver.py`, `scanning.py` | Mail bzw. Abholordner verarbeiten |
+| `journal.py` | Verarbeitungs- und Dienstprotokoll, Aufraeumen |
+| `notify.py` | Benachrichtigungen per Mail |
+| `backup.py` | Sichern, automatische Sicherung, Wiederherstellen |
 | `mapping.py` | Zuordnungen: Speicherung, Matching, Import/Export |
 | `accounts.py`, `archives.py`, `printers.py`, `addresses.py`, `pickups.py` | die jeweiligen Tabellen |
 | `storage.py` | SMB und lokales Verzeichnis |
@@ -879,8 +1012,10 @@ Aufbau des Codes:
 
 - **Die Datenbank enthaelt IMAP- und SMB-Passwoerter im Klartext** - sie
   muessen zum Anmelden verwendbar sein. mail2nas haelt sie auf `chmod 600` im
-  Docker-Volume `state`. Backups des Volumes (und Proxmox-Backups der LXC)
-  enthalten die Passwoerter - entsprechend ablegen.
+  Docker-Volume `state`. Backups des Volumes (und Proxmox-Backups der LXC),
+  heruntergeladene Sicherungen und die automatischen Sicherungen auf dem NAS
+  enthalten die Passwoerter - entsprechend ablegen, den Sicherungsordner nur
+  fuer Berechtigte freigeben.
 - Die `.env` enthaelt nach dem Update keine Passwoerter mehr. Die Sicherungen
   `.env.bak.*`, die das Update anlegt, schon - nach einer Kontrolle loeschen.
 - Dediziertes IMAP-Konto mit App-Passwort, dedizierter SMB-Benutzer mit
@@ -898,9 +1033,12 @@ personenbezogene Daten enthalten (Namen, Adressen, Bankverbindungen in
 Rechnungen/Lieferscheinen usw.). Wer das Tool einsetzt, ist im Sinne der
 DSGVO fuer diese Verarbeitung verantwortlich. Ein paar Punkte:
 
-- **Datensparsamkeit im Log**: geloggt werden Betreff, Absenderadresse,
-  Anhang-Dateinamen und Zielpfade, nicht der Mailinhalt. Betreffzeilen koennen
-  trotzdem personenbezogene Daten enthalten - Logs entsprechend absichern.
+- **Datensparsamkeit im Protokoll**: festgehalten werden Betreff,
+  Absenderadresse, Anhang-Dateinamen und Zielpfade, nicht der Mailinhalt.
+  Betreffzeilen koennen trotzdem personenbezogene Daten enthalten. Das
+  Protokoll wird nach der eingestellten Frist (Standard 183 Tage) automatisch
+  geloescht - die Frist nach dem eigenen Loeschkonzept waehlen. Es ist auch in
+  den Sicherungen enthalten.
 - **Zugriffsbeschraenkung**: nur Personen mit begruendetem Zugriff sollten
   Rechte auf die Freigabe, die Weboberflaeche und die LXC haben.
 - **Verschluesselung**: IMAP per TLS, SMB3 mit Verschluesselung (Standard).
@@ -922,6 +1060,11 @@ verlangen die GoBD zusaetzlich:
 - **Vollstaendigkeit**: mail2nas erfasst nur, was per Mail oder Abholordner
   ankommt.
 - **Aufbewahrungsfristen** von 8 bzw. 10 Jahren (§ 147 AO), inkl. Backup.
+
+Das Protokoll (was wann wohin abgelegt wurde) hilft bei der
+Nachvollziehbarkeit, ist aber selbst kein revisionssicheres Journal und wird
+nach der eingestellten Frist geloescht; bei Bedarf regelmaessig als CSV
+exportieren.
 
 mail2nas ist ein **Zubringer/Sortier-Werkzeug**. Im Zweifel die
 Steuerberatung fragen.

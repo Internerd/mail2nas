@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 from .archives import NoArchiveError, StorageSet
+from .backup import BackupStatus
 from .mapping import Mapping, RuleStore
 from .options import Options, OptionsStore
 from .printing import PrintService, Spooler
@@ -32,6 +33,9 @@ class WorkerStatus:
     last_error: str = ""
     last_error_at: float | None = None
     processed: int = 0
+    # Since when it has been failing without a success in between; what the
+    # notifications measure their delay against.
+    failing_since: float | None = None
 
 
 @dataclass
@@ -40,6 +44,7 @@ class ArchiveStatus:
     detail: str = ""
     checked_at: float | None = None
     fingerprint: tuple = field(default_factory=tuple)
+    failing_since: float | None = None
 
 
 class StatusBoard:
@@ -68,6 +73,7 @@ class StatusBoard:
             status.detail = detail
             if state in ("verbunden", "wartet"):
                 status.last_ok = time.time()
+                status.failing_since = None
 
     def error(self, key: str, message: str) -> None:
         with self._lock:
@@ -75,12 +81,15 @@ class StatusBoard:
             status.state = "Fehler"
             status.last_error = message
             status.last_error_at = time.time()
+            if status.failing_since is None:
+                status.failing_since = status.last_error_at
 
     def processed(self, key: str, count: int) -> None:
         with self._lock:
             status = self._workers.setdefault(key, WorkerStatus(label=key))
             status.processed += count
             status.last_ok = time.time()
+            status.failing_since = None
 
     def forget(self, key: str) -> None:
         with self._lock:
@@ -107,6 +116,8 @@ class Runtime:
         addresses=None,
         archives=None,
         pickups=None,
+        journal=None,
+        logs=None,
     ):
         self.config = config
         self.settings = settings  # the key/value store
@@ -129,6 +140,14 @@ class Runtime:
             )
         self.printing = printing
         self.status = StatusBoard()
+        # The processing journal and the stored log (see journal.py). Optional,
+        # so a test can build a Runtime without them.
+        self.journal = journal
+        self.logs = logs
+        self.backup_status = BackupStatus()
+        # Set by the supervisor: the notifier, for the "test mail" button and
+        # the overview page.
+        self.notifier = None
         # Set by the web UI after a change the supervisor should act on right
         # away (an archive was added, the settings were saved) instead of at
         # its next regular pass.
@@ -174,6 +193,29 @@ class Runtime:
             return self.storages.default()
         except NoArchiveError:
             return None
+
+    def after_restore(self) -> None:
+        """A restored database may come from an older version and holds
+        different settings: bring its tables up to date and drop every cached
+        view of the old one."""
+        from .accounts import AccountStore
+        from .addresses import AddressStore
+        from .archives import ArchiveStore
+        from .journal import Journal, LogStore
+        from .pickups import PickupStore
+        from .printers import PrinterStore
+        from .state import ProcessedStore, SettingsStore
+
+        path = self.config.state_db_path
+        for store in (SettingsStore, AccountStore, ArchiveStore, PrinterStore, AddressStore,
+                      PickupStore, RuleStore, Journal, LogStore):
+            store(path)
+        ProcessedStore(path).close()
+        self.invalidate_options()
+        self.mapping.reload()
+        self.status.archive.checked_at = None
+        self.status.archive.fingerprint = ()
+        self.changed.set()
 
     def default_archive(self):
         return self.archives.default() if self.archives is not None else None

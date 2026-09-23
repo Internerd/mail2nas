@@ -8,12 +8,16 @@ import time
 
 from .accounts import AccountStore
 from .addresses import AddressStore
+from . import journal as journal_module
 from .archiver import Archiver
 from .archives import ArchiveStore
+from .backup import BackupScheduler
 from .config import Config
+from .journal import DatabaseLogHandler, Journal, LogStore
 from .legacy import LegacyEnv
 from .mapping import RuleStore
 from .migrate import migrate_rule_file, rules_settled, seed_from_legacy
+from .notify import Notifier
 from .pickups import PICKUP_INTERVAL, PickupStore
 from .printers import PrinterStore
 from .runtime import Runtime
@@ -33,6 +37,8 @@ ARCHIVE_RETRY = 60
 IDLE_SLICE = 5
 # RFC 2177: re-issue IDLE before 29 minutes, or the server may drop us.
 MAX_IDLE = 29 * 60
+# How often old journal and log entries are pruned.
+MAINTENANCE_INTERVAL = 24 * 60 * 60
 
 
 def build_runtime(config: Config, environ=None) -> Runtime:
@@ -51,6 +57,8 @@ def build_runtime(config: Config, environ=None) -> Runtime:
         addresses=AddressStore(config.state_db_path),
         archives=ArchiveStore(config.state_db_path),
         pickups=PickupStore(config.state_db_path),
+        journal=Journal(config.state_db_path),
+        logs=LogStore(config.state_db_path),
     )
     seed_from_legacy(runtime, LegacyEnv.from_environ(environ))
     return runtime
@@ -65,6 +73,8 @@ def main() -> None:
 
     config = Config.from_env()
     runtime = build_runtime(config)
+    # From here on the log is also kept in the database, for the log page.
+    logging.getLogger("mail2nas").addHandler(DatabaseLogHandler(runtime.logs))
 
     if os.environ.get("WEB_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
         # The web UI is the only place left to configure anything, so it
@@ -149,6 +159,7 @@ class _Worker:
             self.account,
             runtime.printing,
             runtime.addresses,
+            journal=runtime.journal,
         )
         status = runtime.status
         label = f"{self.account.name} <{self.account.user}>"
@@ -272,12 +283,17 @@ class Supervisor:
                 runtime.storages,
                 runtime.pickups,
                 printing=runtime.printing,
+                journal=runtime.journal,
             )
             if runtime.pickups is not None
             else None
         )
         self._next_pickup = 0.0
         self._was_ready: bool | None = None
+        self.notifier = Notifier(runtime)
+        runtime.notifier = self.notifier
+        self.backups = BackupScheduler(runtime)
+        self._next_maintenance = 0.0
 
     # --- readiness -------------------------------------------------------------
 
@@ -288,6 +304,7 @@ class Supervisor:
         archive = runtime.default_archive()
         if archive is None:
             status.ok, status.detail, status.fingerprint = False, "Kein Archiv eingerichtet.", ()
+            status.failing_since = None
             return False
 
         fingerprint = (archive.id, *archive.fingerprint())
@@ -305,10 +322,13 @@ class Supervisor:
             if isinstance(exc, KeyboardInterrupt):
                 raise
             status.ok, status.detail = False, str(exc) or exc.__class__.__name__
+            if status.failing_since is None:
+                status.failing_since = status.checked_at
             logger.error("Archive %r is not usable: %s", archive.name, status.detail)
             return False
 
         status.ok = True
+        status.failing_since = None
         status.detail = f"{archive.location()} ist erreichbar und beschreibbar."
         if archive.backend == "local" and not os.path.ismount(archive.path):
             # Not fatal - a directory on the container's own disk is a valid
@@ -348,11 +368,15 @@ class Supervisor:
                 )
             self._was_ready = ready
 
+        self._maintenance()
+        self._notify()
+
         if not ready:
             self.stop_all()
             return
 
         reconcile(runtime, self.workers, self._factory)
+        self.backups.maybe_run()
 
         # Folders are walked on their own schedule: the supervisor wakes up
         # every few seconds to notice UI changes, which is far more often than
@@ -366,6 +390,26 @@ class Supervisor:
             except Exception:  # noqa: BLE001 - never let this stop the supervisor
                 logger.exception("Pickup cycle failed")
             self._next_pickup = time.monotonic() + PICKUP_INTERVAL
+
+    def _maintenance(self) -> None:
+        """Once a day: forget what is older than the retention period."""
+        if time.monotonic() < self._next_maintenance:
+            return
+        self._next_maintenance = time.monotonic() + MAINTENANCE_INTERVAL
+        days = self.runtime.options.retention_days
+        try:
+            removed = journal_module.prune(self.runtime, days)
+        except Exception:  # noqa: BLE001 - never let this stop the supervisor
+            logger.exception("Pruning the journal failed")
+            return
+        if any(removed.values()):
+            logger.info("Removed entries older than %d days: %s", days, removed)
+
+    def _notify(self) -> None:
+        try:
+            self.notifier.evaluate()
+        except Exception:  # noqa: BLE001 - notifications are a convenience
+            logger.exception("Checking for notifications failed")
 
     def pickup_problems(self) -> dict[int, str]:
         return self._pickup.problems() if self._pickup is not None else {}

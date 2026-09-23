@@ -29,7 +29,7 @@ cat > requirements.txt <<'MAIL2NAS_EOF'
 imapclient>=3.0,<4.0
 PyYAML>=6.0,<7.0
 smbprotocol>=1.15,<2.0
-Flask>=3.0,<4.0
+Flask>=3.1,<4.0
 waitress>=3.0,<4.0
 MAIL2NAS_EOF
 
@@ -418,7 +418,7 @@ fi
 #   ohne Backend, aber NAS_PATH          -> Mount (aufgeraeumte .env, oder Host-Mount)
 #   ohne Backend, IMAP_* aber kein SMB_* -> Mount (Host-Mount-Generation)
 #   ohne Backend, mit SMB_*              -> kein Mount (Docker-cifs-Generation -> jetzt SMB direkt)
-BACKEND="$(env_get STORAGE_BACKEND | tr 'A-Z' 'a-z')"
+BACKEND="$(env_get STORAGE_BACKEND | tr '[:upper:]' '[:lower:]')"
 NAS_PATH_VALUE="$(env_get NAS_PATH)"
 NEED_MOUNT=0
 case "$BACKEND" in
@@ -732,6 +732,7 @@ LIMITS = {
     "max_attachments_per_message": (1, 1_000),
     "pickup_min_age": (0, 86_400),
     "print_timeout": (5, 3_600),
+    "retention_days": (30, 3_650),
 }
 
 # Keys under which each value is stored. Two predate this module and keep
@@ -768,6 +769,8 @@ class Options:
         default_factory=lambda: parse_extension_list(DEFAULT_PRINTABLE_EXTENSIONS)
     )
     dry_run: bool = False
+    # How long the journal, the log and the list of processed mails are kept.
+    retention_days: int = 183
 
 
 def _key(name: str) -> str:
@@ -901,6 +904,14 @@ def _whole(form: Mapping[str, str], name: str, label: str) -> int:
     return value
 
 
+def _whole_or(form: Mapping[str, str], name: str, label: str, current: int) -> int:
+    """Like `_whole`, but a field the form did not send keeps its value -
+    for settings added later, so an older form (or script) still saves."""
+    if name not in form:
+        return current
+    return _whole(form, name, label)
+
+
 def validate(form: Mapping[str, str], current: Options | None = None) -> Options:
     """Turn the submitted settings form into Options, or explain what is wrong.
 
@@ -937,6 +948,9 @@ def validate(form: Mapping[str, str], current: Options | None = None) -> Options
         print_timeout=_whole(form, "print_timeout", "Die Zeitgrenze fuer Druckauftraege"),
         printable_extensions=parse_extension_list(form.get("printable_extensions", "")),
         dry_run=bool(form.get("dry_run")),
+        retention_days=_whole_or(
+            form, "retention_days", "Die Aufbewahrungsdauer", current.retention_days
+        ),
     )
 MAIL2NAS_EOF
 
@@ -1521,6 +1535,7 @@ import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -1551,6 +1566,12 @@ class Account:
     printer: str = ""
     # Off means "print only": attachments are not written to the share.
     archive_attachments: bool = True
+    # Also process mail that is already marked as read - somebody opened it
+    # in their mail client before mail2nas got to it. Only mail that arrived
+    # on or after `seen_since` (YYYY-MM-DD) is considered, so ticking the box
+    # does not suddenly file years of old correspondence.
+    include_seen: bool = False
+    seen_since: str = ""
 
     @property
     def key(self) -> str:
@@ -1573,6 +1594,8 @@ class Account:
             self.print_attachments,
             self.printer,
             self.archive_attachments,
+            self.include_seen,
+            self.seen_since,
         )
 
 
@@ -1627,12 +1650,14 @@ class AccountStore:
             print_attachments=bool(row[12]),
             printer=row[13] or "",
             archive_attachments=bool(row[14]),
+            include_seen=bool(row[15]),
+            seen_since=row[16] or "",
         )
 
     _COLUMNS = (
         "id, name, host, port, ssl, user, password, folder, mode, "
         "processed_folder, oversized_folder, enabled, "
-        "print_attachments, printer, archive_attachments"
+        "print_attachments, printer, archive_attachments, include_seen, seen_since"
     )
 
     def all(self) -> list[Account]:
@@ -1656,10 +1681,10 @@ class AccountStore:
             cursor = conn.execute(
                 "INSERT INTO imap_accounts (name, host, port, ssl, user, password, folder, "
                 "mode, processed_folder, oversized_folder, enabled, print_attachments, "
-                "printer, archive_attachments) "
+                "printer, archive_attachments, include_seen, seen_since) "
                 "VALUES (:name, :host, :port, :ssl, :user, :password, :folder, :mode, "
                 ":processed_folder, :oversized_folder, :enabled, :print_attachments, "
-                ":printer, :archive_attachments)",
+                ":printer, :archive_attachments, :include_seen, :seen_since)",
                 values,
             )
             return int(cursor.lastrowid)
@@ -1684,6 +1709,8 @@ class AccountStore:
                 "print_attachments": current.print_attachments,
                 "printer": current.printer,
                 "archive_attachments": current.archive_attachments,
+                "include_seen": current.include_seen,
+                "seen_since": current.seen_since,
                 **fields,
             }
         )
@@ -1694,7 +1721,8 @@ class AccountStore:
                 "user = :user, password = :password, folder = :folder, mode = :mode, "
                 "processed_folder = :processed_folder, oversized_folder = :oversized_folder, "
                 "enabled = :enabled, print_attachments = :print_attachments, "
-                "printer = :printer, archive_attachments = :archive_attachments WHERE id = :id",
+                "printer = :printer, archive_attachments = :archive_attachments, "
+                "include_seen = :include_seen, seen_since = :seen_since WHERE id = :id",
                 values,
             )
 
@@ -1716,6 +1744,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         ("print_attachments", "INTEGER NOT NULL DEFAULT 0"),
         ("printer", "TEXT NOT NULL DEFAULT ''"),
         ("archive_attachments", "INTEGER NOT NULL DEFAULT 1"),
+        ("include_seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("seen_since", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE imap_accounts ADD COLUMN {column} {definition}")
@@ -1738,7 +1768,20 @@ def _defaults(fields: dict) -> dict:
         "print_attachments": 1 if fields.get("print_attachments", False) else 0,
         "printer": str(fields.get("printer") or "").strip(),
         "archive_attachments": 1 if fields.get("archive_attachments", True) else 0,
+        "include_seen": 1 if fields.get("include_seen", False) else 0,
+        "seen_since": _since(fields.get("include_seen", False), fields.get("seen_since")),
     }
+
+
+def _since(include_seen, value) -> str:
+    """A valid YYYY-MM-DD, or today when read mail is included without one."""
+    text = str(value or "").strip()
+    if text:
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            raise ValueError(f"Kein gueltiges Datum: {text!r} (erwartet JJJJ-MM-TT)") from None
+    return date.today().isoformat() if include_seen else ""
 
 
 def seed_from_config(store: AccountStore, settings, config) -> None:
@@ -3623,6 +3666,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 from .archives import NoArchiveError, StorageSet
+from .backup import BackupStatus
 from .mapping import Mapping, RuleStore
 from .options import Options, OptionsStore
 from .printing import PrintService, Spooler
@@ -3641,6 +3685,9 @@ class WorkerStatus:
     last_error: str = ""
     last_error_at: float | None = None
     processed: int = 0
+    # Since when it has been failing without a success in between; what the
+    # notifications measure their delay against.
+    failing_since: float | None = None
 
 
 @dataclass
@@ -3649,6 +3696,7 @@ class ArchiveStatus:
     detail: str = ""
     checked_at: float | None = None
     fingerprint: tuple = field(default_factory=tuple)
+    failing_since: float | None = None
 
 
 class StatusBoard:
@@ -3677,6 +3725,7 @@ class StatusBoard:
             status.detail = detail
             if state in ("verbunden", "wartet"):
                 status.last_ok = time.time()
+                status.failing_since = None
 
     def error(self, key: str, message: str) -> None:
         with self._lock:
@@ -3684,12 +3733,15 @@ class StatusBoard:
             status.state = "Fehler"
             status.last_error = message
             status.last_error_at = time.time()
+            if status.failing_since is None:
+                status.failing_since = status.last_error_at
 
     def processed(self, key: str, count: int) -> None:
         with self._lock:
             status = self._workers.setdefault(key, WorkerStatus(label=key))
             status.processed += count
             status.last_ok = time.time()
+            status.failing_since = None
 
     def forget(self, key: str) -> None:
         with self._lock:
@@ -3716,6 +3768,8 @@ class Runtime:
         addresses=None,
         archives=None,
         pickups=None,
+        journal=None,
+        logs=None,
     ):
         self.config = config
         self.settings = settings  # the key/value store
@@ -3738,6 +3792,14 @@ class Runtime:
             )
         self.printing = printing
         self.status = StatusBoard()
+        # The processing journal and the stored log (see journal.py). Optional,
+        # so a test can build a Runtime without them.
+        self.journal = journal
+        self.logs = logs
+        self.backup_status = BackupStatus()
+        # Set by the supervisor: the notifier, for the "test mail" button and
+        # the overview page.
+        self.notifier = None
         # Set by the web UI after a change the supervisor should act on right
         # away (an archive was added, the settings were saved) instead of at
         # its next regular pass.
@@ -3783,6 +3845,29 @@ class Runtime:
             return self.storages.default()
         except NoArchiveError:
             return None
+
+    def after_restore(self) -> None:
+        """A restored database may come from an older version and holds
+        different settings: bring its tables up to date and drop every cached
+        view of the old one."""
+        from .accounts import AccountStore
+        from .addresses import AddressStore
+        from .archives import ArchiveStore
+        from .journal import Journal, LogStore
+        from .pickups import PickupStore
+        from .printers import PrinterStore
+        from .state import ProcessedStore, SettingsStore
+
+        path = self.config.state_db_path
+        for store in (SettingsStore, AccountStore, ArchiveStore, PrinterStore, AddressStore,
+                      PickupStore, RuleStore, Journal, LogStore):
+            store(path)
+        ProcessedStore(path).close()
+        self.invalidate_options()
+        self.mapping.reload()
+        self.status.archive.checked_at = None
+        self.status.archive.fingerprint = ()
+        self.changed.set()
 
     def default_archive(self):
         return self.archives.default() if self.archives is not None else None
@@ -5113,6 +5198,22 @@ class ProcessedStore:
             )
             self._conn.commit()
 
+    def prune(self, before: str) -> int:
+        """Forget messages processed before `before` (UTC, SQLite format).
+
+        A forgotten message is only processed again if it turns up as a
+        candidate again - marked unread by somebody, or still in the folder
+        of a mailbox that also processes read mail. The archiver's search for
+        the latter never reaches back further than the retention period, so
+        that cannot happen by itself.
+        """
+        with self._lock:
+            removed = self._conn.execute(
+                "DELETE FROM processed_messages WHERE processed_at < ?", (before,)
+            ).rowcount
+            self._conn.commit()
+        return removed
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -5160,15 +5261,1114 @@ class SettingsStore:
             )
 MAIL2NAS_EOF
 
+# --- mail2nas/journal.py ---
+cat > mail2nas/journal.py <<'MAIL2NAS_EOF'
+"""What happened, kept in the database: the processing journal and the log.
+
+Two tables, both pruned after the retention period (six months by default):
+
+* `journal` - one row per thing that happened to a document: filed,
+  quarantined, printed, not printed, skipped, failed. It is what the log page
+  shows as "Verarbeitung", it is what an error notification is built from -
+  and it is how a mail that failed half-way is retried without filing or
+  printing its first attachments a second time (`done`).
+* `log_entries` - the service's own log lines (INFO and up), so the web UI
+  can show them and they survive a container rebuild. Tracebacks are cut to
+  their last line: the full ones are still in `docker compose logs`, and
+  keeping hundreds of them for half a year would only grow the database.
+
+Timestamps are stored in UTC ("YYYY-MM-DD HH:MM:SS", SQLite's own format) and
+converted to local time for display.
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_RETENTION_DAYS = 183
+
+# Journal actions, with the words the UI uses for them.
+FILED = "abgelegt"
+QUARANTINED = "quarantaene"
+PRINTED = "gedruckt"
+NOT_PRINTED = "nicht_gedruckt"
+SKIPPED = "uebersprungen"
+TOO_LARGE = "zu_gross"
+NO_ATTACHMENTS = "ohne_anhang"
+FAILED = "fehler"
+DRY_RUN = "testmodus"
+
+ACTIONS = {
+    FILED: "abgelegt",
+    QUARANTINED: "Quarantaene",
+    PRINTED: "gedruckt",
+    NOT_PRINTED: "nicht gedruckt",
+    SKIPPED: "uebersprungen",
+    TOO_LARGE: "Mail zu gross",
+    NO_ATTACHMENTS: "ohne Anhang",
+    FAILED: "Fehler",
+    DRY_RUN: "Testmodus",
+}
+# What counts as a problem somebody should hear about.
+FAILURES = (NOT_PRINTED, FAILED, TOO_LARGE, SKIPPED)
+# What makes an attachment "already filed" / "already printed" for a retry.
+FILED_ACTIONS = (FILED, QUARANTINED)
+
+LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+MAX_MESSAGE = 2000
+MAX_FIELD = 500
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cutoff(days: int, now: datetime | None = None) -> str:
+    """The UTC timestamp before which rows are older than `days`."""
+    now = now or datetime.now(timezone.utc)
+    return (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def local_time(stamp: str) -> str:
+    """A stored UTC timestamp as local time, for the UI."""
+    try:
+        value = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return stamp or ""
+    return value.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+
+
+def _clip(value, limit: int = MAX_FIELD) -> str:
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _like(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+@dataclass(frozen=True)
+class Entry:
+    id: int
+    at: str
+    source: str
+    action: str
+    message_key: str
+    part_key: str
+    subject: str
+    sender: str
+    filename: str
+    target: str
+    detail: str
+
+    @property
+    def action_label(self) -> str:
+        return ACTIONS.get(self.action, self.action)
+
+    @property
+    def failed(self) -> bool:
+        return self.action in FAILURES
+
+    @property
+    def local_at(self) -> str:
+        return local_time(self.at)
+
+
+@dataclass(frozen=True)
+class LogLine:
+    id: int
+    at: str
+    level: str
+    name: str
+    message: str
+
+    @property
+    def local_at(self) -> str:
+        return local_time(self.at)
+
+
+class _Store:
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+
+class Journal(_Store):
+    """The processing journal. Safe to use from any thread."""
+
+    def __init__(self, db_path: str):
+        super().__init__(db_path)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS journal ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "at TEXT NOT NULL, "
+                "source TEXT NOT NULL DEFAULT '', "
+                "action TEXT NOT NULL, "
+                "message_key TEXT NOT NULL DEFAULT '', "
+                "part_key TEXT NOT NULL DEFAULT '', "
+                "subject TEXT NOT NULL DEFAULT '', "
+                "sender TEXT NOT NULL DEFAULT '', "
+                "filename TEXT NOT NULL DEFAULT '', "
+                "target TEXT NOT NULL DEFAULT '', "
+                "detail TEXT NOT NULL DEFAULT '')"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS journal_at ON journal (at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS journal_part ON journal (message_key, part_key, action)"
+            )
+
+    def record(
+        self,
+        source: str,
+        action: str,
+        *,
+        message_key: str = "",
+        part_key: str = "",
+        subject: str = "",
+        sender: str = "",
+        filename: str = "",
+        target: str = "",
+        detail: str = "",
+    ) -> None:
+        """Write one row. Never raises: the journal must not stop the archiving."""
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO journal (at, source, action, message_key, part_key, subject, "
+                    "sender, filename, target, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        utc_now(), _clip(source), action, _clip(message_key, 1000),
+                        _clip(part_key), _clip(subject), _clip(sender), _clip(filename),
+                        _clip(target, 1000), _clip(detail, MAX_MESSAGE),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            logger.error("Could not write to the journal: %s", exc)
+
+    def done(self, message_key: str, part_key: str, actions) -> bool:
+        """Has this attachment already had one of `actions` happen to it?"""
+        if not message_key or not part_key:
+            return False
+        marks = ",".join("?" for _ in actions)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM journal WHERE message_key = ? AND part_key = ? "
+                f"AND action IN ({marks}) LIMIT 1",
+                (message_key, part_key, *actions),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _where(search: str = "", source: str = "", problems_only: bool = False,
+               after_id: int = 0, since: str = ""):
+        clauses, args = [], []
+        if search:
+            clauses.append(
+                "(subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\' OR filename LIKE ? "
+                "ESCAPE '\\' OR target LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')"
+            )
+            args += [_like(search)] * 5
+        if source:
+            clauses.append("source = ?")
+            args.append(source)
+        if problems_only:
+            clauses.append(f"action IN ({','.join('?' for _ in FAILURES)})")
+            args += list(FAILURES)
+        if after_id:
+            clauses.append("id > ?")
+            args.append(after_id)
+        if since:
+            clauses.append("at >= ?")
+            args.append(since)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+    def entries(self, *, search: str = "", source: str = "", problems_only: bool = False,
+                limit: int = 100, offset: int = 0, after_id: int = 0,
+                oldest_first: bool = False) -> list[Entry]:
+        where, args = self._where(search, source, problems_only, after_id)
+        order = "ASC" if oldest_first else "DESC"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, at, source, action, message_key, part_key, subject, sender, "
+                f"filename, target, detail FROM journal{where} ORDER BY id {order} "
+                "LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            ).fetchall()
+        return [Entry(*row) for row in rows]
+
+    def count(self, *, search: str = "", source: str = "", problems_only: bool = False,
+              since: str = "") -> int:
+        where, args = self._where(search, source, problems_only, since=since)
+        with self._connect() as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM journal{where}", args).fetchone()[0]
+
+    def sources(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT source FROM journal WHERE source != '' ORDER BY source"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def last_id(self) -> int:
+        with self._connect() as conn:
+            return conn.execute("SELECT COALESCE(MAX(id), 0) FROM journal").fetchone()[0]
+
+    def prune(self, before: str) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute("DELETE FROM journal WHERE at < ?", (before,)).rowcount
+
+
+class LogStore(_Store):
+    """The service log, kept for the log page."""
+
+    def __init__(self, db_path: str):
+        super().__init__(db_path)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS log_entries ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "at TEXT NOT NULL, "
+                "level TEXT NOT NULL, "
+                "name TEXT NOT NULL DEFAULT '', "
+                "message TEXT NOT NULL)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS log_entries_at ON log_entries (at)")
+
+    def add(self, level: str, name: str, message: str, at: str | None = None) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO log_entries (at, level, name, message) VALUES (?, ?, ?, ?)",
+                (at or utc_now(), level, _clip(name, 100), _clip(message, MAX_MESSAGE)),
+            )
+
+    @staticmethod
+    def _where(min_level: str = "INFO", search: str = ""):
+        wanted = [name for name, value in LEVELS.items() if value >= LEVELS.get(min_level, 20)]
+        clauses = [f"level IN ({','.join('?' for _ in wanted)})"]
+        args: list = list(wanted)
+        if search:
+            clauses.append("message LIKE ? ESCAPE '\\'")
+            args.append(_like(search))
+        return " WHERE " + " AND ".join(clauses), args
+
+    def entries(self, *, min_level: str = "INFO", search: str = "", limit: int = 200,
+                offset: int = 0) -> list[LogLine]:
+        where, args = self._where(min_level, search)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, at, level, name, message FROM log_entries{where} "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            ).fetchall()
+        return [LogLine(*row) for row in rows]
+
+    def count(self, *, min_level: str = "INFO", search: str = "") -> int:
+        where, args = self._where(min_level, search)
+        with self._connect() as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM log_entries{where}", args).fetchone()[0]
+
+    def prune(self, before: str) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute("DELETE FROM log_entries WHERE at < ?", (before,)).rowcount
+
+
+class DatabaseLogHandler(logging.Handler):
+    """Copies the service's log records into `LogStore`.
+
+    Only mail2nas' own loggers, INFO and up: library chatter (SMB, waitress)
+    stays in the container log. A record logged while a record is being
+    written (from inside sqlite, say) is dropped instead of recursing.
+    """
+
+    def __init__(self, store: LogStore, level: int = logging.INFO):
+        super().__init__(level)
+        self.store = store
+        self._busy = threading.local()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not record.name.startswith("mail2nas") or getattr(self._busy, "on", False):
+            return
+        self._busy.on = True
+        try:
+            message = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                exc = record.exc_info[1]
+                message += f" - {exc.__class__.__name__}: {exc}"
+            self.store.add(record.levelname, record.name, message)
+        except Exception:  # noqa: BLE001 - logging must never break the caller
+            self.handleError(record)
+        finally:
+            self._busy.on = False
+
+
+def prune(runtime, days: int, now: datetime | None = None) -> dict[str, int]:
+    """Drop everything older than `days` from the journal, the log and the
+    processed-message list. Returns how many rows went, per table."""
+    before = cutoff(days, now)
+    removed = {}
+    if getattr(runtime, "journal", None) is not None:
+        removed["journal"] = runtime.journal.prune(before)
+    if getattr(runtime, "logs", None) is not None:
+        removed["log"] = runtime.logs.prune(before)
+    if runtime.store is not None and hasattr(runtime.store, "prune"):
+        removed["processed"] = runtime.store.prune(before)
+    return removed
+MAIL2NAS_EOF
+
+# --- mail2nas/backup.py ---
+cat > mail2nas/backup.py <<'MAIL2NAS_EOF'
+"""Backing up and restoring the one thing that matters: the database.
+
+Since everything is configured in the web UI, the state database *is* the
+installation - mailboxes, archives, rules, printers, settings, the journal.
+Three ways to keep it:
+
+* **Download** from the web UI, any time.
+* **Automatically** once a day into a folder on one of the archives (the
+  NAS), keeping the last N copies.
+* **Restore** from such a file in the web UI. The current database is saved
+  next to it first (`/data/backups`), so a wrong file can be undone.
+
+A copy is taken with SQLite's online backup API: consistent even while the
+workers are writing, without stopping anything. It is gzip-compressed; the
+journal and the log compress well.
+
+The file contains the IMAP and SMB passwords in clear text - exactly like the
+database itself. Whoever can read the backup folder can read those.
+"""
+from __future__ import annotations
+
+import gzip
+import logging
+import os
+import sqlite3
+import tempfile
+import time
+from dataclasses import dataclass, fields, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .filenames import safe_relative_parts
+
+logger = logging.getLogger(__name__)
+
+PREFIX = "mail2nas-sicherung-"
+SUFFIX = ".db.gz"
+LOCAL_DIR = "backups"
+LOCAL_KEEP = 5
+# A restore upload may be this large (compressed or not).
+MAX_UPLOAD = 512 * 1024 * 1024
+BACKUP_INTERVAL = 24 * 60 * 60
+RETRY_INTERVAL = 60 * 60
+KEEP_LIMITS = (1, 365)
+SQLITE_MAGIC = b"SQLite format 3\x00"
+GZIP_MAGIC = b"\x1f\x8b"
+# Present in every mail2nas database since the web UI exists.
+REQUIRED_TABLES = ("settings",)
+
+
+class BackupError(ValueError):
+    """A backup could not be made or a file cannot be restored."""
+
+
+def backup_name(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return f"{PREFIX}{now.strftime('%Y-%m-%d_%H%M%S')}{SUFFIX}"
+
+
+def dump(db_path: str) -> bytes:
+    """A consistent, compressed copy of the database."""
+    with tempfile.TemporaryDirectory(prefix="mail2nas-backup-") as tmp:
+        copy = os.path.join(tmp, "copy.db")
+        source = sqlite3.connect(db_path, timeout=30)
+        target = sqlite3.connect(copy)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        return gzip.compress(Path(copy).read_bytes(), compresslevel=6)
+
+
+def _plain(data: bytes) -> bytes:
+    if data[:2] == GZIP_MAGIC:
+        try:
+            return gzip.decompress(data)
+        except (OSError, EOFError) as exc:
+            raise BackupError(f"Die Datei ist kein gueltiges gzip-Archiv ({exc}).") from None
+    return data
+
+
+def check(data: bytes) -> dict[str, int]:
+    """Validate an uploaded backup; returns row counts for a few tables."""
+    plain = _plain(data)
+    if not plain.startswith(SQLITE_MAGIC):
+        raise BackupError("Das ist keine mail2nas-Sicherung (keine SQLite-Datenbank).")
+    with tempfile.TemporaryDirectory(prefix="mail2nas-restore-") as tmp:
+        path = os.path.join(tmp, "check.db")
+        Path(path).write_bytes(plain)
+        return _inspect(path)
+
+
+def _inspect(path: str) -> dict[str, int]:
+    conn = sqlite3.connect(path)
+    try:
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise BackupError(f"Die Datenbank in der Sicherung ist beschaedigt ({result}).")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = [name for name in REQUIRED_TABLES if name not in tables]
+        if missing:
+            raise BackupError("Das ist keine mail2nas-Sicherung (Tabelle settings fehlt).")
+        counts = {}
+        for table in ("imap_accounts", "archives", "mapping_rules", "printers", "journal"):
+            if table in tables:
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return counts
+    except sqlite3.DatabaseError as exc:
+        raise BackupError(f"Die Datenbank in der Sicherung ist nicht lesbar ({exc}).") from None
+    finally:
+        conn.close()
+
+
+def save_local(db_path: str, data_dir: str, label: str = "vor-wiederherstellung") -> str:
+    """Keep a copy of the current database in `<data_dir>/backups`."""
+    folder = Path(data_dir) / LOCAL_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    path = folder / f"{label}-{stamp}{SUFFIX}"
+    path.write_bytes(dump(db_path))
+    os.chmod(path, 0o600)
+    old = sorted(folder.glob(f"{label}-*{SUFFIX}"))
+    for stale in old[:-LOCAL_KEEP]:
+        stale.unlink(missing_ok=True)
+    return str(path)
+
+
+def restore(db_path: str, data: bytes, data_dir: str) -> tuple[str, dict[str, int]]:
+    """Replace the live database with the uploaded one.
+
+    Checked first, the current state saved next; then copied in with the
+    backup API, page by page into the open database file, so connections that
+    other threads hold simply see the new content. Returns the path of the
+    saved previous state and the row counts of the restored one.
+    """
+    plain = _plain(data)
+    if not plain.startswith(SQLITE_MAGIC):
+        raise BackupError("Das ist keine mail2nas-Sicherung (keine SQLite-Datenbank).")
+    with tempfile.TemporaryDirectory(prefix="mail2nas-restore-") as tmp:
+        path = os.path.join(tmp, "restore.db")
+        Path(path).write_bytes(plain)
+        counts = _inspect(path)
+        saved = save_local(db_path, data_dir)
+        processed = _processed(db_path)
+        source = sqlite3.connect(path)
+        target = sqlite3.connect(db_path, timeout=30)
+        try:
+            source.backup(target)
+            # Mail processed since the backup was taken stays processed: an
+            # older configuration must not mean filing those mails again.
+            if processed:
+                target.execute(
+                    "CREATE TABLE IF NOT EXISTS processed_messages ("
+                    "message_id TEXT PRIMARY KEY, "
+                    "processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                )
+                target.executemany(
+                    "INSERT OR IGNORE INTO processed_messages (message_id, processed_at) "
+                    "VALUES (?, ?)",
+                    processed,
+                )
+                target.commit()
+        finally:
+            target.close()
+            source.close()
+    logger.warning("Database restored from an uploaded backup (previous state saved to %s)", saved)
+    return saved, counts
+
+
+def _processed(db_path: str) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        return conn.execute("SELECT message_id, processed_at FROM processed_messages").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+# --- automatic backups onto an archive ----------------------------------------
+
+
+@dataclass(frozen=True)
+class BackupSettings:
+    enabled: bool = False
+    archive: str = ""  # archive key, "" = the default archive
+    folder: str = "mail2nas-sicherung"
+    keep: int = 14
+
+
+def _key(name: str) -> str:
+    return f"backup.{name}"
+
+
+class BackupStore:
+    def __init__(self, settings):
+        self._settings = settings
+
+    def load(self) -> BackupSettings:
+        defaults = BackupSettings()
+        values = {}
+        for spec in fields(BackupSettings):
+            raw = self._settings.get(_key(spec.name))
+            if raw is None:
+                continue
+            default = getattr(defaults, spec.name)
+            if isinstance(default, bool):
+                values[spec.name] = raw == "1"
+            elif isinstance(default, int):
+                try:
+                    values[spec.name] = int(raw)
+                except ValueError:
+                    continue
+            else:
+                values[spec.name] = raw
+        return replace(defaults, **values)
+
+    def save(self, value: BackupSettings) -> None:
+        for spec in fields(BackupSettings):
+            item = getattr(value, spec.name)
+            if isinstance(item, bool):
+                item = "1" if item else "0"
+            self._settings.set(_key(spec.name), str(item))
+
+
+def validate(form, archive_keys) -> BackupSettings:
+    folder = (form.get("folder") or "").strip().replace("\\", "/")
+    if not folder:
+        raise BackupError("Bitte einen Ordner fuer die Sicherungen angeben.")
+    try:
+        folder = "/".join(safe_relative_parts(folder))
+    except ValueError as exc:
+        raise BackupError(f"Ordner: {exc}") from None
+    try:
+        keep = int((form.get("keep") or "").strip())
+    except ValueError:
+        raise BackupError("Die Anzahl muss eine ganze Zahl sein.") from None
+    if not KEEP_LIMITS[0] <= keep <= KEEP_LIMITS[1]:
+        raise BackupError(f"Es koennen {KEEP_LIMITS[0]} bis {KEEP_LIMITS[1]} Sicherungen "
+                          "aufbewahrt werden.")
+    archive = (form.get("archive") or "").strip()
+    if archive and archive not in set(archive_keys):
+        raise BackupError("Dieses Archiv gibt es nicht.")
+    return BackupSettings(enabled=bool(form.get("enabled")), archive=archive, folder=folder,
+                          keep=keep)
+
+
+@dataclass
+class BackupStatus:
+    ok: bool | None = None
+    detail: str = ""
+    last_run: float | None = None
+    failing_since: float | None = None
+
+
+def write_to_archive(runtime, settings: BackupSettings | None = None) -> str:
+    """Write one backup into the configured archive folder and rotate. Returns the path."""
+    settings = settings or BackupStore(runtime.settings).load()
+    storage = runtime.storages.get(settings.archive) if settings.archive else runtime.storages.default()
+    parts = safe_relative_parts(settings.folder)
+    path = storage.save_unique(parts, backup_name(), dump(runtime.config.state_db_path))
+    existing = sorted(
+        (entry for entry in storage.list_files(parts, max_depth=1)
+         if entry.name.startswith(PREFIX) and entry.name.endswith(SUFFIX)),
+        key=lambda entry: entry.name,
+    )
+    for stale in existing[:-settings.keep]:
+        storage.remove_file(stale.relative)
+        logger.info("Removed old backup %s", stale.relative)
+    return path
+
+
+class BackupScheduler:
+    """Runs the automatic backup once a day, from the supervisor."""
+
+    def __init__(self, runtime, clock=time.time):
+        self.runtime = runtime
+        self.store = BackupStore(runtime.settings)
+        self._clock = clock
+        self.status: BackupStatus = runtime.backup_status
+
+    def _last_success(self) -> float | None:
+        raw = self.runtime.settings.get("backup.last_success")
+        try:
+            return float(raw) if raw else None
+        except ValueError:
+            return None
+
+    def due(self) -> bool:
+        settings = self.store.load()
+        if not settings.enabled:
+            self.status.ok, self.status.detail, self.status.failing_since = None, "", None
+            return False
+        now = self._clock()
+        last = self._last_success()
+        if self.status.ok is False and self.status.last_run is not None:
+            return now - self.status.last_run >= RETRY_INTERVAL
+        return last is None or now - last >= BACKUP_INTERVAL
+
+    def run(self) -> str:
+        """Back up now. Raises on failure, after noting it in the status."""
+        now = self._clock()
+        self.status.last_run = now
+        try:
+            path = write_to_archive(self.runtime, self.store.load())
+        except Exception as exc:  # noqa: BLE001 - reported on the overview page and by mail
+            self.status.ok = False
+            self.status.detail = f"Sicherung fehlgeschlagen: {exc.__class__.__name__}: {exc}"
+            if self.status.failing_since is None:
+                self.status.failing_since = now
+            logger.error("Automatic backup failed: %s", exc)
+            raise
+        self.status.ok = True
+        self.status.detail = f"Letzte Sicherung: {path}"
+        self.status.failing_since = None
+        self.runtime.settings.set("backup.last_success", str(now))
+        self.runtime.settings.set("backup.last_path", path)
+        logger.info("Backup written to %s", path)
+        return path
+
+    def maybe_run(self) -> None:
+        if self.due():
+            try:
+                self.run()
+            except Exception:  # noqa: BLE001 - already reported
+                pass
+
+
+def last_success(settings) -> tuple[str, str]:
+    """(local time, path) of the last automatic backup, for the UI."""
+    raw = settings.get("backup.last_success")
+    try:
+        when = datetime.fromtimestamp(float(raw), tz=timezone.utc).astimezone() if raw else None
+    except ValueError:
+        when = None
+    return (when.strftime("%d.%m.%Y %H:%M") if when else "", settings.get("backup.last_path") or "")
+MAIL2NAS_EOF
+
+# --- mail2nas/notify.py ---
+cat > mail2nas/notify.py <<'MAIL2NAS_EOF'
+"""Mail to a person when something needs looking at.
+
+A mailbox that cannot log in, an archive that is not writable, a pickup
+folder that is gone, a backup that failed: all of that is on the overview
+page - which nobody watches. So mail2nas sends a mail, through an SMTP server
+set up in the web UI, to the addresses entered there.
+
+Two kinds of message:
+
+* **Problems that last.** A connection that fails once is normal (a server
+  restarting); one that has failed for longer than the configured delay is a
+  problem. That is reported once, and once more when it is over.
+* **Things that went wrong** with a document - a print job refused, a mail
+  that could not be processed. They come from the journal and are sent as one
+  summary at most every `DIGEST_INTERVAL`, so a printer that is off for a day
+  produces a handful of mails, not hundreds.
+
+Sending happens on a thread of its own: an SMTP server that does not answer
+must not hold up the supervisor.
+"""
+from __future__ import annotations
+
+import logging
+import queue
+import re
+import smtplib
+import ssl
+import threading
+import time
+from dataclasses import dataclass, fields, replace
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+
+from . import journal as j
+
+logger = logging.getLogger(__name__)
+
+SECURITY = {
+    "starttls": "STARTTLS (meist Port 587)",
+    "ssl": "SSL/TLS (meist Port 465)",
+    "none": "unverschluesselt (nur im eigenen Netz)",
+}
+DELAY_LIMITS = (0, 1_440)
+DIGEST_INTERVAL = 15 * 60
+MAX_DIGEST_LINES = 50
+SMTP_TIMEOUT = 30
+_ADDRESS = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$")
+
+
+class NotifyError(ValueError):
+    """The notification settings cannot be used."""
+
+
+@dataclass(frozen=True)
+class NotifySettings:
+    enabled: bool = False
+    recipients: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_security: str = "starttls"
+    smtp_user: str = ""
+    smtp_password: str = ""
+    sender: str = ""
+    # How long a connection problem has to last before it is reported.
+    delay_minutes: int = 30
+    on_connection: bool = True
+    on_failures: bool = True
+    on_recovery: bool = True
+
+    @property
+    def recipient_list(self) -> list[str]:
+        return split_addresses(self.recipients)
+
+    @property
+    def from_address(self) -> str:
+        return self.sender or self.smtp_user
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.enabled and self.smtp_host and self.recipient_list and self.from_address)
+
+
+def split_addresses(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,;\s]+", text or "") if part.strip()]
+
+
+def _key(name: str) -> str:
+    return f"notify.{name}"
+
+
+class NotifyStore:
+    """The notification settings, in the key/value settings table."""
+
+    def __init__(self, settings):
+        self._settings = settings
+
+    def load(self) -> NotifySettings:
+        defaults = NotifySettings()
+        values = {}
+        for spec in fields(NotifySettings):
+            raw = self._settings.get(_key(spec.name))
+            if raw is None:
+                continue
+            default = getattr(defaults, spec.name)
+            try:
+                if isinstance(default, bool):
+                    values[spec.name] = raw == "1"
+                elif isinstance(default, int):
+                    values[spec.name] = int(raw)
+                else:
+                    values[spec.name] = raw
+            except ValueError:
+                logger.warning("Stored notification setting %s=%r is unusable", spec.name, raw)
+        return replace(defaults, **values)
+
+    def save(self, value: NotifySettings) -> None:
+        for spec in fields(NotifySettings):
+            item = getattr(value, spec.name)
+            if isinstance(item, bool):
+                item = "1" if item else "0"
+            self._settings.set(_key(spec.name), str(item))
+
+
+def validate(form, current: NotifySettings) -> NotifySettings:
+    """The submitted form as settings. An empty password keeps the stored one."""
+    recipients = split_addresses(form.get("recipients", ""))
+    bad = [address for address in recipients if not _ADDRESS.match(address)]
+    if bad:
+        raise NotifyError(f"Keine gueltige Mailadresse: {', '.join(bad)}")
+    sender = (form.get("sender") or "").strip()
+    if sender and not _ADDRESS.match(sender):
+        raise NotifyError(f"Keine gueltige Absenderadresse: {sender}")
+    security = (form.get("smtp_security") or "starttls").strip()
+    if security not in SECURITY:
+        raise NotifyError("Unbekannte Verschluesselung.")
+    try:
+        port = int((form.get("smtp_port") or "").strip())
+    except ValueError:
+        raise NotifyError("Der SMTP-Port muss eine Zahl sein.") from None
+    if not 1 <= port <= 65535:
+        raise NotifyError("Der SMTP-Port muss zwischen 1 und 65535 liegen.")
+    try:
+        delay = int((form.get("delay_minutes") or "0").strip())
+    except ValueError:
+        raise NotifyError("Die Wartezeit muss eine ganze Zahl sein.") from None
+    if not DELAY_LIMITS[0] <= delay <= DELAY_LIMITS[1]:
+        raise NotifyError(
+            f"Die Wartezeit muss zwischen {DELAY_LIMITS[0]} und {DELAY_LIMITS[1]} Minuten liegen."
+        )
+    host = (form.get("smtp_host") or "").strip()
+    user = (form.get("smtp_user") or "").strip()
+    password = form.get("smtp_password") or ""
+    if not password and user == current.smtp_user:
+        password = current.smtp_password
+    value = NotifySettings(
+        enabled=bool(form.get("enabled")),
+        recipients=", ".join(recipients),
+        smtp_host=host,
+        smtp_port=port,
+        smtp_security=security,
+        smtp_user=user,
+        smtp_password=password,
+        sender=sender,
+        delay_minutes=delay,
+        on_connection=bool(form.get("on_connection")),
+        on_failures=bool(form.get("on_failures")),
+        on_recovery=bool(form.get("on_recovery")),
+    )
+    if value.enabled:
+        if not host:
+            raise NotifyError("Bitte einen SMTP-Server angeben.")
+        if not recipients:
+            raise NotifyError("Bitte mindestens eine Empfaengeradresse angeben.")
+        if not value.from_address or not _ADDRESS.match(value.from_address):
+            raise NotifyError(
+                "Bitte eine Absenderadresse angeben (oder einen Benutzer, der eine Mailadresse ist)."
+            )
+    return value
+
+
+def send_mail(settings: NotifySettings, subject: str, body: str,
+              timeout: int = SMTP_TIMEOUT, smtp_factory=None) -> None:
+    """Send one plain-text mail. Raises on any failure."""
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = settings.from_address
+    message["To"] = ", ".join(settings.recipient_list)
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid(domain="mail2nas.local")
+    message["Auto-Submitted"] = "auto-generated"
+    message.set_content(body)
+
+    context = ssl.create_default_context()
+    if smtp_factory is not None:
+        client = smtp_factory(settings)
+    elif settings.smtp_security == "ssl":
+        client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=timeout,
+                                  context=context)
+    else:
+        client = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=timeout)
+    try:
+        if settings.smtp_security == "starttls" and smtp_factory is None:
+            client.starttls(context=context)
+        if settings.smtp_user:
+            client.login(settings.smtp_user, settings.smtp_password)
+        client.send_message(message)
+    finally:
+        try:
+            client.quit()
+        except Exception:  # noqa: BLE001 - the mail is out, or the error is already known
+            pass
+
+
+@dataclass
+class _Problem:
+    label: str
+    detail: str
+    since: float
+    notified: bool = False
+
+
+class Notifier:
+    """Decides what is worth a mail; a background thread sends it."""
+
+    def __init__(self, runtime, sender=send_mail, clock=time.time):
+        self.runtime = runtime
+        self.store = NotifyStore(runtime.settings)
+        self._send = sender
+        self._clock = clock
+        self._problems: dict[str, _Problem] = {}
+        journal = getattr(runtime, "journal", None)
+        # Only what happens from now on; old failures were before our time.
+        self._last_journal_id = journal.last_id() if journal is not None else 0
+        self._pending: list[j.Entry] = []
+        self._last_digest = 0.0
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.last_sent: float | None = None
+        self.last_error: str = ""
+
+    # --- what is wrong right now --------------------------------------------
+
+    def current_problems(self) -> dict[str, tuple[str, str, float | None]]:
+        """key -> (label, detail, failing since or None)."""
+        runtime = self.runtime
+        found: dict[str, tuple[str, str, float | None]] = {}
+        archive = runtime.status.archive
+        # "No archive configured yet" is a setup step, not an outage.
+        if archive.ok is False and runtime.default_archive() is not None:
+            found["archive"] = ("Standard-Archiv", archive.detail, archive.failing_since)
+        names = {f"account:{a.id}": a.name for a in runtime.accounts.enabled()}
+        for key, row in runtime.status.workers().items():
+            if key in names and row.failing_since is not None:
+                found[key] = (f"Postfach {names[key]}", row.last_error, row.failing_since)
+        supervisor = getattr(runtime, "supervisor", None)
+        if supervisor is not None:
+            for pickup_id, text in supervisor.pickup_problems().items():
+                found[f"pickup:{pickup_id}"] = ("Abholordner", text, None)
+        backup = getattr(runtime, "backup_status", None)
+        if backup is not None and backup.ok is False:
+            found["backup"] = ("Automatische Sicherung", backup.detail, backup.failing_since)
+        return found
+
+    # --- one supervisor step ---------------------------------------------------
+
+    def evaluate(self) -> None:
+        settings = self.store.load()
+        now = self._clock()
+        current = self.current_problems()
+
+        for key, (label, detail, since) in current.items():
+            problem = self._problems.get(key)
+            if problem is None:
+                problem = self._problems[key] = _Problem(label, detail, since or now)
+            problem.detail = detail or problem.detail
+            if not problem.notified and now - problem.since >= settings.delay_minutes * 60:
+                problem.notified = True
+                if settings.on_connection:
+                    self._queue_mail(
+                        settings,
+                        f"mail2nas: {label} - Problem",
+                        f"{label} funktioniert seit {_minutes(now - problem.since)} nicht.\n\n"
+                        f"{problem.detail}\n\n"
+                        "Solange bleibt dort alles liegen; nichts geht verloren. Details in der "
+                        "Weboberflaeche unter Uebersicht und Protokoll.",
+                    )
+
+        for key in list(self._problems):
+            if key in current:
+                continue
+            problem = self._problems.pop(key)
+            if problem.notified and settings.on_connection and settings.on_recovery:
+                self._queue_mail(
+                    settings,
+                    f"mail2nas: {problem.label} - wieder in Ordnung",
+                    f"{problem.label} funktioniert wieder (Problem seit "
+                    f"{_minutes(now - problem.since)}). Was in der Zwischenzeit angekommen "
+                    "ist, wird jetzt verarbeitet.",
+                )
+
+        journal = getattr(self.runtime, "journal", None)
+        if journal is not None:
+            new = journal.entries(after_id=self._last_journal_id, problems_only=True,
+                                  limit=500, oldest_first=True)
+            if new:
+                self._last_journal_id = new[-1].id
+                if settings.on_failures:
+                    self._pending.extend(new)
+            if self._pending and now - self._last_digest >= DIGEST_INTERVAL:
+                self._queue_mail(settings, *self._digest(self._pending))
+                self._pending = []
+                self._last_digest = now
+
+    @staticmethod
+    def _digest(entries) -> tuple[str, str]:
+        lines = []
+        for entry in entries[:MAX_DIGEST_LINES]:
+            what = " - ".join(part for part in (entry.subject, entry.filename) if part)
+            lines.append(
+                f"{entry.local_at}  {entry.source}: {entry.action_label}"
+                + (f" ({what})" if what else "")
+                + (f"\n    {entry.detail}" if entry.detail else "")
+            )
+        if len(entries) > MAX_DIGEST_LINES:
+            lines.append(f"... und {len(entries) - MAX_DIGEST_LINES} weitere.")
+        subject = f"mail2nas: {len(entries)} Problem(e) bei der Verarbeitung"
+        body = (
+            "Bei der Verarbeitung ist Folgendes schiefgegangen:\n\n"
+            + "\n".join(lines)
+            + "\n\nDas vollstaendige Protokoll steht in der Weboberflaeche unter Protokoll."
+        )
+        return subject, body
+
+    # --- sending --------------------------------------------------------------
+
+    def _queue_mail(self, settings: NotifySettings, subject: str, body: str) -> None:
+        # Labels come from names typed in the UI; a line break in a header
+        # would make the mail unsendable (or worse).
+        subject = " ".join(subject.split())
+        if not settings.usable:
+            logger.info("Notification not sent (notifications are off): %s", subject)
+            return
+        with self._lock:
+            self._queue.put((settings, subject, body))
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._drain, name="mail2nas-notify",
+                                                daemon=True)
+                self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            # Under the lock, so a mail queued right now either is seen here
+            # or starts a new thread - never neither.
+            with self._lock:
+                try:
+                    settings, subject, body = self._queue.get_nowait()
+                except queue.Empty:
+                    self._thread = None
+                    return
+            try:
+                self._send(settings, subject, body)
+            except Exception as exc:  # noqa: BLE001 - report, never crash the thread
+                self.last_error = f"{exc.__class__.__name__}: {exc}"
+                logger.error("Could not send the notification %r: %s", subject, self.last_error)
+            else:
+                self.last_sent = self._clock()
+                self.last_error = ""
+                logger.info("Sent notification: %s", subject)
+
+    def flush(self, timeout: float = 10) -> None:
+        """Wait for queued mails to be sent (for tests)."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+
+def _minutes(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "weniger als einer Minute"
+    if minutes < 120:
+        return f"{minutes} Minute(n)"
+    return f"{minutes // 60} Stunde(n)"
+MAIL2NAS_EOF
+
 # --- mail2nas/archiver.py ---
 cat > mail2nas/archiver.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import email
+import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 from email.header import decode_header, make_header
 from email.message import Message
+from email.parser import BytesHeaderParser
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from imapclient import IMAPClient
@@ -5177,6 +6377,7 @@ from .accounts import Account
 from .addresses import AddressRule, AddressStore
 from .archives import StorageSet
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
+from . import journal as j
 from .mapping import Mapping, Rule
 from .options import Options
 from .printers import Printer
@@ -5206,6 +6407,15 @@ MAX_RECIPIENTS = 50
 # Seconds a single IMAP command may take. Without a timeout a server that
 # stops answering mid-session blocks the worker forever - no error, no retry.
 IMAP_TIMEOUT = 60
+# Asked for before the whole message: enough to recognise a mail that was
+# already processed, without downloading it again. PEEK, so asking does not
+# mark anything as read.
+HEADER_PART = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"
+# The processed-message list is pruned after the retention period. A mailbox
+# that also processes read mail must therefore never look back that far, or a
+# forgotten mail still sitting in the folder would be filed a second time. The
+# margin covers the time between a mail's arrival and its processing.
+SEEN_WINDOW_MARGIN_DAYS = 2
 
 
 def _decode(value: str | None) -> str:
@@ -5244,6 +6454,26 @@ def _message_id(msg: Message, uid: int, account_key: str) -> str:
     return f"{account_key}:" + (msg.get("Message-ID") or f"<no-message-id-uid-{uid}@mail2nas>")
 
 
+def part_key(index: int, payload: bytes) -> str:
+    """Identifies one attachment of a mail for the retry check: its position
+    and its content, so a different file at the same position never counts
+    as already done."""
+    return f"{index}:{hashlib.sha256(payload).hexdigest()[:20]}"
+
+
+def _header_part(entry: dict) -> bytes | None:
+    """The fetched Message-ID header, or None if the server did not send it.
+
+    Servers echo the section name in different spellings, so the key is
+    found by its prefix rather than by an exact match.
+    """
+    for key, value in entry.items():
+        name = key.decode("ascii", "replace") if isinstance(key, bytes) else str(key)
+        if name.upper().startswith("BODY[HEADER"):
+            return value or b""
+    return None
+
+
 @dataclass(frozen=True)
 class AttachmentPlan:
     """What is to happen with one attachment, decided before anything happens.
@@ -5274,6 +6504,7 @@ class Archiver:
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
+        journal=None,
     ):
         # `options` is an Options snapshot or a callable returning the current
         # one. The callable is what the service uses: the settings page takes
@@ -5289,6 +6520,15 @@ class Archiver:
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
+        # What happened to each attachment; also what makes a retry skip the
+        # attachments that were already filed or printed. Optional for tests.
+        self.journal = journal
+        # UIDs known to be processed in the current IMAP session, so a mailbox
+        # that also looks at read mail does not ask about them every cycle.
+        self._done_uids: set[int] = set()
+        # Failures already written to the journal in this session - a mail
+        # that keeps failing is recorded once, not on every retry.
+        self._reported: set[tuple[int, str]] = set()
 
     @property
     def options(self) -> Options:
@@ -5310,7 +6550,37 @@ class Archiver:
         )
         client.login(self.account.user, self.account.password)
         client.select_folder(self.account.folder)
+        # UIDs are only meaningful within one session (UIDVALIDITY).
+        self._done_uids.clear()
+        self._reported.clear()
         return client
+
+    @property
+    def source(self) -> str:
+        """How this mailbox is named in the journal."""
+        return f"Postfach {self.account.name}"
+
+    def _record(self, action: str, **fields) -> None:
+        if self.journal is not None:
+            self.journal.record(self.source, action, **fields)
+
+    def seen_since(self, today: date | None = None) -> date:
+        """The oldest arrival date considered when read mail is included."""
+        today = today or date.today()
+        retention = getattr(self.options, "retention_days", j.DEFAULT_RETENTION_DAYS)
+        earliest = today - timedelta(days=max(1, retention - SEEN_WINDOW_MARGIN_DAYS))
+        try:
+            wanted = date.fromisoformat(self.account.seen_since) if self.account.seen_since else today
+        except ValueError:
+            wanted = today
+        return max(wanted, earliest)
+
+    def search_criteria(self, today: date | None = None) -> list:
+        """What to ask the server for: unread mail, and - if the mailbox is set
+        to - read mail since the configured date as well."""
+        if not self.account.include_seen:
+            return ["UNSEEN"]
+        return ["OR", "UNSEEN", "SINCE", self.seen_since(today)]
 
     def _match(self, *texts: str) -> Rule | None:
         # Rules can be limited to a single mailbox, so the account has to be
@@ -5320,7 +6590,7 @@ class Archiver:
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
         self.mapping.reload()
-        uids = client.search(["UNSEEN"])
+        uids = [uid for uid in client.search(self.search_criteria()) if uid not in self._done_uids]
         if not uids:
             return 0
 
@@ -5329,16 +6599,46 @@ class Archiver:
             try:
                 if self._process_message(client, uid):
                     processed += 1
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to process message UID %s, leaving it for retry", uid)
+                reason = f"{exc.__class__.__name__}: {exc}"
+                if (uid, reason) not in self._reported:
+                    self._reported.add((uid, reason))
+                    self._record(
+                        j.FAILED,
+                        message_key=f"uid:{uid}",
+                        detail=f"Mail (UID {uid}) nicht verarbeitet, wird erneut versucht - {reason}",
+                    )
         return processed
+
+    def _already_processed(self, client: IMAPClient, uid: int, entry: dict) -> bool:
+        """Recognise a processed mail from its header alone.
+
+        Returns False when that is not possible (the server did not return the
+        header) - the full message is then fetched and checked as before.
+        """
+        header = _header_part(entry)
+        if header is None:
+            return False
+        parsed = BytesHeaderParser().parsebytes(header)
+        message_id = _message_id(parsed, uid, self.account.key)
+        if not self.store.is_processed(message_id):
+            return False
+        self._done_uids.add(uid)
+        flags = entry.get(b"FLAGS") or ()
+        if b"\\Seen" not in flags and not self.options.dry_run:
+            logger.info("UID %s (%s) already processed, marking seen", uid, message_id)
+            client.add_flags([uid], [b"\\Seen"])
+        return True
 
     def _process_message(self, client: IMAPClient, uid: int) -> bool:
         # Check the message size *before* pulling the full body into memory -
         # a hostile/broken sender could otherwise use an oversized message to
         # exhaust memory/disk on every poll cycle.
-        size_reply = client.fetch([uid], ["RFC822.SIZE"])
-        message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
+        head = client.fetch([uid], ["RFC822.SIZE", "FLAGS", HEADER_PART]).get(uid, {})
+        if self._already_processed(client, uid, head):
+            return False
+        message_size = head.get(b"RFC822.SIZE", 0)
         max_message_bytes = self.options.max_message_size_mb * 1024 * 1024
         if message_size and message_size > max_message_bytes:
             logger.warning(
@@ -5349,6 +6649,16 @@ class Archiver:
                 self.options.max_message_size_mb,
             )
             if not self.options.dry_run:
+                self._record(
+                    j.TOO_LARGE,
+                    message_key=f"uid:{uid}",
+                    detail=(
+                        f"Mail ist {message_size / (1024 * 1024):.1f} MB gross, erlaubt sind "
+                        f"{self.options.max_message_size_mb} MB - nicht verarbeitet"
+                        + (f", verschoben nach {self.account.oversized_folder}"
+                           if self.account.oversized_folder else "")
+                    ),
+                )
                 client.add_flags([uid], [b"\\Seen"])
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
@@ -5360,7 +6670,9 @@ class Archiver:
 
         if self.store.is_processed(message_id):
             logger.info("UID %s (%s) already processed, marking seen and skipping", uid, message_id)
-            client.add_flags([uid], [b"\\Seen"])
+            self._done_uids.add(uid)
+            if not self.options.dry_run:
+                client.add_flags([uid], [b"\\Seen"])
             return False
 
         subject = _decode(msg.get("Subject"))
@@ -5390,12 +6702,16 @@ class Archiver:
             attachments = attachments[: self.options.max_attachments_per_message]
 
         saved: list[str] = []
+        context = dict(message_key=message_id, subject=subject, sender=sender_addr)
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
+            if not self.options.dry_run:
+                self._record(j.NO_ATTACHMENTS, **context)
         else:
             date_prefix = self._date_prefix(msg)
             max_attachment_bytes = self.options.max_attachment_size_mb * 1024 * 1024
-            for filename, payload in attachments:
+            for index, (filename, payload) in enumerate(attachments):
+                shown = sanitize_filename(_decode(filename))
                 if len(payload) > max_attachment_bytes:
                     logger.warning(
                         "UID %s '%s': attachment '%s' is %.1f MB, exceeds "
@@ -5406,23 +6722,38 @@ class Archiver:
                         len(payload) / (1024 * 1024),
                         self.options.max_attachment_size_mb,
                     )
+                    if not self.options.dry_run:
+                        self._record(
+                            j.SKIPPED, filename=shown, **context,
+                            detail=(f"Anhang ist {len(payload) / (1024 * 1024):.1f} MB gross, "
+                                    f"erlaubt sind {self.options.max_attachment_size_mb} MB"),
+                        )
                     continue
 
+                part = part_key(index, payload)
                 plan = self._plan_attachment(filename, mail_rule, address_rule)
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
+                item = dict(context, part_key=part, filename=shown)
+
+                # A retry of a mail that failed half-way: what already happened
+                # to this attachment is not done a second time.
+                already_filed = self._done(message_id, part, j.FILED_ACTIONS)
+                already_printed = self._done(message_id, part, (j.PRINTED,))
 
                 if plan.archive:
-                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                    if already_filed:
+                        logger.info("UID %s: attachment '%s' was already filed, skipping",
+                                    uid, filename)
+                    else:
+                        self._file(plan, out_name, payload, uid, subject, filename, saved, item)
 
                 # Printing comes after filing, deliberately: the share is the
                 # archive and paper is the copy, so a printer that is offline
                 # or out of paper must never be the reason an attachment was
                 # not stored.
-                printed = False
-                if plan.printer is not None:
-                    printed = self.printing.send(
-                        plan.printer, payload, out_name, job_title(subject, filename)
-                    )
+                printed = already_printed
+                if plan.printer is not None and not already_printed:
+                    printed = self._print(plan, payload, out_name, subject, filename, item)
 
                 if not plan.archive and not printed:
                     # "Print only" and yet nothing came out - no printer, a
@@ -5436,7 +6767,8 @@ class Archiver:
                         subject,
                         filename,
                     )
-                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                    if not already_filed:
+                        self._file(plan, out_name, payload, uid, subject, filename, saved, item)
                 elif not plan.archive:
                     logger.info(
                         "UID %s '%s': attachment '%s' printed, not archived (%s)",
@@ -5450,19 +6782,55 @@ class Archiver:
 
         if not self.options.dry_run:
             self.store.mark_processed(message_id)
+            self._done_uids.add(uid)
             client.add_flags([uid], [b"\\Seen"])
             if self.account.processed_folder:
                 client.move([uid], self.account.processed_folder)
         return True
 
-    def _file(self, plan, out_name, payload, uid, subject, filename, saved) -> None:
+    def _done(self, message_key: str, part: str, actions) -> bool:
+        if self.journal is None or self.options.dry_run:
+            return False
+        try:
+            return self.journal.done(message_key, part, actions)
+        except Exception:  # noqa: BLE001 - better a duplicate than a lost attachment
+            logger.exception("Could not read the journal - processing the attachment again")
+            return False
+
+    def _print(self, plan, payload, out_name, subject, filename, item) -> bool:
+        # The spooler knows about the test mode itself and only logs then.
+        printed = self.printing.send(plan.printer, payload, out_name, job_title(subject, filename))
+        if self.options.dry_run:
+            self._record(j.DRY_RUN, target=plan.printer.label(), detail="wuerde gedruckt", **item)
+        elif printed:
+            self._record(j.PRINTED, target=plan.printer.label(), **item)
+        else:
+            self._record(
+                j.NOT_PRINTED, target=plan.printer.label(), **item,
+                detail="Druckauftrag nicht angenommen oder Dateityp nicht druckbar - "
+                       "Details im Protokoll",
+            )
+        return printed
+
+    def _file(self, plan, out_name, payload, uid, subject, filename, saved, item=None) -> None:
         target_parts = self._target_parts(plan.folder)
         storage = self.storage_for(plan.archive_key)
         if self.options.dry_run:
             logger.info("[dry-run] would save %s -> %s", out_name, storage.display(target_parts))
+            self._record(j.DRY_RUN, target=storage.display(target_parts, out_name),
+                         detail="wuerde abgelegt", **(item or {}))
             return
         out_path = storage.save_unique(target_parts, out_name, payload)
         saved.append(out_path)
+        self._record(
+            j.QUARANTINED if plan.quarantined else j.FILED,
+            target=out_path,
+            detail=("gesperrte Dateiendung" if plan.quarantined
+                    else f"Stichwort {plan.keyword}" if plan.keyword
+                    else f"Adresse {plan.address.name}" if plan.address is not None
+                    else "kein Treffer - Fallback-Ordner"),
+            **(item or {}),
+        )
         logger.info(
             "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
             uid,
@@ -5685,6 +7053,7 @@ import logging
 import time
 from datetime import datetime
 
+from . import journal as j
 from .filenames import extension_of, sanitize_filename
 from .pickups import MAX_DEPTH, Pickup, PickupStore
 from .printing import job_title
@@ -5707,6 +7076,7 @@ class PickupRunner:
         storages,
         pickups: PickupStore,
         printing=None,
+        journal=None,
     ):
         # Options snapshot or a callable returning the current one, like the
         # archiver: quarantine list, folders and waiting time are all live.
@@ -5715,9 +7085,12 @@ class PickupRunner:
         self.storages = storages
         self.pickups = pickups
         self.printing = printing
+        self.journal = journal
         # Remembers the last problem reported per folder, so one that stays
         # unreachable is logged once instead of on every cycle.
         self._reported: dict[int, str] = {}
+        # Files whose failure is already in the journal (once, not per cycle).
+        self._failed: set[tuple[int, str, str]] = set()
 
     @property
     def options(self):
@@ -5797,12 +7170,17 @@ class PickupRunner:
             try:
                 if self._file_one(pickup, source, target, entry):
                     filed += 1
-            except Exception:  # noqa: BLE001 - leave it in place and try again later
+            except Exception as exc:  # noqa: BLE001 - leave it in place and try again later
                 logger.exception(
                     "Pickup %s: could not file %s, leaving it in place",
                     pickup.name,
                     entry.relative,
                 )
+                reason = f"{exc.__class__.__name__}: {exc}"
+                if (pickup.id, entry.relative, reason) not in self._failed:
+                    self._failed.add((pickup.id, entry.relative, reason))
+                    self._record(pickup, j.FAILED, entry,
+                                 detail=f"nicht abgeholt, wird erneut versucht - {reason}")
         return filed
 
     # --- one document ---------------------------------------------------------
@@ -5841,9 +7219,15 @@ class PickupRunner:
         # (nor leave the scan in the folder to be printed again next cycle).
         printer = self._printer_for(pickup, quarantined)
         if printer is not None:
-            self.printing.send(
+            printed = self.printing.send(
                 printer, source.read_bytes(entry.relative), entry.name,
                 job_title(pickup.name, entry.name),
+            )
+            self._record(
+                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
+                target=printer.label(),
+                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
+                                          "druckbar - Details im Protokoll",
             )
 
         if source is target:
@@ -5854,6 +7238,13 @@ class PickupRunner:
             out_path = target.save_unique(parts, out_name, source.read_bytes(entry.relative))
             source.remove_file(entry.relative)
 
+        self._record(
+            pickup, j.QUARANTINED if quarantined else j.FILED, entry, target=out_path,
+            detail=("gesperrte Dateiendung" if quarantined
+                    else "fester Zielordner" if pickup.has_fixed_target
+                    else f"Stichwort {rule.keyword}" if rule is not None
+                    else "kein Treffer - Fallback-Ordner"),
+        )
         logger.info(
             "Pickup %s: '%s' matched '%s'%s -> %s",
             pickup.name,
@@ -5863,6 +7254,13 @@ class PickupRunner:
             out_path,
         )
         return True
+
+    def _record(self, pickup: Pickup, action: str, entry, **fields) -> None:
+        if self.journal is not None:
+            self.journal.record(
+                f"Abholordner {pickup.name}", action, filename=entry.name,
+                message_key=f"pickup:{pickup.id}:{entry.relative}", **fields,
+            )
 
     def _printer_for(self, pickup: Pickup, quarantined: bool):
         if self.printing is None or not self.options.printing_enabled:
@@ -5928,12 +7326,14 @@ to the internet without a TLS-terminating reverse proxy in front.
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import os
 import secrets
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 
@@ -5966,6 +7366,17 @@ from .mapping import (
 )
 from .addresses import AddressError
 from .migrate import SETTING_RULES_NOTE
+from . import backup
+from .journal import LEVELS as LOG_LEVELS, cutoff
+from .notify import (
+    DELAY_LIMITS,
+    DIGEST_INTERVAL,
+    SECURITY,
+    NotifyError,
+    NotifyStore,
+    send_mail,
+)
+from .notify import validate as validate_notify
 from .options import FILENAME_PREFIXES, LIMITS, OptionsError
 from .options import validate as validate_options
 from .archives import ArchiveError
@@ -5981,6 +7392,8 @@ SETTING_SECRET_KEY = "web_secret_key"
 SETTING_SESSION_VERSION = "web_session_version"
 
 MIN_PASSWORD_LENGTH = 8
+LOG_PAGE_SIZE = 100
+CSV_LIMIT = 100_000
 SESSION_HOURS = 12
 
 # Login throttling. Single-password auth is only as good as the number of
@@ -6054,7 +7467,8 @@ BASE_TEMPLATE = """
   td.keyword { font-weight: 600; overflow-wrap: break-word; min-width: 9rem; }
   .table-wrap { overflow-x: auto; }
   input, select, button { font: inherit; color: inherit; }
-  input[type=text], input[type=password], select {
+  input[type=text], input[type=password], input[type=date], input[type=email],
+  input[type=file], select {
     background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
     padding: .4rem .5rem; width: 100%; max-width: 22rem; }
   button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
@@ -6094,6 +7508,13 @@ BASE_TEMPLATE = """
   code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
          padding: 0 .25rem; font-size: .85em; }
   a { color: var(--accent); }
+  .tabs { display: flex; gap: 1rem; margin-bottom: .8rem; }
+  .tabs a { text-decoration: none; padding-bottom: .2rem; }
+  .tabs a.active { border-bottom: 2px solid var(--accent); font-weight: 600; }
+  table.log td { font-size: .85rem; vertical-align: top; }
+  td.when { white-space: nowrap; color: var(--muted); }
+  td.detail { overflow-wrap: anywhere; }
+  .pager { display: flex; gap: 1rem; align-items: center; margin-top: .6rem; }
 </style>
 </head>
 <body>
@@ -6106,6 +7527,8 @@ BASE_TEMPLATE = """
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
       <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
       <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
+      <a href="{{ url_for('log_page') }}">Protokoll</a> &middot;
+      <a href="{{ url_for('backup_page') }}">Sicherung</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -6370,7 +7793,8 @@ CONFIG_BODY = """
       <td>{{ account.user }}<br><span class="hint">{{ account.host }}:{{ account.port }}{%
         if not account.ssl %} &middot; ohne TLS{% endif %}</span></td>
       <td>{{ account.folder }}</td>
-      <td>{{ account.mode }}</td>
+      <td>{{ account.mode }}{% if account.include_seen %}<br>
+        <span class="hint">auch gelesene ab {{ account.seen_since }}</span>{% endif %}</td>
       <td>{% if account.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('edit_account', account_id=account.id) }}">Bearbeiten</a>
@@ -6526,6 +7950,20 @@ CONFIG_BODY = """
     <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">Benachrichtigungen</h2>
+  {% if notify.enabled %}
+  <p style="margin-top:0">Aktiv - Mails gehen an <strong>{{ notify.recipients }}</strong>
+  (ueber {{ notify.smtp_host }}).</p>
+  {% else %}
+  <p class="hint" style="margin-top:0">Aus. Eingerichtet schickt mail2nas eine Mail, wenn ein
+  Postfach, Archiv, Abholordner oder die Sicherung laenger nicht funktioniert oder beim
+  Verarbeiten etwas schiefgeht.</p>
+  {% endif %}
+  <p style="margin-bottom:0"><a href="{{ url_for('notifications_page') }}">
+    <button type="button">Benachrichtigungen einrichten</button></a></p>
+</div>
+
 <p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
 Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
 <a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
@@ -6596,6 +8034,23 @@ ACCOUNT_BODY = """
       <label><input type="checkbox" name="enabled" value="1"
         {% if not account or account.enabled %}checked{% endif %}> Postfach aktiv</label>
     </p>
+
+    <h2>Bereits gelesene Mails</h2>
+    <div class="row">
+      <p style="margin:.2rem 0"><label><input type="checkbox" name="include_seen" value="1"
+        {% if account and account.include_seen %}checked{% endif %}>
+        Auch bereits gelesene Mails verarbeiten</label></p>
+      <div class="field">
+        <label for="seen_since">Angekommen ab</label>
+        <input id="seen_since" name="seen_since" type="date"
+               value="{{ account.seen_since if account and account.seen_since else today }}">
+      </div>
+    </div>
+    <p class="hint">Normalerweise holt mail2nas nur ungelesene Mails. Mit Haken auch die,
+    die jemand schon geoeffnet hat - etwa in Outlook, bevor mail2nas an der Reihe war.
+    Jede Mail wird trotzdem nur einmal verarbeitet. Beruecksichtigt werden Mails ab dem
+    Datum, hoechstens so weit zurueck, wie das Protokoll aufbewahrt wird
+    ({{ retention_days }} Tage, unter Einstellungen).</p>
 
     {% if printers %}
     <input type="hidden" name="print_fields" value="1">
@@ -7153,6 +8608,22 @@ OVERVIEW_BODY = """
             <span class="hint">({{ row.last_error_at }})</span>{% endif %}</td>
     </tr>
     {% endfor %}
+    {% if backup_status.ok is not none %}
+    <tr>
+      <td class="keyword">Automatische Sicherung</td>
+      <td>{% if backup_status.ok %}<span class="state-ok">ok</span>
+          {% else %}<span class="state-bad">Fehler</span>{% endif %}</td>
+      <td>{{ backup_status.detail }}</td>
+    </tr>
+    {% endif %}
+    {% if recent_problems %}
+    <tr>
+      <td class="keyword">Verarbeitung</td>
+      <td><span class="state-bad">{{ recent_problems }} Problem(e)</span></td>
+      <td>in den letzten 24 Stunden -
+        <a href="{{ url_for('log_page', problems=1) }}">im Protokoll ansehen</a></td>
+    </tr>
+    {% endif %}
     {% for problem in pickup_problems %}
     <tr><td class="keyword">Abholordner</td><td><span class="state-bad">Problem</span></td>
       <td>{{ problem }}</td></tr>
@@ -7166,7 +8637,7 @@ OVERVIEW_BODY = """
   gelesen markiert, nur protokolliert.</p>
   {% endif %}
   <p class="hint" style="margin-bottom:0">Stand {{ now }} &middot; laeuft seit {{ started }}.
-  Details stehen im Container-Log (<code>docker compose logs -f</code>).</p>
+  Was mit jeder Mail passiert ist, steht im <a href="{{ url_for('log_page') }}">Protokoll</a>.</p>
 </div>
 
 <div class="card">
@@ -7287,6 +8758,20 @@ SETTINGS_BODY = """
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">Protokoll</h2>
+    <div class="field">
+      <label for="retention_days">Protokoll aufbewahren (Tage)</label>
+      <input id="retention_days" name="retention_days" type="number"
+             value="{{ o.retention_days }}" min="{{ limits.retention_days[0] }}"
+             max="{{ limits.retention_days[1] }}">
+    </div>
+    <p class="hint" style="margin-bottom:0">So lange bleiben das Verarbeitungsprotokoll (was
+    mit welchem Anhang passiert ist), das Dienstprotokoll und die Liste der verarbeiteten
+    Mails erhalten - Standard 183 Tage, also ein halbes Jahr. Aeltere Eintraege werden
+    einmal taeglich geloescht; die abgelegten Dateien selbst bleiben natuerlich.</p>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">Testmodus</h2>
     <p style="margin-top:0"><label><input type="checkbox" name="dry_run" value="1"
       {% if o.dry_run %}checked{% endif %}> Nur protokollieren - nichts ablegen, nichts
@@ -7299,6 +8784,285 @@ SETTINGS_BODY = """
   <button type="submit">Einstellungen speichern</button>
   <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
 </form>
+"""
+
+LOG_BODY = """
+<div class="tabs">
+  <a href="{{ url_for('log_page') }}" class="{{ 'active' if view == 'journal' }}">Verarbeitung</a>
+  <a href="{{ url_for('log_page', view='log') }}" class="{{ 'active' if view == 'log' }}">Dienstprotokoll</a>
+</div>
+
+{% if view == 'journal' %}
+<div class="card">
+  <form method="get" class="row">
+    <div class="field">
+      <label for="q">Suche (Betreff, Absender, Datei, Ziel)</label>
+      <input id="q" name="q" type="text" value="{{ q }}">
+    </div>
+    <div class="field">
+      <label for="source">Quelle</label>
+      <select id="source" name="source">
+        <option value="">alle</option>
+        {% for name in sources %}
+          <option value="{{ name }}" {% if name == selected_source %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <p style="margin:0 0 .45rem"><label><input type="checkbox" name="problems" value="1"
+      {% if problems %}checked{% endif %}> nur Probleme</label></p>
+    <button type="submit">Filtern</button>
+    <a href="{{ url_for('export_journal', q=q or None, source=selected_source or None, problems=1 if problems else None) }}">
+      <button class="secondary" type="button">Als CSV herunterladen</button></a>
+  </form>
+</div>
+
+<div class="card">
+  {% if entries %}
+  <div class="table-wrap">
+  <table class="log">
+    <tr><th>Zeit</th><th>Quelle</th><th>Was</th><th>Mail / Datei</th><th>Ziel / Details</th></tr>
+    {% for e in entries %}
+    <tr>
+      <td class="when">{{ e.local_at }}</td>
+      <td>{{ e.source }}</td>
+      <td>{% if e.failed %}<span class="state-bad">{{ e.action_label }}</span>
+          {% elif e.action == 'quarantaene' %}<span class="state-wait">{{ e.action_label }}</span>
+          {% else %}{{ e.action_label }}{% endif %}</td>
+      <td class="detail">{% if e.subject %}{{ e.subject }}{% endif %}
+        {% if e.sender %}<br><span class="hint">{{ e.sender }}</span>{% endif %}
+        {% if e.filename %}<br><strong>{{ e.filename }}</strong>{% endif %}</td>
+      <td class="detail">{% if e.target %}{{ e.target }}{% endif %}
+        {% if e.detail %}<br><span class="hint">{{ e.detail }}</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Keine Eintraege{% if q or selected_source or problems %} fuer diesen Filter{% endif %}.</p>
+  {% endif %}
+  {{ pager }}
+</div>
+{% else %}
+<div class="card">
+  <form method="get" class="row">
+    <input type="hidden" name="view" value="log">
+    <div class="field">
+      <label for="q">Suche</label>
+      <input id="q" name="q" type="text" value="{{ q }}">
+    </div>
+    <div class="field">
+      <label for="level">Mindestens</label>
+      <select id="level" name="level">
+        {% for name in levels %}
+          <option value="{{ name }}" {% if name == level %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit">Filtern</button>
+  </form>
+</div>
+
+<div class="card">
+  {% if lines %}
+  <div class="table-wrap">
+  <table class="log">
+    <tr><th>Zeit</th><th>Stufe</th><th>Meldung</th></tr>
+    {% for line in lines %}
+    <tr>
+      <td class="when">{{ line.local_at }}</td>
+      <td>{% if line.level in ('ERROR', 'CRITICAL') %}<span class="state-bad">{{ line.level }}</span>
+          {% elif line.level == 'WARNING' %}<span class="state-wait">{{ line.level }}</span>
+          {% else %}{{ line.level }}{% endif %}</td>
+      <td class="detail">{{ line.message }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">Keine Eintraege.</p>
+  {% endif %}
+  {{ pager }}
+</div>
+{% endif %}
+<p class="hint">Aufbewahrt werden {{ retention_days }} Tage (einstellbar unter
+<a href="{{ url_for('settings_page') }}">Einstellungen</a>). Vollstaendige Fehlermeldungen
+mit Stacktrace stehen zusaetzlich im Container-Log (<code>docker compose logs</code>).</p>
+"""
+
+PAGER = """
+{% if pages > 1 %}
+<div class="pager">
+  {% if page > 1 %}<a href="{{ prev_url }}">&larr; neuer</a>{% endif %}
+  <span class="hint">Seite {{ page }} von {{ pages }} &middot; {{ total }} Eintraege</span>
+  {% if page < pages %}<a href="{{ next_url }}">aelter &rarr;</a>{% endif %}
+</div>
+{% elif total %}
+<p class="hint" style="margin-bottom:0">{{ total }} Eintraege</p>
+{% endif %}
+"""
+
+BACKUP_BODY = """
+<div class="card">
+  <h2 style="margin-top:0">Sicherung herunterladen</h2>
+  <p style="margin-top:0">Die komplette Konfiguration in einer Datei: Postfaecher, Archive,
+  Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Benachrichtigungen,
+  Passwort der Oberflaeche und das Protokoll.</p>
+  <p><a href="{{ url_for('download_backup') }}"><button type="button">Jetzt sichern und
+    herunterladen</button></a></p>
+  <p class="hint" style="margin-bottom:0"><strong>Die Datei enthaelt die Passwoerter der
+  Postfaecher und NAS-Freigaben im Klartext</strong> - so sicher aufbewahren wie diese.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Automatische Sicherung aufs NAS</h2>
+  <form method="post" action="{{ url_for('backup_settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="margin-top:0"><label><input type="checkbox" name="enabled" value="1"
+      {% if b.enabled %}checked{% endif %}> Taeglich sichern</label></p>
+    <div class="row">
+      {% if archives %}
+      <div class="field">
+        <label for="archive">Archiv</label>
+        <select id="archive" name="archive">
+          <option value="">Standard-Archiv</option>
+          {% for entry in archives %}
+            <option value="{{ entry.key }}" {% if b.archive == entry.key %}selected{% endif %}>{{ entry.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label for="folder">Ordner</label>
+        <input id="folder" name="folder" type="text" value="{{ b.folder }}">
+      </div>
+      <div class="field">
+        <label for="keep">Anzahl aufbewahren</label>
+        <input id="keep" name="keep" type="number" value="{{ b.keep }}" min="{{ keep_limits[0] }}"
+               max="{{ keep_limits[1] }}">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.8rem">
+      <button type="submit">Speichern</button>
+    </div>
+  </form>
+  <form method="post" action="{{ url_for('backup_now') }}" style="margin-top:.6rem">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Jetzt aufs NAS sichern</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">
+    {% if last_when %}Letzte automatische Sicherung: {{ last_when }} &middot; {{ last_path }}<br>{% endif %}
+    {% if status.ok is sameas false %}<span class="state-bad">{{ status.detail }}</span><br>{% endif %}
+    Einmal am Tag wird eine Datei <code>mail2nas-sicherung-DATUM.db.gz</code> in den Ordner
+    geschrieben; aeltere ueber die Anzahl hinaus werden geloescht. Der Ordner sollte nur fuer
+    Berechtigte lesbar sein. Bei einem Fehler wird stuendlich neu versucht (und, falls
+    eingerichtet, per Mail benachrichtigt).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Wiederherstellen</h2>
+  <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="backup_file">Sicherungsdatei (.db.gz oder .db)</label>
+        <input id="backup_file" name="backup_file" type="file" accept=".gz,.db" required>
+      </div>
+    </div>
+    <p><label><input type="checkbox" name="confirm" value="1" required> Ja, die aktuelle
+      Konfiguration komplett durch die Sicherung ersetzen</label></p>
+    <button class="danger" type="submit">Wiederherstellen</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">Ersetzt alles - auch das Passwort der Oberflaeche:
+  danach gilt das aus der Sicherung. Der bisherige Stand wird vorher im Container unter
+  <code>/data/backups</code> abgelegt (die letzten {{ local_keep }}). Die Postfaecher
+  verbinden sich danach innerhalb weniger Sekunden neu; ein Neustart ist nicht noetig.
+  {% if local_backups %}<br>Vorhandene Sicherungen vor Wiederherstellungen:
+  {% for name in local_backups %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}</p>
+</div>
+"""
+
+NOTIFY_BODY = """
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="card">
+    <h2 style="margin-top:0">Benachrichtigungen per Mail</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="enabled" value="1"
+      {% if n.enabled %}checked{% endif %}> Benachrichtigungen senden</label></p>
+    <div class="field">
+      <label for="recipients">Empfaenger (mehrere mit Komma trennen)</label>
+      <input id="recipients" name="recipients" type="text" style="max-width:100%"
+             value="{{ n.recipients }}" placeholder="it@firma.de, chef@firma.de">
+    </div>
+    <h2>Wann</h2>
+    <p style="margin:.2rem 0"><label><input type="checkbox" name="on_connection" value="1"
+      {% if n.on_connection %}checked{% endif %}> Postfach, Archiv, Abholordner oder Sicherung
+      funktioniert nicht</label></p>
+    <div class="field" style="margin:.4rem 0 .4rem 1.6rem">
+      <label for="delay_minutes">... seit mindestens (Minuten)</label>
+      <input id="delay_minutes" name="delay_minutes" type="number" value="{{ n.delay_minutes }}"
+             min="{{ delay_limits[0] }}" max="{{ delay_limits[1] }}">
+    </div>
+    <p style="margin:.2rem 0 .2rem 1.6rem"><label><input type="checkbox" name="on_recovery"
+      value="1" {% if n.on_recovery %}checked{% endif %}> Entwarnung, wenn es wieder geht</label></p>
+    <p style="margin:.2rem 0"><label><input type="checkbox" name="on_failures" value="1"
+      {% if n.on_failures %}checked{% endif %}> Probleme bei der Verarbeitung (Druck
+      fehlgeschlagen, Mail oder Anhang zu gross, Mail nicht verarbeitbar)</label></p>
+    <p class="hint" style="margin-bottom:0">Verarbeitungsprobleme werden gesammelt und
+    hoechstens alle {{ digest_minutes }} Minuten als eine Mail verschickt.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Postausgangsserver (SMTP)</h2>
+    <div class="row">
+      <div class="field">
+        <label for="smtp_host">Server</label>
+        <input id="smtp_host" name="smtp_host" type="text" value="{{ n.smtp_host }}"
+               placeholder="smtp.example.com">
+      </div>
+      <div class="field">
+        <label for="smtp_port">Port</label>
+        <input id="smtp_port" name="smtp_port" type="text" value="{{ n.smtp_port }}">
+      </div>
+      <div class="field">
+        <label for="smtp_security">Verschluesselung</label>
+        <select id="smtp_security" name="smtp_security">
+          {% for value, text in security.items() %}
+            <option value="{{ value }}" {% if n.smtp_security == value %}selected{% endif %}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div class="field">
+        <label for="smtp_user">Benutzer (leer = ohne Anmeldung)</label>
+        <input id="smtp_user" name="smtp_user" type="text" value="{{ n.smtp_user }}">
+      </div>
+      <div class="field">
+        <label for="smtp_password">Passwort</label>
+        <input id="smtp_password" name="smtp_password" type="password" autocomplete="new-password"
+               {% if n.smtp_password %}placeholder="unveraendert lassen: leer"{% endif %}>
+      </div>
+      <div class="field">
+        <label for="sender">Absender (leer = Benutzer)</label>
+        <input id="sender" name="sender" type="text" value="{{ n.sender }}"
+               placeholder="mail2nas@firma.de">
+      </div>
+    </div>
+  </div>
+  <button type="submit">Speichern</button>
+  <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
+</form>
+
+<div class="card" style="margin-top:1rem">
+  <h2 style="margin-top:0">Testmail</h2>
+  <form method="post" action="{{ url_for('test_notification') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Testmail an die Empfaenger senden</button>
+  </form>
+  <p class="hint" style="margin-bottom:0">Verwendet die gespeicherten Einstellungen - vorher
+  speichern. {% if last_sent %}Zuletzt gesendet: {{ last_sent }}.{% endif %}
+  {% if last_error %}<br><span class="state-bad">Letzter Fehler: {{ last_error }}</span>{% endif %}</p>
+</div>
 """
 
 PASSWORD_BODY = """
@@ -7325,6 +9089,12 @@ PASSWORD_BODY = """
   <code>docker compose exec mail2nas python -m mail2nas.cli reset-password</code></p>
 </div>
 """
+
+
+def _csv_cell(value: str) -> str:
+    """Subjects and file names come from strangers' mail: a cell starting
+    with "=" would be a formula to Excel. A leading apostrophe keeps it text."""
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
 
 
 def test_imap(account, timeout: int = 20) -> int:
@@ -7761,6 +9531,7 @@ def create_app(runtime) -> Flask:
             pickups=_pickup_rows(),
             pickup_interval=PICKUP_INTERVAL,
             printing_enabled=runtime.options.printing_enabled,
+            notify=NotifyStore(settings).load(),
         )
 
     # --- general settings ----------------------------------------------------
@@ -7865,6 +9636,9 @@ def create_app(runtime) -> Flask:
             pickup_problems=problems,
             ready=runtime.status.archive.ok,
             dry_run=runtime.options.dry_run,
+            backup_status=runtime.backup_status,
+            recent_problems=runtime.journal.count(problems_only=True, since=cutoff(1))
+            if runtime.journal is not None else 0,
             initial_password=read_initial_password(config.data_dir) is not None,
             now=_when(time.time()),
             started=_when(runtime.status.started_at),
@@ -7925,6 +9699,30 @@ def create_app(runtime) -> Flask:
             "processed_folder": request.form.get("processed_folder", ""),
             "oversized_folder": request.form.get("oversized_folder", ""),
             "enabled": bool(request.form.get("enabled")),
+            **_seen_fields(account),
+        }
+
+    def _seen_fields(account) -> dict:
+        """The "also read mail" part of the account form."""
+        if "seen_since" not in request.form and account is not None:
+            # A form without the field (an older page, a script): unchanged.
+            return {"include_seen": account.include_seen, "seen_since": account.seen_since}
+        include = bool(request.form.get("include_seen"))
+        since = request.form.get("seen_since", "").strip()
+        if since:
+            try:
+                since = date.fromisoformat(since).isoformat()
+            except ValueError:
+                raise MappingError("Bitte ein gueltiges Datum angeben (JJJJ-MM-TT).") from None
+            if since > date.today().isoformat():
+                raise MappingError("Das Datum fuer gelesene Mails liegt in der Zukunft.")
+        return {"include_seen": include, "seen_since": since}
+
+    def _account_context() -> dict:
+        return {
+            **_printer_context(),
+            "today": date.today().isoformat(),
+            "retention_days": runtime.options.retention_days,
         }
 
     @app.route("/config/accounts/new", methods=["GET", "POST"])
@@ -7941,7 +9739,7 @@ def create_app(runtime) -> Flask:
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
-        return render(ACCOUNT_BODY, "Postfach", account=None, **_printer_context())
+        return render(ACCOUNT_BODY, "Postfach", account=None, **_account_context())
 
     @app.route("/config/accounts/<int:account_id>", methods=["GET", "POST"])
     @login_required
@@ -7963,7 +9761,7 @@ def create_app(runtime) -> Flask:
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
             account = runtime.accounts.get(account_id)
-        return render(ACCOUNT_BODY, "Postfach", account=account, **_printer_context())
+        return render(ACCOUNT_BODY, "Postfach", account=account, **_account_context())
 
     @app.post("/config/accounts/<int:account_id>/delete")
     @login_required
@@ -8466,6 +10264,283 @@ def create_app(runtime) -> Flask:
         )
         return redirect(url_for("config_page"))
 
+    # --- log -------------------------------------------------------------------
+
+    def _page_number() -> int:
+        try:
+            return max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            return 1
+
+    def _pager(page: int, total: int, endpoint: str, **args) -> Markup:
+        args = {key: value for key, value in args.items() if value}
+        pages = max(1, -(-total // LOG_PAGE_SIZE))
+        return Markup(render_template_string(
+            PAGER,
+            page=page,
+            pages=pages,
+            total=total,
+            prev_url=url_for(endpoint, page=page - 1, **args),
+            next_url=url_for(endpoint, page=page + 1, **args),
+        ))
+
+    def _journal_filter() -> dict:
+        return {
+            "search": request.args.get("q", "").strip()[:200],
+            "source": request.args.get("source", "").strip()[:200],
+            "problems_only": bool(request.args.get("problems")),
+        }
+
+    @app.get("/log")
+    @login_required
+    def log_page():
+        view = "log" if request.args.get("view") == "log" else "journal"
+        page = _page_number()
+        offset = (page - 1) * LOG_PAGE_SIZE
+        context = {"view": view, "retention_days": runtime.options.retention_days}
+        if view == "journal":
+            wanted = _journal_filter()
+            journal = runtime.journal
+            total = journal.count(**wanted) if journal else 0
+            context.update(
+                entries=journal.entries(limit=LOG_PAGE_SIZE, offset=offset, **wanted)
+                if journal else [],
+                sources=journal.sources() if journal else [],
+                q=wanted["search"],
+                # Not "source": that is render_template_string's own argument.
+                selected_source=wanted["source"],
+                problems=wanted["problems_only"],
+                pager=_pager(page, total, "log_page", q=wanted["search"],
+                             source=wanted["source"],
+                             problems=1 if wanted["problems_only"] else None),
+            )
+        else:
+            q = request.args.get("q", "").strip()[:200]
+            level = request.args.get("level", "INFO")
+            if level not in LOG_LEVELS:
+                level = "INFO"
+            logs = runtime.logs
+            total = logs.count(min_level=level, search=q) if logs else 0
+            context.update(
+                lines=logs.entries(min_level=level, search=q, limit=LOG_PAGE_SIZE,
+                                   offset=offset) if logs else [],
+                q=q,
+                level=level,
+                levels=[name for name in LOG_LEVELS if name != "CRITICAL"],
+                pager=_pager(page, total, "log_page", view="log", q=q,
+                             level=level if level != "INFO" else None),
+            )
+        return render(LOG_BODY, "Protokoll", **context)
+
+    @app.get("/log/export.csv")
+    @login_required
+    def export_journal():
+        wanted = _journal_filter()
+        buffer = io.StringIO()
+        # Semicolons and a BOM: what a German Excel opens without asking.
+        buffer.write("﻿")
+        writer = csv.writer(buffer, delimiter=";")
+        writer.writerow(["Zeit", "Quelle", "Aktion", "Betreff", "Absender", "Datei", "Ziel",
+                         "Details"])
+        if runtime.journal is not None:
+            for e in runtime.journal.entries(limit=CSV_LIMIT, **wanted):
+                writer.writerow([_csv_cell(value) for value in (
+                    e.local_at, e.source, e.action_label, e.subject, e.sender,
+                    e.filename, e.target, e.detail)])
+        name = f"mail2nas-protokoll-{datetime.now().strftime('%Y-%m-%d')}.csv"
+        return (
+            buffer.getvalue().encode("utf-8"),
+            200,
+            {
+                "Content-Type": "text/csv; charset=utf-8",
+                "Content-Disposition": f'attachment; filename="{name}"',
+            },
+        )
+
+    # --- backup ------------------------------------------------------------------
+
+    @app.get("/backup")
+    @login_required
+    def backup_page():
+        when, path = backup.last_success(settings)
+        folder = os.path.join(config.data_dir, backup.LOCAL_DIR)
+        try:
+            local = sorted(
+                (name for name in os.listdir(folder) if name.endswith(backup.SUFFIX)),
+                reverse=True,
+            )
+        except OSError:
+            local = []
+        return render(
+            BACKUP_BODY,
+            "Sicherung",
+            b=backup.BackupStore(settings).load(),
+            archives=_archives(),
+            keep_limits=backup.KEEP_LIMITS,
+            status=runtime.backup_status,
+            last_when=when,
+            last_path=path,
+            local_backups=local,
+            local_keep=backup.LOCAL_KEEP,
+        )
+
+    @app.get("/backup/download")
+    @login_required
+    def download_backup():
+        try:
+            data = backup.dump(config.state_db_path)
+        except Exception as exc:  # noqa: BLE001 - report in the UI
+            logger.exception("Web UI: backup download failed")
+            flash(f"Sicherung fehlgeschlagen: {exc}", "error")
+            return redirect(url_for("backup_page"))
+        logger.info("Web UI: backup downloaded (%d bytes)", len(data))
+        return (
+            data,
+            200,
+            {
+                "Content-Type": "application/gzip",
+                "Content-Disposition": f'attachment; filename="{backup.backup_name()}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/backup/settings")
+    @login_required
+    def backup_settings():
+        require_csrf()
+        try:
+            value = backup.validate(request.form, [a.key for a in _archives()])
+        except backup.BackupError as exc:
+            flash(str(exc), "error")
+        else:
+            backup.BackupStore(settings).save(value)
+            logger.info("Web UI: backup settings saved (enabled=%s)", value.enabled)
+            flash("Gespeichert." + (" Die erste Sicherung folgt in wenigen Sekunden."
+                                    if value.enabled else ""), "ok")
+            _changed()
+        return redirect(url_for("backup_page"))
+
+    @app.post("/backup/now")
+    @login_required
+    def backup_now():
+        require_csrf()
+        if runtime.default_archive() is None:
+            flash("Erst ein Archiv einrichten - dorthin wird gesichert.", "error")
+            return redirect(url_for("backup_page"))
+        try:
+            path = backup.BackupScheduler(runtime).run()
+        except Exception as exc:  # noqa: BLE001 - report in the UI
+            flash(f"Sicherung fehlgeschlagen: {exc}", "error")
+        else:
+            flash(f"Gesichert nach {path}.", "ok")
+        return redirect(url_for("backup_page"))
+
+    @app.post("/backup/restore")
+    @login_required
+    def restore_backup():
+        # The only request that may be large; everything else keeps the
+        # small global limit.
+        request.max_content_length = backup.MAX_UPLOAD
+        require_csrf()
+        upload = request.files.get("backup_file")
+        if not request.form.get("confirm"):
+            flash("Bitte bestaetigen, dass die Konfiguration ersetzt werden soll.", "error")
+            return redirect(url_for("backup_page"))
+        if upload is None or not upload.filename:
+            flash("Bitte eine Sicherungsdatei auswaehlen.", "error")
+            return redirect(url_for("backup_page"))
+        current_hash = settings.get(SETTING_PASSWORD_HASH)
+        try:
+            saved, counts = backup.restore(config.state_db_path, upload.read(), config.data_dir)
+        except backup.BackupError as exc:
+            flash(f"Nicht wiederhergestellt: {exc}", "error")
+            return redirect(url_for("backup_page"))
+        runtime.after_restore()
+        restored_hash = settings.get(SETTING_PASSWORD_HASH)
+        if not restored_hash and current_hash:
+            settings.set(SETTING_PASSWORD_HASH, current_hash)
+            restored_hash = current_hash
+        # Sessions stay signed with the key this process started with.
+        settings.set(SETTING_SECRET_KEY, app.config["SECRET_KEY"])
+        initial = read_initial_password(config.data_dir)
+        if initial is not None and not (
+            restored_hash and check_password_hash(restored_hash, initial)
+        ):
+            path = initial_password_path(config.data_dir)
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        session["auth_version"] = session_version()
+        logger.warning("Web UI: configuration restored from %s", upload.filename)
+        flash(
+            "Wiederhergestellt: "
+            f"{counts.get('imap_accounts', 0)} Postfach/Postfaecher, "
+            f"{counts.get('archives', 0)} Archiv(e), {counts.get('mapping_rules', 0)} "
+            f"Zuordnung(en), {counts.get('printers', 0)} Drucker. Ab jetzt gilt das Passwort "
+            f"aus der Sicherung. Der vorherige Stand liegt in {saved}.",
+            "ok",
+        )
+        return redirect(url_for("overview_page"))
+
+    # --- notifications -------------------------------------------------------------
+
+    @app.route("/config/notifications", methods=["GET", "POST"])
+    @login_required
+    def notifications_page():
+        store = NotifyStore(settings)
+        current = store.load()
+        shown = current
+        if request.method == "POST":
+            require_csrf()
+            try:
+                value = validate_notify(request.form, current)
+            except NotifyError as exc:
+                flash(str(exc), "error")
+                shown = current
+            else:
+                store.save(value)
+                logger.info("Web UI: notification settings saved (enabled=%s)", value.enabled)
+                flash("Benachrichtigungen gespeichert.", "ok")
+                return redirect(url_for("notifications_page"))
+        notifier = getattr(runtime, "notifier", None)
+        return render(
+            NOTIFY_BODY,
+            "Benachrichtigungen",
+            n=shown,
+            security=SECURITY,
+            delay_limits=DELAY_LIMITS,
+            digest_minutes=DIGEST_INTERVAL // 60,
+            last_sent=_when(notifier.last_sent) if notifier and notifier.last_sent else "",
+            last_error=notifier.last_error if notifier else "",
+        )
+
+    @app.post("/config/notifications/test")
+    @login_required
+    def test_notification():
+        require_csrf()
+        value = NotifyStore(settings).load()
+        if not value.smtp_host or not value.recipient_list or not value.from_address:
+            flash("Bitte zuerst Server, Absender und Empfaenger speichern.", "error")
+            return redirect(url_for("notifications_page"))
+        try:
+            send_mail(
+                value,
+                "mail2nas: Testmail",
+                "Diese Mail kommt von mail2nas. Die Benachrichtigungen sind richtig "
+                "eingerichtet.\n\nSie wurde ueber die Weboberflaeche ausgeloest "
+                f"({datetime.now().strftime('%d.%m.%Y %H:%M')}).",
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 - report every failure in the UI
+            logger.info("Web UI: test notification failed: %s", exc)
+            flash(f"Senden fehlgeschlagen: {exc.__class__.__name__}: {exc}", "error")
+        else:
+            logger.info("Web UI: test notification sent to %s", value.recipients)
+            flash(f"Testmail an {value.recipients} gesendet.", "ok")
+        return redirect(url_for("notifications_page"))
+
     @app.route("/password", methods=["GET", "POST"])
     @login_required
     def password_page():
@@ -8638,12 +10713,16 @@ import time
 
 from .accounts import AccountStore
 from .addresses import AddressStore
+from . import journal as journal_module
 from .archiver import Archiver
 from .archives import ArchiveStore
+from .backup import BackupScheduler
 from .config import Config
+from .journal import DatabaseLogHandler, Journal, LogStore
 from .legacy import LegacyEnv
 from .mapping import RuleStore
 from .migrate import migrate_rule_file, rules_settled, seed_from_legacy
+from .notify import Notifier
 from .pickups import PICKUP_INTERVAL, PickupStore
 from .printers import PrinterStore
 from .runtime import Runtime
@@ -8663,6 +10742,8 @@ ARCHIVE_RETRY = 60
 IDLE_SLICE = 5
 # RFC 2177: re-issue IDLE before 29 minutes, or the server may drop us.
 MAX_IDLE = 29 * 60
+# How often old journal and log entries are pruned.
+MAINTENANCE_INTERVAL = 24 * 60 * 60
 
 
 def build_runtime(config: Config, environ=None) -> Runtime:
@@ -8681,6 +10762,8 @@ def build_runtime(config: Config, environ=None) -> Runtime:
         addresses=AddressStore(config.state_db_path),
         archives=ArchiveStore(config.state_db_path),
         pickups=PickupStore(config.state_db_path),
+        journal=Journal(config.state_db_path),
+        logs=LogStore(config.state_db_path),
     )
     seed_from_legacy(runtime, LegacyEnv.from_environ(environ))
     return runtime
@@ -8695,6 +10778,8 @@ def main() -> None:
 
     config = Config.from_env()
     runtime = build_runtime(config)
+    # From here on the log is also kept in the database, for the log page.
+    logging.getLogger("mail2nas").addHandler(DatabaseLogHandler(runtime.logs))
 
     if os.environ.get("WEB_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
         # The web UI is the only place left to configure anything, so it
@@ -8779,6 +10864,7 @@ class _Worker:
             self.account,
             runtime.printing,
             runtime.addresses,
+            journal=runtime.journal,
         )
         status = runtime.status
         label = f"{self.account.name} <{self.account.user}>"
@@ -8902,12 +10988,17 @@ class Supervisor:
                 runtime.storages,
                 runtime.pickups,
                 printing=runtime.printing,
+                journal=runtime.journal,
             )
             if runtime.pickups is not None
             else None
         )
         self._next_pickup = 0.0
         self._was_ready: bool | None = None
+        self.notifier = Notifier(runtime)
+        runtime.notifier = self.notifier
+        self.backups = BackupScheduler(runtime)
+        self._next_maintenance = 0.0
 
     # --- readiness -------------------------------------------------------------
 
@@ -8918,6 +11009,7 @@ class Supervisor:
         archive = runtime.default_archive()
         if archive is None:
             status.ok, status.detail, status.fingerprint = False, "Kein Archiv eingerichtet.", ()
+            status.failing_since = None
             return False
 
         fingerprint = (archive.id, *archive.fingerprint())
@@ -8935,10 +11027,13 @@ class Supervisor:
             if isinstance(exc, KeyboardInterrupt):
                 raise
             status.ok, status.detail = False, str(exc) or exc.__class__.__name__
+            if status.failing_since is None:
+                status.failing_since = status.checked_at
             logger.error("Archive %r is not usable: %s", archive.name, status.detail)
             return False
 
         status.ok = True
+        status.failing_since = None
         status.detail = f"{archive.location()} ist erreichbar und beschreibbar."
         if archive.backend == "local" and not os.path.ismount(archive.path):
             # Not fatal - a directory on the container's own disk is a valid
@@ -8978,11 +11073,15 @@ class Supervisor:
                 )
             self._was_ready = ready
 
+        self._maintenance()
+        self._notify()
+
         if not ready:
             self.stop_all()
             return
 
         reconcile(runtime, self.workers, self._factory)
+        self.backups.maybe_run()
 
         # Folders are walked on their own schedule: the supervisor wakes up
         # every few seconds to notice UI changes, which is far more often than
@@ -8996,6 +11095,26 @@ class Supervisor:
             except Exception:  # noqa: BLE001 - never let this stop the supervisor
                 logger.exception("Pickup cycle failed")
             self._next_pickup = time.monotonic() + PICKUP_INTERVAL
+
+    def _maintenance(self) -> None:
+        """Once a day: forget what is older than the retention period."""
+        if time.monotonic() < self._next_maintenance:
+            return
+        self._next_maintenance = time.monotonic() + MAINTENANCE_INTERVAL
+        days = self.runtime.options.retention_days
+        try:
+            removed = journal_module.prune(self.runtime, days)
+        except Exception:  # noqa: BLE001 - never let this stop the supervisor
+            logger.exception("Pruning the journal failed")
+            return
+        if any(removed.values()):
+            logger.info("Removed entries older than %d days: %s", days, removed)
+
+    def _notify(self) -> None:
+        try:
+            self.notifier.evaluate()
+        except Exception:  # noqa: BLE001 - notifications are a convenience
+            logger.exception("Checking for notifications failed")
 
     def pickup_problems(self) -> dict[int, str]:
         return self._pickup.problems() if self._pickup is not None else {}
@@ -12522,6 +14641,302 @@ def test_a_failing_mailbox_test_says_why(client, env, monkeypatch):
         "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
 
     assert "AUTHENTICATIONFAILED" in response.get_data(as_text=True)
+
+
+# --- read mail per mailbox ------------------------------------------------------
+
+
+def _account_form(**overrides):
+    form = {
+        "name": "Buchhaltung", "host": "imap.example.com", "port": "993", "ssl": "1",
+        "user": "u", "password": "geheim", "folder": "INBOX", "mode": "poll",
+        "processed_folder": "", "oversized_folder": "", "enabled": "1",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_an_account_can_include_read_mail(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/accounts/new", data={
+        **_account_form(include_seen="1", seen_since="2026-01-15"),
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    (account,) = runtime.accounts.all()
+    assert account.include_seen and account.seen_since == "2026-01-15"
+    assert "auch gelesene ab 2026-01-15" in client.get("/config").get_data(as_text=True)
+
+
+def test_a_bad_read_mail_date_is_refused(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/accounts/new", data={
+        **_account_form(include_seen="1", seen_since="2999-01-01"),
+        "csrf_token": _csrf(client, "/config/accounts/new")})
+
+    assert "Zukunft" in response.get_data(as_text=True)
+    assert runtime.accounts.all() == []
+
+
+def test_an_account_form_without_the_new_fields_keeps_them(client, env):
+    _, _, _, _, runtime = env
+    account_id = runtime.accounts.add(name="A", host="h", user="u", password="p",
+                                      include_seen=True, seen_since="2026-02-01")
+    _login(client)
+
+    client.post(f"/config/accounts/{account_id}", data={
+        **_account_form(), "csrf_token": _csrf(client, f"/config/accounts/{account_id}")})
+
+    assert runtime.accounts.get(account_id).include_seen
+
+
+# --- retention ------------------------------------------------------------------
+
+
+def test_the_retention_can_be_set(client, env):
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/settings", data={
+        **_settings_form(retention_days="365"), "csrf_token": _csrf(client, "/settings")})
+    assert runtime.options.retention_days == 365
+
+    response = client.post("/settings", data={
+        **_settings_form(retention_days="5"), "csrf_token": _csrf(client, "/settings")})
+    assert "zwischen" in response.get_data(as_text=True) or runtime.options.retention_days == 365
+    assert runtime.options.retention_days == 365
+
+
+# --- the log page ------------------------------------------------------------------
+
+
+def test_the_log_page_shows_the_journal_and_filters_it(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FILED, subject="Rechnung 4711", filename="r.pdf",
+                           target="/nas/rechnungen/r.pdf")
+    runtime.journal.record("Postfach A", j.NOT_PRINTED, subject="Lieferschein <b>",
+                           filename="l.pdf", detail="Drucker aus")
+    _login(client)
+
+    page = client.get("/log").get_data(as_text=True)
+    assert "Rechnung 4711" in page and "Drucker aus" in page
+    assert "Lieferschein &lt;b&gt;" in page
+
+    problems = client.get("/log?problems=1").get_data(as_text=True)
+    assert "Drucker aus" in problems and "Rechnung 4711" not in problems
+
+    found = client.get("/log?q=4711").get_data(as_text=True)
+    assert "Rechnung 4711" in found and "Drucker aus" not in found
+
+
+def test_the_log_page_pages(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    for number in range(130):
+        runtime.journal.record("A", j.FILED, subject=f"Mail {number}")
+    _login(client)
+
+    first = client.get("/log").get_data(as_text=True)
+    second = client.get("/log?page=2").get_data(as_text=True)
+
+    assert "Mail 129" in first and "Mail 0<" not in first
+    assert "Seite 2 von 2" in second and "Mail 0" in second
+
+
+def test_the_service_log_is_shown(client, env):
+    _, _, _, _, runtime = env
+    runtime.logs.add("WARNING", "mail2nas.archiver", "Drucker antwortet nicht")
+    runtime.logs.add("INFO", "mail2nas.archiver", "alles gut")
+    _login(client)
+
+    page = client.get("/log?view=log&level=WARNING").get_data(as_text=True)
+
+    assert "Drucker antwortet nicht" in page and "alles gut" not in page
+
+
+def test_the_journal_can_be_exported_as_csv(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FILED, subject="Rechnung; 1", filename="r.pdf")
+    runtime.journal.record("Postfach A", j.FILED, subject="=HYPERLINK(\"http://x\")")
+    _login(client)
+
+    response = client.get("/log/export.csv")
+
+    assert response.headers["Content-Type"].startswith("text/csv")
+    text = response.get_data().decode("utf-8-sig")
+    assert text.splitlines()[0].startswith("Zeit;Quelle;Aktion")
+    assert '"Rechnung; 1"' in text
+    assert "'=HYPERLINK" in text
+
+
+def test_the_log_needs_a_login(client):
+    assert client.get("/log").status_code == 302
+    assert client.get("/log/export.csv").status_code == 302
+    assert client.get("/backup/download").status_code == 302
+
+
+# --- backup and restore ---------------------------------------------------------------
+
+
+def test_a_backup_can_be_downloaded_and_restored(client, env):
+    import io
+
+    from mail2nas import backup
+
+    _, _, _, _, runtime = env
+    runtime.accounts.add(name="Original", host="h", user="u", password="p")
+    _login(client)
+
+    response = client.get("/backup/download")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["Content-Disposition"]
+    data = response.get_data()
+    assert backup.check(data)["imap_accounts"] == 1
+
+    runtime.accounts.add(name="Spaeter", host="h", user="u", password="p")
+    response = client.post("/backup/restore", data={
+        "confirm": "1",
+        "backup_file": (io.BytesIO(data), "sicherung.db.gz"),
+        "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert "Wiederhergestellt" in response.get_data(as_text=True)
+    assert [a.name for a in runtime.accounts.all()] == ["Original"]
+    # Still logged in afterwards.
+    assert client.get("/overview").status_code == 200
+
+
+def test_a_restore_needs_confirmation_and_a_real_backup(client, env):
+    import io
+
+    _, _, _, _, runtime = env
+    runtime.accounts.add(name="Bleibt", host="h", user="u", password="p")
+    _login(client)
+
+    response = client.post("/backup/restore", data={
+        "backup_file": (io.BytesIO(b"x"), "a.db"), "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert "bestaetigen" in response.get_data(as_text=True)
+
+    response = client.post("/backup/restore", data={
+        "confirm": "1", "backup_file": (io.BytesIO(b"kein backup"), "a.db"),
+        "csrf_token": _csrf(client, "/backup"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert "Nicht wiederhergestellt" in response.get_data(as_text=True)
+    assert [a.name for a in runtime.accounts.all()] == ["Bleibt"]
+
+
+def test_automatic_backups_can_be_set_up_and_run(client, env, tmp_path):
+    from mail2nas import backup
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/backup/settings", data={
+        "enabled": "1", "folder": "sicherung", "keep": "3",
+        "csrf_token": _csrf(client, "/backup")})
+    assert backup.BackupStore(runtime.settings).load().keep == 3
+
+    response = client.post("/backup/now", data={"csrf_token": _csrf(client, "/backup")},
+                           follow_redirects=True)
+    assert "Gesichert nach" in response.get_data(as_text=True)
+    assert any((tmp_path / "sicherung").glob("mail2nas-sicherung-*.db.gz"))
+
+
+# --- notifications -----------------------------------------------------------------------
+
+
+def _notify_form(**overrides):
+    form = {
+        "enabled": "1", "recipients": "it@firma.de", "smtp_host": "smtp.firma.de",
+        "smtp_port": "587", "smtp_security": "starttls", "smtp_user": "m@firma.de",
+        "smtp_password": "geheim", "sender": "", "delay_minutes": "30",
+        "on_connection": "1", "on_failures": "1", "on_recovery": "1",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_notifications_are_configured_in_the_ui(client, env):
+    from mail2nas.notify import NotifyStore
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    value = NotifyStore(runtime.settings).load()
+    assert value.enabled and value.recipients == "it@firma.de"
+    page = client.get("/config/notifications").get_data(as_text=True)
+    assert "geheim" not in page
+    assert "it@firma.de" in client.get("/config").get_data(as_text=True)
+
+
+def test_invalid_notification_settings_are_refused(client, env):
+    from mail2nas.notify import NotifyStore
+
+    _, _, _, _, runtime = env
+    _login(client)
+
+    response = client.post("/config/notifications", data={
+        **_notify_form(recipients="kaputt"), "csrf_token": _csrf(client, "/config/notifications")})
+
+    assert "Keine gueltige Mailadresse" in response.get_data(as_text=True)
+    assert not NotifyStore(runtime.settings).load().enabled
+
+
+def test_a_test_mail_can_be_sent(client, env, monkeypatch):
+    from mail2nas import web
+
+    sent = []
+    monkeypatch.setattr(web, "send_mail", lambda settings, subject, body, timeout: sent.append(subject))
+    _login(client)
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    response = client.post("/config/notifications/test", data={
+        "csrf_token": _csrf(client, "/config/notifications")}, follow_redirects=True)
+
+    assert sent == ["mail2nas: Testmail"]
+    assert "Testmail an it@firma.de gesendet" in response.get_data(as_text=True)
+
+
+def test_a_failing_test_mail_is_reported(client, env, monkeypatch):
+    from mail2nas import web
+
+    def broken(*args, **kwargs):
+        raise OSError("Verbindung abgelehnt")
+
+    monkeypatch.setattr(web, "send_mail", broken)
+    _login(client)
+    client.post("/config/notifications", data={
+        **_notify_form(), "csrf_token": _csrf(client, "/config/notifications")})
+
+    response = client.post("/config/notifications/test", data={
+        "csrf_token": _csrf(client, "/config/notifications")}, follow_redirects=True)
+
+    assert "Verbindung abgelehnt" in response.get_data(as_text=True)
+
+
+def test_the_overview_mentions_recent_problems(client, env):
+    from mail2nas import journal as j
+
+    _, _, _, _, runtime = env
+    runtime.journal.record("Postfach A", j.FAILED, detail="kaputt")
+    _login(client)
+
+    page = client.get("/overview").get_data(as_text=True)
+
+    assert "1 Problem(e)" in page
 MAIL2NAS_EOF
 
 # --- tests/test_accounts.py ---
@@ -14807,6 +17222,864 @@ def test_nothing_to_switch_is_reported_as_such(container, monkeypatch):
     _make_runtime(container, with_archive=False)
 
     assert _archive_to_smb(monkeypatch, SMB) == 2
+MAIL2NAS_EOF
+
+# --- tests/test_journal.py ---
+cat > tests/test_journal.py <<'MAIL2NAS_EOF'
+"""The processing journal, the stored log, pruning - and what the archiver
+does with them: retries without duplicates, read mail per mailbox."""
+from __future__ import annotations
+
+import logging
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
+
+from mail2nas import journal as j
+from mail2nas.accounts import AccountStore
+from mail2nas.archiver import HEADER_PART
+from mail2nas.journal import DatabaseLogHandler, Journal, LogStore
+from mail2nas.state import ProcessedStore
+from mail2nas.storage import LocalStorage
+from tests.test_archiver import (
+    FakeIMAPClient,
+    _account,
+    _build_message,
+    _make_archiver,
+    _make_printing,
+    _make_runtime,
+)
+
+
+def _journal(tmp_path) -> Journal:
+    return Journal(str(tmp_path / "state.db"))
+
+
+# --- the journal itself -----------------------------------------------------------
+
+
+def test_journal_records_and_filters(tmp_path):
+    journal = _journal(tmp_path)
+    journal.record("Postfach A", j.FILED, subject="Rechnung 1", filename="r.pdf", target="/x/r.pdf")
+    journal.record("Postfach B", j.NOT_PRINTED, subject="Lieferschein", filename="l.pdf")
+
+    assert journal.count() == 2
+    assert [e.subject for e in journal.entries()] == ["Lieferschein", "Rechnung 1"]
+    assert [e.source for e in journal.entries(problems_only=True)] == ["Postfach B"]
+    assert [e.filename for e in journal.entries(search="rechn")] == ["r.pdf"]
+    assert journal.count(source="Postfach A") == 1
+    assert journal.sources() == ["Postfach A", "Postfach B"]
+
+
+def test_journal_search_treats_wildcards_literally(tmp_path):
+    journal = _journal(tmp_path)
+    journal.record("A", j.FILED, subject="100% sicher")
+    journal.record("A", j.FILED, subject="1000 sicher")
+
+    assert [e.subject for e in journal.entries(search="100%")] == ["100% sicher"]
+
+
+def test_journal_knows_what_was_done_to_an_attachment(tmp_path):
+    journal = _journal(tmp_path)
+    journal.record("A", j.FILED, message_key="1:<m@x>", part_key="0:abc")
+
+    assert journal.done("1:<m@x>", "0:abc", j.FILED_ACTIONS)
+    assert not journal.done("1:<m@x>", "0:abc", (j.PRINTED,))
+    assert not journal.done("1:<m@x>", "1:abc", j.FILED_ACTIONS)
+    assert not journal.done("", "", j.FILED_ACTIONS)
+
+
+def test_entries_after_an_id_come_oldest_first(tmp_path):
+    journal = _journal(tmp_path)
+    first = journal.last_id()
+    journal.record("A", j.FAILED, detail="eins")
+    journal.record("A", j.FILED, detail="ok")
+    journal.record("A", j.NOT_PRINTED, detail="zwei")
+
+    new = journal.entries(after_id=first, problems_only=True, oldest_first=True)
+    assert [e.detail for e in new] == ["eins", "zwei"]
+
+
+def test_long_values_are_clipped(tmp_path):
+    journal = _journal(tmp_path)
+    journal.record("A", j.FAILED, detail="x" * 10_000)
+
+    assert len(journal.entries()[0].detail) == j.MAX_MESSAGE
+
+
+# --- the stored log -------------------------------------------------------------------
+
+
+def test_log_handler_keeps_only_our_own_records(tmp_path):
+    store = LogStore(str(tmp_path / "state.db"))
+    handler = DatabaseLogHandler(store)
+    ours = logging.getLogger("mail2nas.test_journal")
+    theirs = logging.getLogger("smbprotocol.test_journal")
+    for logger in (ours, theirs):
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    try:
+        ours.info("abgelegt %s", "a.pdf")
+        ours.debug("zu viel Detail")
+        theirs.warning("fremd")
+        try:
+            raise ValueError("kaputt")
+        except ValueError:
+            ours.exception("Fehler beim Abholen")
+    finally:
+        for logger in (ours, theirs):
+            logger.removeHandler(handler)
+
+    messages = [line.message for line in store.entries()]
+    assert messages == ["Fehler beim Abholen - ValueError: kaputt", "abgelegt a.pdf"]
+    assert [line.message for line in store.entries(min_level="ERROR")] == [messages[0]]
+    assert store.count(search="abgelegt") == 1
+
+
+# --- pruning -----------------------------------------------------------------------------
+
+
+def test_prune_removes_old_entries_everywhere(tmp_path):
+    runtime = _make_runtime(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d %H:%M:%S")
+    runtime.journal.record("A", j.FILED, detail="neu")
+    runtime.logs.add("INFO", "mail2nas", "neu")
+    runtime.logs.add("INFO", "mail2nas", "alt", at=old)
+    runtime.store.mark_processed("1:<neu@x>")
+    with sqlite3.connect(runtime.config.state_db_path) as conn:
+        conn.execute(
+            "INSERT INTO journal (at, source, action, detail) VALUES (?, 'A', ?, 'alt')",
+            (old, j.FILED),
+        )
+        conn.execute(
+            "INSERT INTO processed_messages (message_id, processed_at) VALUES ('1:<alt@x>', ?)",
+            (old,),
+        )
+
+    removed = j.prune(runtime, 183)
+
+    assert removed == {"journal": 1, "log": 1, "processed": 1}
+    assert [e.detail for e in runtime.journal.entries()] == ["neu"]
+    assert runtime.store.is_processed("1:<neu@x>")
+    assert not runtime.store.is_processed("1:<alt@x>")
+
+
+def test_supervisor_prunes_with_the_configured_retention(tmp_path):
+    from dataclasses import replace
+
+    from mail2nas.main import Supervisor
+
+    runtime = _make_runtime(tmp_path)
+    runtime.set_options(replace(runtime.options, retention_days=30))
+    old = (datetime.now(timezone.utc) - timedelta(days=40)).strftime("%Y-%m-%d %H:%M:%S")
+    runtime.logs.add("INFO", "mail2nas", "alt", at=old)
+
+    Supervisor(runtime, factory=lambda account: None)._maintenance()
+
+    assert "alt" not in [line.message for line in runtime.logs.entries()]
+
+
+# --- the archiver writes the journal ---------------------------------------------------
+
+
+def _archiver_with_journal(tmp_path, **kwargs):
+    archiver = _make_archiver(tmp_path, **kwargs)
+    archiver.journal = _journal(tmp_path)
+    return archiver
+
+
+def test_filed_and_quarantined_attachments_are_journaled(tmp_path):
+    archiver = _archiver_with_journal(tmp_path, mapping_content="RE: rechnungen\n")
+    raw = _build_message("RE-1", [("Rechnung.pdf", b"PDF"), ("virus.exe", b"MZ")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    entries = {e.filename: e for e in archiver.journal.entries()}
+    assert entries["Rechnung.pdf"].action == j.FILED
+    assert entries["Rechnung.pdf"].source == "Postfach Test"
+    assert entries["Rechnung.pdf"].subject == "RE-1"
+    assert entries["Rechnung.pdf"].detail == "Stichwort RE"
+    assert "rechnungen" in entries["Rechnung.pdf"].target
+    assert entries["virus.exe"].action == j.QUARANTINED
+
+
+def test_mail_without_attachments_is_journaled(tmp_path):
+    archiver = _archiver_with_journal(tmp_path)
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=_build_message("Hallo", [])), 1)
+
+    assert [e.action for e in archiver.journal.entries()] == [j.NO_ATTACHMENTS]
+
+
+def test_dry_run_is_journaled_but_does_not_count_as_done(tmp_path):
+    archiver = _archiver_with_journal(tmp_path, dry_run=True)
+    raw = _build_message("RE-1", [("a.pdf", b"PDF")])
+
+    archiver._process_message(FakeIMAPClient(uid=1, raw=raw), 1)
+
+    (entry,) = archiver.journal.entries()
+    assert entry.action == j.DRY_RUN
+    assert not archiver.journal.done(entry.message_key, entry.part_key, j.FILED_ACTIONS)
+
+
+# --- retries do not duplicate -----------------------------------------------------------
+
+
+class FailOnce(LocalStorage):
+    """Fails the first time a file with `name` in it is saved."""
+
+    def __init__(self, root, name):
+        super().__init__(root)
+        self.name = name
+        self.failed = False
+
+    def save_unique(self, parts, filename, data):
+        if self.name in filename and not self.failed:
+            self.failed = True
+            raise OSError("NAS voll")
+        return super().save_unique(parts, filename, data)
+
+
+def test_a_retried_mail_does_not_file_its_first_attachment_twice(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _archiver_with_journal(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        storages=FailOnce(str(tmp_path), "zwei"),
+        account=_account(print_attachments=True, printer=printer_id),
+        printing=printing,
+    )
+    raw = _build_message("RE-1", [("eins.pdf", b"ONE"), ("zwei.pdf", b"TWO")])
+
+    try:
+        archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("the first attempt should have failed")
+    archiver._process_message(FakeIMAPClient(uid=5, raw=raw), 5)
+
+    names = sorted(path.name for path in (tmp_path / "rechnungen").iterdir())
+    assert len(names) == 2
+    assert any("eins" in name for name in names) and any("zwei" in name for name in names)
+    printed = [filename for _, filename in spooler.jobs]
+    assert len(printed) == 2
+    assert sum("eins" in name for name in printed) == 1
+
+
+def test_the_same_file_name_with_other_content_is_not_skipped(tmp_path):
+    archiver = _archiver_with_journal(tmp_path, mapping_content="RE: rechnungen\n")
+
+    archiver._process_message(
+        FakeIMAPClient(uid=1, raw=_build_message("RE-1", [("a.pdf", b"ONE")])), 1
+    )
+    archiver._process_message(
+        FakeIMAPClient(uid=2, raw=_build_message("RE-2", [("a.pdf", b"TWO")])), 2
+    )
+
+    assert len(list((tmp_path / "rechnungen").iterdir())) == 2
+
+
+def test_a_failing_mail_is_journaled_once_per_session(tmp_path):
+    archiver = _archiver_with_journal(tmp_path)
+
+    class AlwaysFail(FakeIMAPClient):
+        def search(self, criteria):
+            return [9]
+
+        def fetch(self, uids, parts):
+            raise ConnectionError("weg")
+
+    client = AlwaysFail(uid=9, raw=b"")
+    archiver.run_once(client)
+    archiver.run_once(client)
+
+    (entry,) = archiver.journal.entries()
+    assert entry.action == j.FAILED
+    assert "ConnectionError: weg" in entry.detail
+
+
+# --- recognising processed mail from the header ---------------------------------------
+
+
+class HeaderClient(FakeIMAPClient):
+    """Answers header fetches like a real server, and remembers what was asked."""
+
+    def __init__(self, uid, raw, seen=False):
+        super().__init__(uid, raw)
+        self.requests: list[list[str]] = []
+        self.seen = seen
+
+    def search(self, criteria):
+        self.criteria = criteria
+        return [self._uid]
+
+    def fetch(self, uids, parts):
+        self.requests.append(list(parts))
+        result = super().fetch(uids, parts)
+        if HEADER_PART in parts:
+            header = b"".join(
+                line for line in self._raw.splitlines(keepends=True)
+                if line.lower().startswith(b"message-id")
+            )
+            result[self._uid][b"BODY[HEADER.FIELDS (MESSAGE-ID)]"] = header + b"\r\n"
+            result[self._uid][b"FLAGS"] = (b"\\Seen",) if self.seen else ()
+        return result
+
+
+def _with_id(subject, attachments, message_id="<fest@example.com>"):
+    raw = _build_message(subject, attachments)
+    return b"Message-ID: " + message_id.encode() + b"\r\n" + raw
+
+
+def test_a_processed_mail_is_recognised_without_downloading_it(tmp_path):
+    archiver = _archiver_with_journal(tmp_path)
+    raw = _with_id("RE-1", [("a.pdf", b"PDF")])
+    archiver._process_message(HeaderClient(1, raw), 1)
+
+    again = HeaderClient(1, raw, seen=True)
+    assert archiver.run_once(again) == 0
+
+    assert all("RFC822" not in parts for parts in again.requests)
+    assert again.flags_added == []
+
+
+def test_a_processed_but_unread_mail_is_marked_read(tmp_path):
+    archiver = _archiver_with_journal(tmp_path)
+    raw = _with_id("RE-1", [("a.pdf", b"PDF")])
+    ProcessedStore(str(tmp_path / "state.db")).mark_processed("1:<fest@example.com>")
+
+    client = HeaderClient(1, raw, seen=False)
+    archiver._process_message(client, 1)
+
+    assert client.flags_added == [([1], [b"\\Seen"])]
+    assert not (tmp_path / "unsorted").exists()
+
+
+def test_known_uids_are_not_asked_about_again_in_the_same_session(tmp_path):
+    archiver = _archiver_with_journal(tmp_path)
+    raw = _with_id("RE-1", [("a.pdf", b"PDF")])
+    client = HeaderClient(1, raw)
+
+    archiver.run_once(client)
+    requests = len(client.requests)
+    archiver.run_once(client)
+
+    assert len(client.requests) == requests
+
+
+# --- read mail, per mailbox ----------------------------------------------------------------
+
+
+def test_only_unread_mail_by_default(tmp_path):
+    archiver = _make_archiver(tmp_path)
+
+    assert archiver.search_criteria() == ["UNSEEN"]
+
+
+def test_read_mail_since_the_configured_date(tmp_path):
+    today = date(2026, 9, 23)
+    archiver = _make_archiver(
+        tmp_path, account=_account(include_seen=True, seen_since="2026-09-01")
+    )
+
+    assert archiver.search_criteria(today) == ["OR", "UNSEEN", "SINCE", date(2026, 9, 1)]
+
+
+def test_read_mail_never_reaches_back_past_the_retention(tmp_path):
+    today = date(2026, 9, 23)
+    archiver = _make_archiver(
+        tmp_path,
+        account=_account(include_seen=True, seen_since="2020-01-01"),
+        retention_days=100,
+    )
+
+    (_, _, _, since) = archiver.search_criteria(today)
+    assert since == today - timedelta(days=100 - 2)
+
+
+def test_accounts_store_the_read_mail_option(tmp_path):
+    store = AccountStore(str(tmp_path / "state.db"))
+    account_id = store.add(name="A", host="h", user="u", password="p", include_seen=True,
+                           seen_since="2026-01-15")
+
+    account = store.get(account_id)
+    assert account.include_seen and account.seen_since == "2026-01-15"
+    store.update(account_id, name="B")
+    assert store.get(account_id).include_seen
+
+    store.update(account_id, include_seen=True, seen_since="")
+    assert store.get(account_id).seen_since == date.today().isoformat()
+
+
+def test_an_older_account_table_gets_the_new_columns(tmp_path):
+    path = str(tmp_path / "state.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE imap_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+            "host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 993, ssl INTEGER NOT NULL DEFAULT 1, "
+            "user TEXT NOT NULL, password TEXT NOT NULL, folder TEXT NOT NULL DEFAULT 'INBOX', "
+            "mode TEXT NOT NULL DEFAULT 'poll', processed_folder TEXT NOT NULL DEFAULT '', "
+            "oversized_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute("INSERT INTO imap_accounts (name, host, user, password) VALUES ('A','h','u','p')")
+
+    (account,) = AccountStore(path).all()
+
+    assert account.include_seen is False
+    assert account.seen_since == ""
+    assert account.archive_attachments is True
+MAIL2NAS_EOF
+
+# --- tests/test_notify.py ---
+cat > tests/test_notify.py <<'MAIL2NAS_EOF'
+"""Mail notifications: settings, sending, and when something is worth a mail."""
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from mail2nas import journal as j
+from mail2nas.notify import (
+    NotifyError,
+    Notifier,
+    NotifySettings,
+    NotifyStore,
+    send_mail,
+    validate,
+)
+from tests.test_archiver import _make_runtime
+
+FORM = {
+    "enabled": "1",
+    "recipients": "it@firma.de; chef@firma.de",
+    "smtp_host": "smtp.firma.de",
+    "smtp_port": "587",
+    "smtp_security": "starttls",
+    "smtp_user": "mail2nas@firma.de",
+    "smtp_password": "geheim",
+    "sender": "",
+    "delay_minutes": "30",
+    "on_connection": "1",
+    "on_failures": "1",
+    "on_recovery": "1",
+}
+
+
+def test_validate_reads_the_form():
+    value = validate(FORM, NotifySettings())
+
+    assert value.recipient_list == ["it@firma.de", "chef@firma.de"]
+    assert value.from_address == "mail2nas@firma.de"
+    assert value.usable
+
+
+def test_an_empty_password_keeps_the_stored_one():
+    current = validate(FORM, NotifySettings())
+
+    value = validate({**FORM, "smtp_password": ""}, current)
+
+    assert value.smtp_password == "geheim"
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"recipients": "kein-mail"}, "Keine gueltige Mailadresse"),
+        ({"recipients": ""}, "Empfaenger"),
+        ({"smtp_host": ""}, "SMTP-Server"),
+        ({"smtp_port": "abc"}, "Port"),
+        ({"delay_minutes": "-1"}, "Wartezeit"),
+        ({"smtp_security": "xyz"}, "Verschluesselung"),
+        ({"smtp_user": "", "sender": ""}, "Absenderadresse"),
+    ],
+)
+def test_validate_rejects_unusable_settings(change, message):
+    with pytest.raises(NotifyError, match=message):
+        validate({**FORM, **change}, NotifySettings())
+
+
+def test_disabled_settings_may_be_incomplete():
+    value = validate({**FORM, "enabled": "", "smtp_host": "", "recipients": ""}, NotifySettings())
+
+    assert not value.usable
+
+
+def test_settings_round_trip_through_the_database(tmp_path):
+    runtime = _make_runtime(tmp_path)
+    store = NotifyStore(runtime.settings)
+    value = validate(FORM, NotifySettings())
+
+    store.save(value)
+
+    assert store.load() == value
+
+
+class FakeSMTP:
+    sent: list = []
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.logged_in = None
+
+    def login(self, user, password):
+        self.logged_in = (user, password)
+
+    def send_message(self, message):
+        FakeSMTP.sent.append((self.logged_in, message))
+
+    def quit(self):
+        pass
+
+
+def test_send_mail_builds_a_plain_message():
+    FakeSMTP.sent = []
+    settings = validate(FORM, NotifySettings())
+
+    send_mail(settings, "Betreff", "Text", smtp_factory=FakeSMTP)
+
+    ((login, message),) = FakeSMTP.sent
+    assert login == ("mail2nas@firma.de", "geheim")
+    assert message["To"] == "it@firma.de, chef@firma.de"
+    assert message["Auto-Submitted"] == "auto-generated"
+    assert message.get_content().strip() == "Text"
+
+
+# --- the notifier ------------------------------------------------------------------
+
+
+def _notifier(tmp_path, **form_changes):
+    runtime = _make_runtime(tmp_path)
+    NotifyStore(runtime.settings).save(validate({**FORM, **form_changes}, NotifySettings()))
+    sent: list[tuple[str, str]] = []
+    now = {"t": time.time()}
+    notifier = Notifier(
+        runtime,
+        sender=lambda settings, subject, body: sent.append((subject, body)),
+        clock=lambda: now["t"],
+    )
+    return runtime, notifier, sent, now
+
+
+def test_a_lasting_mailbox_problem_is_reported_once_and_its_end_too(tmp_path):
+    runtime, notifier, sent, now = _notifier(tmp_path)
+    account_id = runtime.accounts.add(name="Buchhaltung", host="h", user="u", password="p")
+    key = f"account:{account_id}"
+    runtime.status.error(key, "Login fehlgeschlagen")
+
+    notifier.evaluate()
+    notifier.flush()
+    assert sent == []
+
+    now["t"] += 31 * 60
+    notifier.evaluate()
+    notifier.evaluate()
+    notifier.flush()
+    assert len(sent) == 1
+    assert "Postfach Buchhaltung" in sent[0][0]
+    assert "Login fehlgeschlagen" in sent[0][1]
+
+    runtime.status.set(key, "verbunden")
+    notifier.evaluate()
+    notifier.flush()
+    assert len(sent) == 2
+    assert "wieder in Ordnung" in sent[1][0]
+
+
+def test_a_short_problem_is_not_reported(tmp_path):
+    runtime, notifier, sent, now = _notifier(tmp_path)
+    account_id = runtime.accounts.add(name="A", host="h", user="u", password="p")
+    runtime.status.error(f"account:{account_id}", "kurz weg")
+    notifier.evaluate()
+
+    runtime.status.set(f"account:{account_id}", "verbunden")
+    now["t"] += 60 * 60
+    notifier.evaluate()
+    notifier.flush()
+
+    assert sent == []
+
+
+def test_processing_failures_are_sent_as_one_digest(tmp_path):
+    runtime, notifier, sent, now = _notifier(tmp_path)
+    runtime.journal.record("Postfach A", j.NOT_PRINTED, subject="RE-1", filename="a.pdf",
+                           detail="Drucker aus")
+    runtime.journal.record("Postfach A", j.FILED, subject="RE-2")
+    runtime.journal.record("Postfach A", j.FAILED, detail="kaputt")
+
+    notifier.evaluate()
+    runtime.journal.record("Postfach A", j.FAILED, detail="noch eins")
+    notifier.evaluate()
+    notifier.flush()
+
+    assert len(sent) == 1
+    subject, body = sent[0]
+    assert "2 Problem" in subject
+    assert "Drucker aus" in body and "kaputt" in body and "RE-2" not in body
+
+    now["t"] += 16 * 60
+    notifier.evaluate()
+    notifier.flush()
+    assert len(sent) == 2
+    assert "noch eins" in sent[1][1]
+
+
+def test_failures_from_before_the_start_are_not_sent(tmp_path):
+    runtime = _make_runtime(tmp_path)
+    NotifyStore(runtime.settings).save(validate(FORM, NotifySettings()))
+    runtime.journal.record("Postfach A", j.FAILED, detail="alt")
+    sent = []
+
+    notifier = Notifier(runtime, sender=lambda *args: sent.append(args))
+    notifier.evaluate()
+    notifier.flush()
+
+    assert sent == []
+
+
+def test_nothing_is_sent_when_switched_off(tmp_path):
+    runtime, notifier, sent, now = _notifier(tmp_path, enabled="")
+    runtime.journal.record("Postfach A", j.FAILED, detail="kaputt")
+
+    notifier.evaluate()
+    notifier.flush()
+
+    assert sent == []
+
+
+def test_a_missing_archive_is_a_setup_step_not_an_outage(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    NotifyStore(runtime.settings).save(validate({**FORM, "delay_minutes": "0"}, NotifySettings()))
+    runtime.status.archive.ok = False
+    sent = []
+
+    notifier = Notifier(runtime, sender=lambda *args: sent.append(args))
+    notifier.evaluate()
+    notifier.flush()
+
+    assert sent == []
+
+
+def test_a_broken_archive_is_reported(tmp_path):
+    runtime, notifier, sent, now = _notifier(tmp_path, delay_minutes="0")
+    runtime.status.archive.ok = False
+    runtime.status.archive.detail = "SMB: Zugriff verweigert"
+    runtime.status.archive.failing_since = now["t"]
+
+    notifier.evaluate()
+    notifier.flush()
+
+    assert len(sent) == 1
+    assert "Standard-Archiv" in sent[0][0]
+
+
+def test_a_failing_smtp_server_is_remembered(tmp_path):
+    runtime = _make_runtime(tmp_path)
+    NotifyStore(runtime.settings).save(validate({**FORM, "delay_minutes": "0"}, NotifySettings()))
+
+    def broken(*args):
+        raise OSError("Verbindung abgelehnt")
+
+    notifier = Notifier(runtime, sender=broken)
+    runtime.status.archive.ok = False
+    runtime.status.archive.failing_since = time.time()
+    notifier.evaluate()
+    notifier.flush()
+
+    assert "Verbindung abgelehnt" in notifier.last_error
+MAIL2NAS_EOF
+
+# --- tests/test_backup.py ---
+cat > tests/test_backup.py <<'MAIL2NAS_EOF'
+"""Backing up and restoring the database, by hand and onto the NAS."""
+from __future__ import annotations
+
+import gzip
+import sqlite3
+
+import pytest
+
+from mail2nas import backup
+from mail2nas.mapping import Rule
+from tests.test_archiver import _make_runtime
+
+
+def _runtime(tmp_path):
+    runtime = _make_runtime(tmp_path / "a")
+    runtime.accounts.add(name="Buchhaltung", host="imap.example.com", user="u", password="p")
+    runtime.mapping.save([Rule.create("RE", "rechnungen")])
+    return runtime
+
+
+def test_a_backup_is_a_compressed_copy_of_the_database(tmp_path):
+    runtime = _runtime(tmp_path)
+
+    data = backup.dump(runtime.config.state_db_path)
+
+    assert data[:2] == backup.GZIP_MAGIC
+    assert gzip.decompress(data).startswith(backup.SQLITE_MAGIC)
+    counts = backup.check(data)
+    assert counts["imap_accounts"] == 1
+    assert counts["mapping_rules"] == 1
+
+
+@pytest.mark.parametrize(
+    "data, message",
+    [
+        (b"hallo", "keine SQLite"),
+        (backup.GZIP_MAGIC + b"kaputt", "gzip"),
+        (gzip.compress(b"hallo"), "keine SQLite"),
+    ],
+)
+def test_other_files_are_refused(data, message):
+    with pytest.raises(backup.BackupError, match=message):
+        backup.check(data)
+
+
+def test_a_database_that_is_not_ours_is_refused(tmp_path):
+    other = tmp_path / "other.db"
+    with sqlite3.connect(other) as conn:
+        conn.execute("CREATE TABLE foo (x)")
+
+    with pytest.raises(backup.BackupError, match="settings"):
+        backup.check(other.read_bytes())
+
+
+def test_restore_replaces_the_configuration_and_keeps_the_old_state(tmp_path):
+    source = _runtime(tmp_path)
+    data = backup.dump(source.config.state_db_path)
+
+    target = _make_runtime(tmp_path / "b")
+    target.accounts.add(name="Anderes", host="h", user="x", password="y")
+    saved, counts = backup.restore(target.config.state_db_path, data, target.config.data_dir)
+    target.after_restore()
+
+    assert [a.name for a in target.accounts.all()] == ["Buchhaltung"]
+    assert [r.keyword for r in target.rule_store.load()] == ["RE"]
+    assert counts["imap_accounts"] == 1
+    assert saved.endswith(backup.SUFFIX)
+    previous = backup.check(open(saved, "rb").read())
+    assert previous["imap_accounts"] == 1  # "Anderes"
+
+
+def test_mail_processed_after_the_backup_stays_processed(tmp_path):
+    runtime = _runtime(tmp_path)
+    runtime.store.mark_processed("1:<vorher@x>")
+    data = backup.dump(runtime.config.state_db_path)
+    runtime.store.mark_processed("1:<nachher@x>")
+
+    backup.restore(runtime.config.state_db_path, data, runtime.config.data_dir)
+    runtime.after_restore()
+
+    assert runtime.store.is_processed("1:<vorher@x>")
+    assert runtime.store.is_processed("1:<nachher@x>")
+
+
+def test_restoring_an_older_database_adds_the_new_columns(tmp_path):
+    old = tmp_path / "old.db"
+    with sqlite3.connect(old) as conn:
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+                     "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute(
+            "CREATE TABLE imap_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+            "host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 993, ssl INTEGER NOT NULL DEFAULT 1, "
+            "user TEXT NOT NULL, password TEXT NOT NULL, folder TEXT NOT NULL DEFAULT 'INBOX', "
+            "mode TEXT NOT NULL DEFAULT 'poll', processed_folder TEXT NOT NULL DEFAULT '', "
+            "oversized_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute("INSERT INTO imap_accounts (name, host, user, password) VALUES ('Alt','h','u','p')")
+
+    runtime = _make_runtime(tmp_path / "b")
+    backup.restore(runtime.config.state_db_path, old.read_bytes(), runtime.config.data_dir)
+    runtime.after_restore()
+
+    (account,) = runtime.accounts.all()
+    assert account.name == "Alt" and account.include_seen is False
+    assert runtime.journal.count() == 0
+
+
+def test_only_the_last_local_copies_are_kept(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path)
+    stamps = iter(f"2026-01-{day:02d}_000000" for day in range(1, 20))
+
+    class Clock:
+        @staticmethod
+        def now():
+            class Stamp:
+                def strftime(self, fmt):
+                    return next(stamps)
+            return Stamp()
+
+    monkeypatch.setattr(backup, "datetime", Clock)
+    for _ in range(backup.LOCAL_KEEP + 3):
+        backup.save_local(runtime.config.state_db_path, runtime.config.data_dir)
+
+    files = sorted((tmp_path / "a" / backup.LOCAL_DIR).iterdir())
+    assert len(files) == backup.LOCAL_KEEP
+
+
+# --- onto the NAS ---------------------------------------------------------------------
+
+
+def test_validate_the_backup_settings():
+    value = backup.validate({"enabled": "1", "folder": "sicherung/mail2nas", "keep": "7"}, [])
+
+    assert value == backup.BackupSettings(True, "", "sicherung/mail2nas", 7)
+    with pytest.raises(backup.BackupError):
+        backup.validate({"folder": "../raus", "keep": "7"}, [])
+    with pytest.raises(backup.BackupError):
+        backup.validate({"folder": "x", "keep": "0"}, [])
+    with pytest.raises(backup.BackupError):
+        backup.validate({"folder": "x", "keep": "3", "archive": "99"}, ["1"])
+
+
+def test_the_scheduler_writes_and_rotates(tmp_path):
+    runtime = _runtime(tmp_path)
+    store = backup.BackupStore(runtime.settings)
+    store.save(backup.BackupSettings(enabled=True, folder="sicherung", keep=2))
+    now = {"t": 1_000_000.0}
+    scheduler = backup.BackupScheduler(runtime, clock=lambda: now["t"])
+    folder = tmp_path / "a" / "sicherung"
+    for stale in ("mail2nas-sicherung-2020-01-01_000000.db.gz",
+                  "mail2nas-sicherung-2020-01-02_000000.db.gz"):
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / stale).write_bytes(b"alt")
+    (folder / "fremd.txt").write_text("bleibt")
+
+    assert scheduler.due()
+    scheduler.maybe_run()
+
+    names = sorted(path.name for path in folder.iterdir())
+    assert "fremd.txt" in names
+    assert "mail2nas-sicherung-2020-01-01_000000.db.gz" not in names
+    assert len([n for n in names if n.endswith(backup.SUFFIX)]) == 2
+    assert runtime.backup_status.ok is True
+    assert not scheduler.due()
+    now["t"] += backup.BACKUP_INTERVAL
+    assert scheduler.due()
+
+
+def test_a_failed_backup_is_retried_hourly(tmp_path):
+    runtime = _runtime(tmp_path)
+    backup.BackupStore(runtime.settings).save(backup.BackupSettings(enabled=True))
+    now = {"t": 1_000_000.0}
+    scheduler = backup.BackupScheduler(runtime, clock=lambda: now["t"])
+    runtime.archives.delete(runtime.archives.all()[0].id)
+
+    scheduler.maybe_run()
+
+    assert runtime.backup_status.ok is False
+    assert runtime.backup_status.failing_since == now["t"]
+    assert not scheduler.due()
+    now["t"] += backup.RETRY_INTERVAL
+    assert scheduler.due()
+
+
+def test_nothing_is_due_while_switched_off(tmp_path):
+    runtime = _runtime(tmp_path)
+
+    assert not backup.BackupScheduler(runtime).due()
+    assert runtime.backup_status.ok is None
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---

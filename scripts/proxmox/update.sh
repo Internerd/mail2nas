@@ -160,7 +160,7 @@ fi
 #   ohne Backend, aber NAS_PATH          -> Mount (aufgeraeumte .env, oder Host-Mount)
 #   ohne Backend, IMAP_* aber kein SMB_* -> Mount (Host-Mount-Generation)
 #   ohne Backend, mit SMB_*              -> kein Mount (Docker-cifs-Generation -> jetzt SMB direkt)
-BACKEND="$(env_get STORAGE_BACKEND | tr 'A-Z' 'a-z')"
+BACKEND="$(env_get STORAGE_BACKEND | tr '[:upper:]' '[:lower:]')"
 NAS_PATH_VALUE="$(env_get NAS_PATH)"
 NEED_MOUNT=0
 case "$BACKEND" in
