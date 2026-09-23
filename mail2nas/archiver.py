@@ -11,13 +11,13 @@ from imapclient import IMAPClient
 
 from .accounts import Account
 from .addresses import AddressRule, AddressStore
-from .config import Config
+from .archives import StorageSet
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
 from .mapping import Mapping, Rule
+from .options import Options
 from .printers import Printer
 from .printing import PrintService, job_title
 from .state import ProcessedStore
-from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ RECIPIENT_HEADERS = (
 # A mail may legitimately carry a few dozen recipients; thousands are either a
 # mistake or an attempt to make matching expensive.
 MAX_RECIPIENTS = 50
+# Seconds a single IMAP command may take. Without a timeout a server that
+# stops answering mid-session blocks the worker forever - no error, no retry.
+IMAP_TIMEOUT = 60
 
 
 def _decode(value: str | None) -> str:
@@ -100,46 +103,47 @@ class AttachmentPlan:
 class Archiver:
     def __init__(
         self,
-        config: Config,
+        options,
         mapping: Mapping,
         store: ProcessedStore,
-        storage: Storage,
+        storages,
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
-        storages=None,
-        blocked_extensions=None,
     ):
-        self.config = config
+        # `options` is an Options snapshot or a callable returning the current
+        # one. The callable is what the service uses: the settings page takes
+        # effect on the next message, without restarting the worker.
+        self._options = options
         self.mapping = mapping
         self.store = store
-        self.storage = storage
+        # A StorageSet (one storage per archive), or a single Storage for an
+        # installation - or a test - with exactly one place to file into.
+        self.storages = storages
         self.account = account
         self.printing = printing
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
-        # A StorageSet once more than one archive can be configured; without
-        # it everything is filed into the one archive from the environment.
-        self.storages = storages
-        # Read through a callable rather than copied from the config: the list
-        # is editable in the web UI and has to take effect without a restart.
-        self._blocked_extensions = blocked_extensions
+
+    @property
+    def options(self) -> Options:
+        return self._options() if callable(self._options) else self._options
 
     @property
     def blocked_extensions(self) -> frozenset[str]:
-        if self._blocked_extensions is None:
-            return self.config.blocked_extensions
-        return self._blocked_extensions()
+        return self.options.blocked_extensions
 
     def storage_for(self, archive_key: str):
         """The archive a plan points at, or the only one there is."""
-        if self.storages is None:
-            return self.storage
-        return self.storages.get(archive_key)
+        if isinstance(self.storages, StorageSet):
+            return self.storages.get(archive_key)
+        return self.storages
 
     def connect(self) -> IMAPClient:
-        client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
+        client = IMAPClient(
+            self.account.host, port=self.account.port, ssl=self.account.ssl, timeout=IMAP_TIMEOUT
+        )
         client.login(self.account.user, self.account.password)
         client.select_folder(self.account.folder)
         return client
@@ -171,16 +175,16 @@ class Archiver:
         # exhaust memory/disk on every poll cycle.
         size_reply = client.fetch([uid], ["RFC822.SIZE"])
         message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
-        max_message_bytes = self.config.max_message_size_mb * 1024 * 1024
+        max_message_bytes = self.options.max_message_size_mb * 1024 * 1024
         if message_size and message_size > max_message_bytes:
             logger.warning(
                 "UID %s is %.1f MB, exceeds MAX_MESSAGE_SIZE_MB=%d - skipping attachment "
                 "extraction and flagging for manual review",
                 uid,
                 message_size / (1024 * 1024),
-                self.config.max_message_size_mb,
+                self.options.max_message_size_mb,
             )
-            if not self.config.dry_run:
+            if not self.options.dry_run:
                 client.add_flags([uid], [b"\\Seen"])
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
@@ -197,7 +201,7 @@ class Archiver:
 
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
-        body = self._extract_body(msg) if self.config.match_body else ""
+        body = self._extract_body(msg) if self.options.match_body else ""
         mail_rule = self._match(subject, body)
         address_rule = self._address_rule(msg, sender_addr)
         if address_rule is not None:
@@ -210,23 +214,23 @@ class Archiver:
             )
 
         attachments = list(self._iter_attachments(msg))
-        if len(attachments) > self.config.max_attachments_per_message:
+        if len(attachments) > self.options.max_attachments_per_message:
             logger.warning(
                 "UID %s '%s' has %d attachments, only processing the first %d "
                 "(MAX_ATTACHMENTS_PER_MESSAGE)",
                 uid,
                 subject,
                 len(attachments),
-                self.config.max_attachments_per_message,
+                self.options.max_attachments_per_message,
             )
-            attachments = attachments[: self.config.max_attachments_per_message]
+            attachments = attachments[: self.options.max_attachments_per_message]
 
         saved: list[str] = []
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
         else:
             date_prefix = self._date_prefix(msg)
-            max_attachment_bytes = self.config.max_attachment_size_mb * 1024 * 1024
+            max_attachment_bytes = self.options.max_attachment_size_mb * 1024 * 1024
             for filename, payload in attachments:
                 if len(payload) > max_attachment_bytes:
                     logger.warning(
@@ -236,7 +240,7 @@ class Archiver:
                         subject,
                         filename,
                         len(payload) / (1024 * 1024),
-                        self.config.max_attachment_size_mb,
+                        self.options.max_attachment_size_mb,
                     )
                     continue
 
@@ -244,72 +248,75 @@ class Archiver:
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if plan.archive:
-                    target_parts = self._target_parts(plan.folder)
-                    storage = self.storage_for(plan.archive_key)
-                    if self.config.dry_run:
-                        logger.info(
-                            "[dry-run] would save %s -> %s",
-                            out_name,
-                            storage.display(target_parts),
-                        )
-                    else:
-                        out_path = storage.save_unique(target_parts, out_name, payload)
-                        saved.append(out_path)
-                        logger.info(
-                            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
-                            uid,
-                            subject,
-                            filename,
-                            plan.keyword or "<fallback>",
-                            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
-                            out_path,
-                        )
-                elif plan.printer is not None:
-                    logger.info(
-                        "UID %s '%s': attachment '%s' is printed only, not archived",
-                        uid,
-                        subject,
-                        filename,
-                    )
-                else:
-                    # Neither filed nor printed - that is a configuration
-                    # mistake rather than an intention, and the attachment is
-                    # gone once the mail is marked as read.
-                    logger.warning(
-                        "UID %s '%s': attachment '%s' was neither archived nor printed - "
-                        "%s is set to print only but nothing prints it",
-                        uid,
-                        subject,
-                        filename,
-                        f"the address rule {plan.address.name!r}"
-                        if plan.address is not None
-                        else "the mailbox",
-                    )
+                    self._file(plan, out_name, payload, uid, subject, filename, saved)
 
                 # Printing comes after filing, deliberately: the share is the
                 # archive and paper is the copy, so a printer that is offline
                 # or out of paper must never be the reason an attachment was
                 # not stored.
+                printed = False
                 if plan.printer is not None:
-                    self.printing.send(
+                    printed = self.printing.send(
                         plan.printer, payload, out_name, job_title(subject, filename)
                     )
 
-        if not self.config.dry_run:
+                if not plan.archive and not printed:
+                    # "Print only" and yet nothing came out - no printer, a
+                    # format it cannot print, CUPS down. The mail is marked as
+                    # read in a moment, so this is the last chance to keep the
+                    # attachment: file it after all rather than lose it.
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' was meant to be printed only, but "
+                        "nothing was printed - filing it instead so it is not lost",
+                        uid,
+                        subject,
+                        filename,
+                    )
+                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                elif not plan.archive:
+                    logger.info(
+                        "UID %s '%s': attachment '%s' printed, not archived (%s)",
+                        uid,
+                        subject,
+                        filename,
+                        f"address rule {plan.address.name!r}"
+                        if plan.address is not None
+                        else "mailbox set to print only",
+                    )
+
+        if not self.options.dry_run:
             self.store.mark_processed(message_id)
             client.add_flags([uid], [b"\\Seen"])
             if self.account.processed_folder:
                 client.move([uid], self.account.processed_folder)
         return True
 
+    def _file(self, plan, out_name, payload, uid, subject, filename, saved) -> None:
+        target_parts = self._target_parts(plan.folder)
+        storage = self.storage_for(plan.archive_key)
+        if self.options.dry_run:
+            logger.info("[dry-run] would save %s -> %s", out_name, storage.display(target_parts))
+            return
+        out_path = storage.save_unique(target_parts, out_name, payload)
+        saved.append(out_path)
+        logger.info(
+            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+            uid,
+            subject,
+            filename,
+            plan.keyword or "<fallback>",
+            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
+            out_path,
+        )
+
     def _target_parts(self, folder_name: str) -> tuple[str, ...]:
         """Map a configured folder name onto path components inside the archive root.
 
-        Folder names come from mapping.yaml on the share and are therefore
-        untrusted; anything that would escape the archive root is rejected and
+        Folder names come from rules and address entries - and a rule file
+        imported from somewhere else is not necessarily trustworthy; anything that would escape the archive root is rejected and
         replaced with the fallback folder rather than being written outside.
         """
-        for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
+        for candidate, note in ((folder_name, None), (self.options.fallback_folder, "fallback"), ("unsorted", "built-in")):
             try:
                 target = safe_relative_parts(candidate)
             except ValueError as exc:
@@ -361,7 +368,7 @@ class Archiver:
         quarantined = bool(extensions & self.blocked_extensions)
 
         return AttachmentPlan(
-            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
+            folder=self.options.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
             archive_key=self._archive_of(rule, address_rule),
@@ -381,7 +388,7 @@ class Archiver:
     def _folder_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
         if address_rule is not None and address_rule.folder:
             return address_rule.folder
-        return rule.folder if rule else self.config.fallback_folder
+        return rule.folder if rule else self.options.fallback_folder
 
     def _archive_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
         """Which archive the folder lives on.
@@ -409,7 +416,7 @@ class Archiver:
         Its whole purpose is to say what happens to mail sent there, so an
         address set to "only file" is not overruled by a keyword rule.
         """
-        if self.printing is None or not self.config.printing_enabled:
+        if self.printing is None or not self.options.printing_enabled:
             return None
         if quarantined:
             # A blocked attachment is a suspected executable. It is neither
@@ -449,7 +456,7 @@ class Archiver:
 
     def _build_filename(self, date_prefix: str, sender_addr: str, filename: str) -> str:
         filename = sanitize_filename(_decode(filename))
-        mode = self.config.filename_prefix
+        mode = self.options.filename_prefix
         if mode == "none":
             return filename
         if mode == "date":

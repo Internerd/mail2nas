@@ -4,7 +4,7 @@ import pytest
 
 from mail2nas.accounts import SETTING_ACCOUNTS_SEEDED, AccountStore, seed_from_config
 from mail2nas.state import SettingsStore
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 @pytest.fixture
@@ -78,7 +78,7 @@ def test_renaming_does_not_restart_the_worker(store):
 
 
 def test_the_first_account_is_created_from_the_configuration(tmp_path):
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
 
@@ -91,7 +91,7 @@ def test_the_first_account_is_created_from_the_configuration(tmp_path):
 
 
 def test_seeding_happens_only_once(tmp_path):
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -103,11 +103,23 @@ def test_seeding_happens_only_once(tmp_path):
 
 def test_deleting_the_last_account_does_not_resurrect_it_from_the_env(tmp_path):
     """Otherwise removing a mailbox in the UI would silently come back."""
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
     store.delete(store.all()[0].id)
+
+    seed_from_config(store, settings, config)
+
+    assert store.all() == []
+    assert settings.get(SETTING_ACCOUNTS_SEEDED) == "1"
+
+
+def test_a_fresh_installation_gets_no_mailbox_from_the_env(tmp_path):
+    """Without IMAP_* in the .env the mailbox is set up in the web UI."""
+    config = _seed_config(tmp_path, imap_host="", imap_user="", imap_password="")
+    store = AccountStore(config.state_db_path)
+    settings = SettingsStore(config.state_db_path)
 
     seed_from_config(store, settings, config)
 

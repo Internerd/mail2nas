@@ -3,30 +3,21 @@
 # mail2nas - Installer, der INNERHALB einer Debian/Ubuntu-LXC oder -VM laeuft
 # (normalerweise automatisch von scripts/proxmox/mail2nas.sh aufgerufen).
 #
-# Kann auch manuell in einer bereits vorhandenen Container/VM ausgefuehrt
-# werden, z. B. wenn du den Container selbst per Proxmox-GUI angelegt hast:
+# Kann auch direkt in einer vorhandenen LXC/VM ausgefuehrt werden:
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/install.sh)"
 #
-# Erwartet die App-Konfiguration entweder als bereits gesetzte
-# Umgebungsvariablen, oder in /root/mail2nas-install.env (wird automatisch
-# geladen und danach geloescht, da sie Klartext-Zugangsdaten enthaelt).
-# Erforderlich sind IMAP_HOST/IMAP_USER/IMAP_PASSWORD sowie - beim
-# Standard-Backend STORAGE_BACKEND=smb - SMB_HOST/SMB_SHARE/SMB_USER/
-# SMB_PASSWORD. Es wird nichts gemountet: mail2nas spricht SMB direkt.
+# Es werden KEINE Zugangsdaten abgefragt: Postfaecher, NAS-Freigaben,
+# Zuordnungen und Drucker werden nach der Installation in der Weboberflaeche
+# eingerichtet. Das erste Passwort fuer die Oberflaeche erzeugt mail2nas
+# selbst; dieses Skript zeigt es am Ende an.
 #
-# Mit STORAGE_BACKEND=local wird stattdessen in ein bereits vom Betriebssystem
-# gemountetes Verzeichnis (NAS_PATH, Default /mnt/nas) geschrieben.
+# Liegt schon eine Installation vor, wird stattdessen aktualisiert
+# (scripts/proxmox/update.sh) - ein erneuter Aufruf ist also gefahrlos.
 #
-# Die Weboberflaeche fuer das Mapping ist per Default an (WEB_ENABLED=true) und
-# braucht dann ein Startpasswort in WEB_PASSWORD.
-#
-# Drucken ist optional und wird komplett in der Weboberflaeche eingerichtet
-# (Drucker anlegen, dann je Postfach/Zuordnung auswaehlen). Hier landen nur
-# die Defaults dafuer in der .env; ein PRINTER_DESTINATION legt beim ersten
-# Start optional gleich einen Drucker an.
-# Existiert bereits eine .env und werden keine Zugangsdaten uebergeben,
-# laeuft das Skript im Update-Modus und laesst die Konfiguration unveraendert.
+# Optional per Umgebungsvariable (oder in /root/mail2nas-install.env):
+#   MAIL2NAS_REPO_URL, MAIL2NAS_REPO_BRANCH, MAIL2NAS_TARGET_DIR
+#   WEB_PORT (Default 8080), TZ (Default Europe/Berlin)
 
 set -euo pipefail
 
@@ -35,87 +26,36 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Render a value as a double-quoted literal for docker compose's .env parser.
-#
-# Note this is deliberately NOT shell quoting: compose's dotenv parser does not
-# understand the shell's '\'' idiom for an embedded single quote and errors out
-# on it. Double quotes with \\ , \" and $$ escapes are what it does understand,
-# and that combination round-trips every character (quotes, backticks, $( ),
-# spaces, #) literally - so a password can never be executed or interpolated.
-dq() {
-  local v=${1-}
-  v=${v//\\/\\\\}
-  v=${v//\"/\\\"}
-  v=${v//\$/\$\$}
-  printf '"%s"' "$v"
-}
-
 if [ -f /root/mail2nas-install.env ]; then
   set -a
   # shellcheck disable=SC1091
   source /root/mail2nas-install.env
   set +a
+  rm -f /root/mail2nas-install.env
 fi
 
 REPO_URL="${MAIL2NAS_REPO_URL:-https://github.com/Internerd/mail2nas.git}"
 REPO_BRANCH="${MAIL2NAS_REPO_BRANCH:-main}"
 TARGET_DIR="${MAIL2NAS_TARGET_DIR:-/opt/mail2nas}"
+RAW_BASE="${MAIL2NAS_RAW_BASE:-https://raw.githubusercontent.com/Internerd/mail2nas/${REPO_BRANCH}}"
+WEB_PORT="${WEB_PORT:-8080}"
+TZ_VALUE="${TZ:-Europe/Berlin}"
 
-# Two modes, decided by what is already there:
-#
-#   Erstinstallation - keine .env vorhanden (oder Zugangsdaten wurden
-#     ausdruecklich uebergeben): Zugangsdaten sind Pflicht, .env wird
-#     geschrieben.
-#   Update - eine .env existiert bereits und es wurden KEINE Zugangsdaten
-#     uebergeben: die bestehende Konfiguration bleibt unangetastet, es wird
-#     nur der Code aktualisiert und neu gebaut.
-#
-# Dadurch ist ein erneuter Aufruf gefahrlos: ein Update kostet keine
-# Neukonfiguration und kann die vorhandene .env nicht ueberschreiben.
-if [ -z "${IMAP_HOST:-}" ] && [ -f "$TARGET_DIR/.env" ]; then
-  WRITE_ENV=0
-  echo "==> Update-Modus: bestehende $TARGET_DIR/.env bleibt unveraendert."
-else
-  WRITE_ENV=1
-  : "${IMAP_HOST:?IMAP_HOST ist nicht gesetzt}"
-  : "${IMAP_USER:?IMAP_USER ist nicht gesetzt}"
-  : "${IMAP_PASSWORD:?IMAP_PASSWORD ist nicht gesetzt}"
+# --- Bestehende Installation? Dann ist das ein Update. ------------------------------
+
+if [ -f "$TARGET_DIR/docker-compose.yml" ]; then
+  echo "==> In $TARGET_DIR liegt bereits mail2nas - es wird aktualisiert."
+  UPDATE_SCRIPT="$(mktemp)"
+  # Das aktuelle Update-Skript holen, nicht das der alten Installation: nur das
+  # neue kennt alle Generationen und die Migration.
+  if ! curl -fsSL "${RAW_BASE}/scripts/proxmox/update.sh" -o "$UPDATE_SCRIPT"; then
+    cp "$TARGET_DIR/scripts/proxmox/update.sh" "$UPDATE_SCRIPT"
+  fi
+  MAIL2NAS_TARGET_DIR="$TARGET_DIR" MAIL2NAS_REPO_URL="$REPO_URL" \
+    MAIL2NAS_REPO_BRANCH="$REPO_BRANCH" exec bash "$UPDATE_SCRIPT"
 fi
 
-STORAGE_BACKEND="${STORAGE_BACKEND:-smb}"
-NAS_PATH="${NAS_PATH:-/mnt/nas}"
-WEB_ENABLED="${WEB_ENABLED:-true}"
-
-if [ "$WRITE_ENV" -eq 1 ]; then
-  # Ohne Startpasswort wuerde die Oberflaeche beim Start abbrechen - das lieber
-  # hier sagen als im Container-Log.
-  if [ "$WEB_ENABLED" = "true" ] && [ -z "${WEB_PASSWORD:-}" ]; then
-    echo "FEHLER: WEB_ENABLED=true, aber WEB_PASSWORD ist nicht gesetzt." >&2
-    echo "Startpasswort setzen (mind. 8 Zeichen) oder WEB_ENABLED=false uebergeben." >&2
-    exit 1
-  fi
-  if [ "$STORAGE_BACKEND" = "smb" ]; then
-    # Nichts zu mounten - die Anwendung verbindet sich selbst zum NAS.
-    : "${SMB_HOST:?SMB_HOST ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
-    : "${SMB_SHARE:?SMB_SHARE ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
-    : "${SMB_USER:?SMB_USER ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
-    : "${SMB_PASSWORD:?SMB_PASSWORD ist nicht gesetzt (bei STORAGE_BACKEND=smb)}"
-  else
-    # local: das Share muss bereits vom Betriebssystem gemountet sein. Lieber
-    # hier abbrechen als spaeter Anhaenge in ein leeres Verzeichnis schreiben,
-    # das beim naechsten Neustart verschwindet.
-    if [ ! -d "$NAS_PATH" ]; then
-      echo "FEHLER: $NAS_PATH existiert nicht." >&2
-      echo "Bei STORAGE_BACKEND=local muss das Share dort eingebunden sein." >&2
-      echo "Ohne Mount stattdessen STORAGE_BACKEND=smb verwenden (Default)." >&2
-      exit 1
-    fi
-    if ! mountpoint -q "$NAS_PATH" 2>/dev/null; then
-      echo "WARNUNG: $NAS_PATH ist kein Mountpoint - liegt das Share wirklich dort?" >&2
-      echo "         Anhaenge wuerden sonst in das lokale Dateisystem geschrieben." >&2
-    fi
-  fi
-fi
+# --- Pakete und Docker -------------------------------------------------------------
 
 echo "==> Pakete installieren (git, curl, ca-certificates) ..."
 export DEBIAN_FRONTEND=noninteractive
@@ -127,131 +67,66 @@ if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
 
-echo "==> mail2nas-Code holen (${REPO_URL} @ ${REPO_BRANCH}) ..."
-if [ -d "$TARGET_DIR/.git" ]; then
-  # FETCH_HEAD statt origin/<branch>: funktioniert auch bei einem flachen
-  # Clone zuverlaessig, unabhaengig vom lokalen Branch-Zustand. .env und
-  # andere ignorierte Dateien sind von reset --hard nicht betroffen.
-  git -C "$TARGET_DIR" fetch --depth 1 origin "$REPO_BRANCH"
-  git -C "$TARGET_DIR" reset --hard FETCH_HEAD
-else
-  mkdir -p "$TARGET_DIR"
-  git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR"
-fi
+# --- Code -----------------------------------------------------------------------------
 
+echo "==> mail2nas holen (${REPO_URL} @ ${REPO_BRANCH}) ..."
+mkdir -p "$(dirname "$TARGET_DIR")"
+git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-if [ "$WRITE_ENV" -eq 0 ]; then
-  echo "==> .env uebernommen (unveraendert)."
-else
-echo "==> .env schreiben ..."
+# --- .env: nur Infrastruktur ------------------------------------------------------------
+
+echo "==> .env schreiben (nur Port, Zeitzone, Log-Level) ..."
 umask 077
 cat > .env <<ENVEOF
-IMAP_HOST=$(dq "${IMAP_HOST}")
-IMAP_PORT=$(dq "${IMAP_PORT:-993}")
-IMAP_SSL=$(dq "${IMAP_SSL:-true}")
-IMAP_USER=$(dq "${IMAP_USER}")
-IMAP_PASSWORD=$(dq "${IMAP_PASSWORD}")
-IMAP_FOLDER=$(dq "${IMAP_FOLDER:-INBOX}")
-IMAP_PROCESSED_FOLDER=$(dq "${IMAP_PROCESSED_FOLDER:-}")
-IMAP_OVERSIZED_FOLDER=$(dq "${IMAP_OVERSIZED_FOLDER:-}")
-IMAP_MODE=$(dq "${IMAP_MODE:-idle}")
-POLL_INTERVAL_SECONDS=$(dq "${POLL_INTERVAL_SECONDS:-300}")
-
-WEB_ENABLED=$(dq "${WEB_ENABLED:-true}")
-WEB_HOST=$(dq "${WEB_HOST:-0.0.0.0}")
-WEB_PORT=$(dq "${WEB_PORT:-8080}")
-WEB_PASSWORD=$(dq "${WEB_PASSWORD:-}")
-WEB_COOKIE_SECURE=$(dq "${WEB_COOKIE_SECURE:-false}")
-
-STORAGE_BACKEND=$(dq "${STORAGE_BACKEND}")
-SMB_HOST=$(dq "${SMB_HOST:-}")
-SMB_SHARE=$(dq "${SMB_SHARE:-}")
-SMB_USER=$(dq "${SMB_USER:-}")
-SMB_PASSWORD=$(dq "${SMB_PASSWORD:-}")
-SMB_DOMAIN=$(dq "${SMB_DOMAIN:-}")
-SMB_PORT=$(dq "${SMB_PORT:-445}")
-SMB_ROOT=$(dq "${SMB_ROOT:-}")
-SMB_ENCRYPT=$(dq "${SMB_ENCRYPT:-true}")
-STORAGE_ROOT=$(dq "${STORAGE_ROOT:-/mnt/nas}")
-NAS_PATH=$(dq "${NAS_PATH}")
-
-MAPPING_PATH=$(dq "${MAPPING_PATH:-mapping.yaml}")
-FALLBACK_FOLDER=$(dq "${FALLBACK_FOLDER:-unsorted}")
-MATCH_BODY=$(dq "${MATCH_BODY:-false}")
-FILENAME_PREFIX=$(dq "${FILENAME_PREFIX:-date_sender}")
-
-MAX_ATTACHMENT_SIZE_MB=$(dq "${MAX_ATTACHMENT_SIZE_MB:-25}")
-MAX_MESSAGE_SIZE_MB=$(dq "${MAX_MESSAGE_SIZE_MB:-50}")
-MAX_ATTACHMENTS_PER_MESSAGE=$(dq "${MAX_ATTACHMENTS_PER_MESSAGE:-20}")
-BLOCKED_EXTENSIONS=$(dq "${BLOCKED_EXTENSIONS:-exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk}")
-QUARANTINE_FOLDER=$(dq "${QUARANTINE_FOLDER:-quarantaene}")
-
-PRINTING_ENABLED=$(dq "${PRINTING_ENABLED:-true}")
-LP_BINARY=$(dq "${LP_BINARY:-lp}")
-PRINT_TIMEOUT_SECONDS=$(dq "${PRINT_TIMEOUT_SECONDS:-120}")
-PRINTABLE_EXTENSIONS=$(dq "${PRINTABLE_EXTENSIONS:-pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff}")
-PRINTER_DESTINATION=$(dq "${PRINTER_DESTINATION:-}")
-PRINTER_NAME=$(dq "${PRINTER_NAME:-}")
-PRINTER_SERVER=$(dq "${PRINTER_SERVER:-}")
-PRINTER_OPTIONS=$(dq "${PRINTER_OPTIONS:-}")
-PRINTER_COPIES=$(dq "${PRINTER_COPIES:-1}")
-
-STATE_DB_PATH="/data/state.db"
-LOG_LEVEL=$(dq "${LOG_LEVEL:-INFO}")
-DRY_RUN=$(dq "${DRY_RUN:-false}")
+# mail2nas - nur Infrastruktur. Postfaecher, Archive (NAS-Freigaben),
+# Zuordnungen, Drucker und alle Einstellungen werden in der Weboberflaeche
+# gepflegt und in der Datenbank im Docker-Volume "state" gespeichert.
+WEB_PORT=${WEB_PORT}
+TZ=${TZ_VALUE}
+LOG_LEVEL=INFO
 ENVEOF
 chmod 600 .env
-fi
 
-if [ "$WRITE_ENV" -eq 0 ]; then
-  # Update-Modus: das Backend steht in der bestehenden .env. Fehlt es dort,
-  # stammt die Installation aus einer Version vor dem SMB-Backend und arbeitet
-  # mit einem gemounteten Share - dann muss der Bind-Mount erhalten bleiben.
-  ENV_BACKEND="$(sed -n 's/^STORAGE_BACKEND=//p' .env | tail -1 | tr -d "\"' ")"
-  STORAGE_BACKEND="${ENV_BACKEND:-local}"
-  echo "==> Backend aus bestehender .env: $STORAGE_BACKEND"
-fi
+# --- Start -------------------------------------------------------------------------------
 
-echo "==> docker compose build && up -d ..."
-# Beim local-Backend braucht es zusaetzlich den Bind-Mount des gemounteten
-# Shares; beim SMB-Backend wird nichts gemountet.
-COMPOSE_FILES=(-f docker-compose.yml)
-if [ "$STORAGE_BACKEND" = "local" ]; then
-  COMPOSE_FILES+=(-f docker-compose.local.yml)
-fi
-docker compose "${COMPOSE_FILES[@]}" up -d --build
+echo "==> Bauen und starten ..."
+docker compose up -d --build
 
-if [ -f /root/mail2nas-install.env ]; then
-  shred -u /root/mail2nas-install.env 2>/dev/null || rm -f /root/mail2nas-install.env
-fi
-
-echo
-if [ "$WRITE_ENV" -eq 0 ]; then
-  echo "mail2nas aktualisiert und neu gestartet - Konfiguration unveraendert."
-else
-  echo "mail2nas laeuft."
-fi
-echo "Logs:    cd $TARGET_DIR && docker compose logs -f"
-echo "Config:  $TARGET_DIR/.env (chmod 600)"
-if [ "$WEB_ENABLED" = "true" ]; then
-  CT_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  echo "Weboberflaeche: http://${CT_IP:-<container-ip>}:${WEB_PORT:-8080}/"
-fi
-
-if [ "$WRITE_ENV" -eq 1 ]; then
-  echo
-  if [ "$WEB_ENABLED" = "true" ]; then
-    echo "Naechster Schritt: in der Weboberflaeche anmelden und die Stichwoerter"
-    echo "den Zielordnern zuordnen. Das Passwort dort bitte gleich aendern."
-  elif [ "$STORAGE_BACKEND" = "smb" ]; then
-    echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml in die"
-    echo "Wurzel der Freigabe //${SMB_HOST}/${SMB_SHARE} kopieren (vom NAS oder"
-    echo "einem anderen Rechner aus) und an die eigenen Stichwoerter anpassen."
-    echo "Vorlage: $TARGET_DIR/config/mapping.example.yaml"
-  else
-    echo "Naechster Schritt: config/mapping.example.yaml als mapping.yaml nach"
-    echo "$NAS_PATH kopieren und an deine Stichwoerter anpassen:"
-    echo "  cp $TARGET_DIR/config/mapping.example.yaml $NAS_PATH/mapping.yaml"
+echo "==> Warte auf die Weboberflaeche ..."
+PASSWORD=""
+for _ in $(seq 1 60); do
+  if PASSWORD="$(docker compose exec -T mail2nas python -m mail2nas.cli password 2>/dev/null)" \
+     && [ -n "$PASSWORD" ]; then
+    break
   fi
+  PASSWORD=""
+  sleep 2
+done
+
+cat > /usr/local/bin/mail2nas-update <<EOF
+#!/bin/sh
+# mail2nas auf den neuesten Stand bringen (angelegt von install.sh).
+MAIL2NAS_TARGET_DIR="$TARGET_DIR" exec bash "$TARGET_DIR/scripts/proxmox/update.sh" "\$@"
+EOF
+chmod 755 /usr/local/bin/mail2nas-update
+
+CT_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+echo
+echo "mail2nas laeuft."
+echo
+echo "  Weboberflaeche: http://${CT_IP:-<container-ip>}:${WEB_PORT}/"
+if [ -n "$PASSWORD" ]; then
+  echo "  Startpasswort:  $PASSWORD"
+else
+  echo "  Startpasswort:  cd $TARGET_DIR && docker compose exec mail2nas python -m mail2nas.cli password"
 fi
+echo
+echo "Naechste Schritte - alles in der Weboberflaeche:"
+echo "  1. Anmelden und unter 'Passwort' ein eigenes setzen."
+echo "  2. Archiv einrichten (NAS-Freigabe per SMB - 'Verbindung testen')."
+echo "  3. Postfach anlegen ('Anmeldung und Ordner pruefen')."
+echo "  4. Zuordnungen anlegen - oder eine alte mapping.yaml importieren."
+echo
+echo "Logs:    cd $TARGET_DIR && docker compose logs -f"
+echo "Update:  mail2nas-update"

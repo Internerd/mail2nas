@@ -1,1089 +1,845 @@
 # mail2nas
 
-Holt Mails per IMAP ab, sortiert Anhaenge anhand konfigurierbarer Stichwoerter
-(Stichwort im Betreff -> Zielordner) und legt sie auf einem SMB-Share ab. Die
-Zuordnungen werden ueber eine kleine, passwortgeschuetzte Weboberflaeche
-gepflegt. Gedacht zum Betrieb als Container auf Proxmox (LXC/Docker), kann aber
-genauso als einfacher systemd-Service laufen.
+Holt Mails per IMAP ab, sortiert die Anhaenge anhand von Stichwoertern in
+Ordner auf dem NAS (SMB) und druckt auf Wunsch mit. Dazu kommen Scans, die ein
+Kopierer direkt in einen Ordner legt ("Scan to Folder"), und Adressen wie
+`drucker@firma.de`, an die man einfach etwas schickt, damit es ausgedruckt
+wird.
+
+**Eingerichtet wird alles in der Weboberflaeche** - Postfaecher,
+NAS-Freigaben, Zuordnungen, Drucker, Adressen, Abholordner und alle
+Einstellungen. Die Installation fragt nach keinem einzigen Passwort; die
+Konfiguration liegt in einer Datenbank im Container, nicht in Dateien und nicht
+auf dem NAS. Gedacht fuer eine LXC auf Proxmox, laeuft aber ueberall, wo
+Docker laeuft.
 
 ## Inhaltsverzeichnis
 
 - [Funktionsweise](#funktionsweise)
 - [Voraussetzungen](#voraussetzungen)
-- [Installation, Variante 1: Proxmox-Helper-Skript (automatisch)](#installation-variante-1-proxmox-helper-skript-automatisch)
-- [Installation, Variante 2: Proxmox ohne Git (manuelles Kopieren)](#installation-variante-2-proxmox-ohne-git-manuelles-kopieren)
-- [Weiter mit Docker Compose](#weiter-mit-docker-compose)
-- [Alternative ohne Docker (LXC + systemd)](#alternative-ohne-docker-lxc--systemd)
-- [Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift)
-- [Weboberflaeche](#weboberflaeche)
+- [Installation](#installation)
+- [Erste Einrichtung](#erste-einrichtung)
+- [Die Weboberflaeche](#die-weboberflaeche)
+- [Archive: wohin abgelegt wird](#archive-wohin-abgelegt-wird)
 - [Drucken](#drucken)
-  - [Drucker im Netzwerk finden](#drucker-im-netzwerk-finden)
-  - [Drucken per Mail-Adresse (Zustelladressen)](#drucken-per-mail-adresse-zustelladressen)
-- [Mehrere Archive (mehrere NAS oder Freigaben)](#mehrere-archive-mehrere-nas-oder-freigaben)
 - [Abholordner (Scan-to-Folder)](#abholordner-scan-to-folder)
-- [Konfiguration (Environment-Variablen)](#konfiguration-environment-variablen)
-- [Mapping-Datei und Mehrfach-Anhaenge](#mapping-datei-und-mehrfach-anhaenge)
+- [Wo die Konfiguration liegt](#wo-die-konfiguration-liegt)
+- [Updates](#updates)
+- [Kommandozeile](#kommandozeile)
 - [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
 - [Betrieb & Troubleshooting](#betrieb--troubleshooting)
-- [Tests](#tests)
+- [Bekannte Grenzen](#bekannte-grenzen)
+- [Tests und Entwicklung](#tests-und-entwicklung)
 - [Sicherheitshinweise](#sicherheitshinweise)
 - [Datenschutz (DSGVO)](#datenschutz-dsgvo)
 - [Rechnungsarchivierung / GoBD-Hinweis](#rechnungsarchivierung--gobd-hinweis)
 - [Haftungsausschluss](#haftungsausschluss)
 - [Lizenz](#lizenz)
-- [Updates einspielen](#updates-einspielen)
 
 ## Funktionsweise
 
-1. Verbindet sich per IMAP mit einem oder mehreren Postfaechern (IDLE-Push
-   oder Polling, je Postfach einstellbar).
-2. Liest ungelesene Mails, sucht im Betreff (optional auch im Mailtext)
-   nach den konfigurierten Stichwoertern.
-3. Die Zuordnungen werden **von oben nach unten** geprueft, die erste
-   passende gewinnt und bestimmt den Zielordner unterhalb des SMB-Shares
-   (z. B. `RE`/`Rechnung` -> `rechnungen/`, `LS`/`Lieferschein` ->
-   `lieferscheine/`). Gross-/Kleinschreibung ist egal, `*` und `?` sind als
-   Platzhalter erlaubt, und eine Zuordnung kann auf ein einzelnes Postfach
-   beschraenkt werden. Ohne Treffer landen Anhaenge im `FALLBACK_FOLDER`
-   (Default: `unsorted/`).
-4. Anhaenge werden mit Datums-/Absender-Praefix gespeichert, Namenskollisionen
-   werden automatisch durch einen Zaehler-Suffix vermieden.
-   Auf Wunsch werden sie zusaetzlich **ausgedruckt** - alles, was an eine
-   dafuer eingerichtete Adresse geschickt wurde (`drucker@firma.de`), alles
-   aus einem bestimmten Postfach, oder nur das, was eine bestimmte Zuordnung
-   trifft (z. B. nur Rechnungen). Siehe [Drucken](#drucken).
-5. Die Mail wird als gelesen markiert (und optional in einen
-   `IMAP_PROCESSED_FOLDER` verschoben). Zusaetzlich wird die Message-ID in
-   einer lokalen SQLite-Datenbank vermerkt, damit nichts doppelt verarbeitet
-   wird, selbst wenn das `\Seen`-Flag von woanders zurueckgesetzt wird.
-6. Die Zuordnungen liegen als `mapping.yaml` auf dem SMB-Share und werden bei
-   jedem Zyklus neu eingelesen - Anpassungen wirken ohne Neustart/Redeploy.
-   Gepflegt werden sie in der [Weboberflaeche](#weboberflaeche); die Datei
-   bleibt dabei das Original und ist im Notfall auch von Hand editierbar.
+1. mail2nas ueberwacht ein oder mehrere IMAP-Postfaecher (IDLE-Push oder
+   Polling, je Postfach einstellbar) und liest die ungelesenen Mails.
+2. Jeder Anhang wird zuerst anhand **seines eigenen Dateinamens** gegen die
+   Zuordnungen geprueft, dann anhand des Betreffs (auf Wunsch auch des
+   Mailtexts). Die Liste wird **von oben nach unten** geprueft, die erste
+   passende Zuordnung gewinnt und bestimmt den Zielordner - z. B.
+   `Rechnung*` -> `rechnungen/`. Gross-/Kleinschreibung ist egal, `*` und `?`
+   sind Platzhalter, eine Zuordnung kann auf ein Postfach beschraenkt werden.
+   Ohne Treffer landet der Anhang im Ordner fuer Unsortiertes.
+3. Der Anhang wird mit Datum und Absender im Namen auf dem NAS abgelegt -
+   direkt per SMB, ohne dass irgendwo etwas gemountet wird. Namenskollisionen
+   bekommen einen Zaehler, nichts wird ueberschrieben.
+4. Auf Wunsch wird zusaetzlich gedruckt: alles aus einem Postfach, nur was
+   eine Zuordnung trifft (z. B. nur Rechnungen), oder alles, was an eine
+   bestimmte Adresse geschickt wurde. Siehe [Drucken](#drucken).
+5. Die Mail wird als gelesen markiert (optional in einen anderen IMAP-Ordner
+   verschoben) und ihre Message-ID vermerkt, damit nichts doppelt verarbeitet
+   wird - auch wenn jemand das Gelesen-Flag zuruecksetzt.
+6. Abholordner werden alle 30 Sekunden geleert: fertige Scans werden nach
+   denselben Regeln einsortiert (und optional gedruckt).
 
-Der Zugriff auf die Freigabe laeuft standardmaessig **direkt per SMB aus der
-Anwendung heraus**: es wird nichts gemountet, weder im Container noch auf dem
-Proxmox-Host. Warum das so ist und welche Alternative es gibt, steht unter
-[Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift).
+Anhaenge mit ausfuehrbaren Dateiendungen (`.exe`, `.js`, `.ps1` ...) landen
+immer in einem Quarantaene-Ordner - auch wenn sie `Rechnung.exe` heissen - und
+werden nie gedruckt. Mehr dazu unter
+[Sicherheit](#sicherheit-angriffsflaeche-ueber-mailanhaenge).
 
 ## Voraussetzungen
 
-- Ein IMAP-Postfach (am besten ein dediziertes Konto/App-Passwort, keine
-  Zugangsdaten eines persoenlichen Postfachs).
-- Ein SMB-Share mit einem Benutzer, der Schreibrechte auf die Zielordner hat.
-- Ein Proxmox-Host mit einer LXC (Debian/Ubuntu-Template) oder VM, auf der
-  entweder Docker+Compose oder Python 3.11+ verfuegbar ist.
-- Fuer die Weboberflaeche: ein freier Port (Default 8080) und ein Browser im
-  selben Netz. Sie ist optional (`WEB_ENABLED=false`).
-- Fuers [Drucken](#drucken) (ebenfalls optional): ein Drucker an einem
-  CUPS-Server, der aus dem Container erreichbar ist. Der CUPS-*Client* `lp`
-  ist im Image enthalten, ein Druckerdienst laeuft dort nicht.
-- **Kein** Mount und damit auch kein `cifs-utils` noetig - mail2nas spricht
-  SMB selbst. Nur beim optionalen `STORAGE_BACKEND=local` muss das Share
-  vorher vom Betriebssystem eingebunden sein.
-- Zugriff auf `apt`/`pip` fuer Paketinstallationen (Internet oder ein
-  interner Mirror) - **git/GitHub wird nicht benoetigt**, siehe naechster
-  Abschnitt.
+- Ein Proxmox-Host (fuer das Helper-Skript) - oder irgendein Linux-System mit
+  Docker und Docker Compose.
+- Ein IMAP-Postfach, am besten ein eigenes Konto mit App-Passwort.
+- Eine SMB-Freigabe mit einem Benutzer, der in die Zielordner schreiben darf.
+  **Gemountet werden muss nichts**, weder auf dem Host noch im Container, und
+  es braucht kein `cifs-utils`.
+- Ein Browser im selben Netz - die Weboberflaeche laeuft auf Port 8080.
+- Optional fuers Drucken: ein Drucker an einem CUPS-Server, den der Container
+  erreicht. Der CUPS-Client steckt im Image.
+- Internet- bzw. Mirror-Zugriff fuer `apt`, Docker-Images und `pip`. Zugriff
+  auf GitHub ist praktisch, aber nicht zwingend (siehe
+  [Variante 3](#variante-3-ohne-zugriff-auf-github-bootstrap)).
 
-## Installation, Variante 1: Proxmox-Helper-Skript (automatisch)
+## Installation
 
-Der schnellste Weg, sofern der Proxmox-Host Internetzugriff auf GitHub hat:
-ein einzelner Befehl in der Proxmox-VE-Shell (Rechenzentrum -> Node -> Shell,
-**nicht** in einer Container-Konsole), angelehnt an den Stil der bekannten
-[Proxmox VE Helper-Scripts](https://community-scripts.github.io/ProxmoxVE/)
-(eigenstaendige Neuimplementierung fuer dieses Projekt, keine Codeuebernahme):
+Keine der Varianten fragt nach Mail- oder NAS-Zugangsdaten: die kommen danach
+in der Weboberflaeche dazu. Jede Variante endet mit der Adresse der
+Oberflaeche und einem **zufaellig erzeugten Startpasswort**.
+
+### Variante 1: Proxmox-Helper-Skript (empfohlen)
+
+Auf der Shell des **Proxmox-Hosts** (Datacenter -> Node -> Shell, nicht in
+einer Container-Konsole):
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/mail2nas.sh)"
 ```
 
-Das Skript:
+Im Menue **"Neu installieren"** waehlen. Das Skript
 
-1. Fragt (per whiptail-Dialogen) nach Container-Ressourcen (CTID, Hostname,
-   CPU/RAM/Disk, Netzwerk-Bridge) - mit sinnvollen Defaults, die sich per
-   "Standard-Einstellungen? Nein" auch im Detail anpassen lassen.
-2. Fragt anschliessend nach den IMAP- und SMB-Zugangsdaten, dem Mapping-Pfad
-   und Fallback-Ordner sowie danach, ob die Weboberflaeche aktiviert werden
-   soll (mit Port und Startpasswort).
-3. Legt eine neue, unprivilegierte Debian-12-LXC an (`pct create`).
-4. Installiert darin Docker und git, klont dieses Repository, schreibt die
-   `.env` aus deinen Eingaben und startet den Dienst (`docker compose up -d`).
-   Es wird kein Share gemountet - weder in der LXC noch auf dem Host.
-5. Zeigt am Ende die Container-IP sowie die Befehle zum Log-Ansehen und fuer
-   einen Testlauf.
+1. fragt nur die Container-Ressourcen ab (Standard: 1 Kern, 512 MB RAM, 4 GB
+   Disk, DHCP auf `vmbr0`, unprivilegiert - oder erweitert mit eigener CTID,
+   Bridge, Port),
+2. legt eine Debian-12-LXC mit `nesting=1,keyctl=1` an (noetig fuer Docker),
+3. installiert darin Docker und mail2nas nach `/opt/mail2nas`,
+4. zeigt am Ende **Adresse und Startpasswort** der Weboberflaeche.
 
-Alle eingegebenen Passwoerter landen ausschliesslich in der `.env` innerhalb
-der neuen LXC (Rechte `600`) - nicht im Bash-Verlauf des Proxmox-Hosts: die
-temporaere Uebergabedatei auf dem Host wird per `shred` entfernt, sobald sie
-in den Container kopiert wurde.
+Dasselbe Skript aktualisiert spaeter auch - siehe [Updates](#updates).
+Ohne Menue: `... mail2nas.sh install` bzw. `... mail2nas.sh update [CTID]`.
 
-Nicht abgefragt werden die Sicherheits-/Feinjustierungs-Variablen (Groessen-
-limits, Blockliste, `MATCH_BODY`, ...) - dafuer gelten die dokumentierten
-Defaults (siehe [Konfiguration](#konfiguration-environment-variablen)); nach
-der Installation einfach in `/opt/mail2nas/.env` in der LXC anpassen und
-`docker compose up -d` erneut ausfuehren.
+### Variante 2: In einer vorhandenen LXC/VM
 
-Danach fehlen nur noch die Stichwort-Zuordnungen. Mit aktivierter
-Weboberflaeche geht das im Browser unter `http://<container-ip>:8080/` - das
-Skript zeigt die Adresse am Ende an. Ohne Weboberflaeche stattdessen
-`config/mapping.example.yaml` (liegt im Container unter
-`/opt/mail2nas/config/`) als `mapping.yaml` auf die Wurzel des SMB-Shares
-kopieren, siehe [Mapping-Datei](#mapping-datei-und-mehrfach-anhaenge).
-
-**Voraussetzung**: Der Proxmox-Host selbst braucht dafuer Internetzugriff auf
-GitHub (fuer den `curl`-Aufruf und den `git clone` in der LXC) sowie auf die
-Debian-Paketquellen und `get.docker.com`. Wenn das nicht gegeben ist, siehe
-Variante 2.
-
-Falls du schon eine Container/VM hast und nur den App-Teil (Docker, Code,
-`.env`) darin einrichten willst - ohne dass das Skript selbst eine LXC
-anlegt - kannst du auch direkt `scripts/proxmox/install.sh` **innerhalb**
-dieser Umgebung ausfuehren:
+In einer Debian/Ubuntu-LXC oder -VM als root:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/install.sh)"
 ```
 
-Das fragt nicht interaktiv nach - es erwartet die Konfiguration als bereits
-gesetzte Umgebungsvariablen (z. B. `IMAP_HOST=... IMAP_USER=... bash -c "..."`,
-siehe Variablenliste im Skript-Kopf).
+Installiert git und Docker (falls noetig), holt den Code nach
+`/opt/mail2nas`, schreibt eine `.env` mit Port und Zeitzone, startet und gibt
+Adresse und Startpasswort aus. Laeuft dort schon mail2nas, wird stattdessen
+aktualisiert - ein erneuter Aufruf ist also gefahrlos.
 
-## Installation, Variante 2: Proxmox ohne Git (manuelles Kopieren)
+Optional: `WEB_PORT=9090 TZ=Europe/Vienna bash -c "$(curl ...)"`.
 
-Wenn der Proxmox-Host bzw. die LXC keinen Zugriff auf git/GitHub hat (z. B.
-wegen Firewall/Proxy), gibt es zwei Wege, den Code trotzdem draufzubekommen:
+Bei einer selbst angelegten LXC muessen unter *Optionen -> Features*
+`nesting` und `keyctl` aktiv sein, sonst startet Docker nicht.
 
-### Variante A: Ein Bootstrap-Skript per Copy & Paste (am einfachsten)
+### Variante 3: Ohne Zugriff auf GitHub (Bootstrap)
 
-Im Repo liegt `scripts/bootstrap.sh` - ein einzelnes, in sich geschlossenes
-Shell-Skript, das die komplette Projektstruktur (Python-Code, Dockerfile,
-docker-compose.yml, Beispiel-Mapping, Tests) neu erzeugt. Es braucht dafuer
-nichts weiter als `bash` - kein git, keine Internetverbindung fuer den Code
-selbst.
-
-1. Auf einem Rechner mit Zugriff auf dieses Repository (z. B. der eigene
-   Laptop, oder wo auch immer der Code gerade vorliegt) den Inhalt von
-   `scripts/bootstrap.sh` oeffnen und den kompletten Text kopieren.
-2. Per SSH auf den Proxmox-Host bzw. in die Ziel-LXC verbinden:
-   ```bash
-   ssh root@proxmox-host
-   # bzw. innerhalb der LXC:
-   pct enter <CTID>
-   ```
-3. Eine neue Datei anlegen und den kopierten Inhalt einfuegen:
-   ```bash
-   nano bootstrap.sh
-   # Inhalt einfuegen (Rechtsklick/Strg+Umschalt+V im Terminal), speichern mit Strg+O, Strg+X
-   ```
-4. Ausfuehren - das Zielverzeichnis ist optional, Default ist `/opt/mail2nas`:
-   ```bash
-   bash bootstrap.sh /opt/mail2nas
-   ```
-   Das Skript legt darunter `mail2nas/` (Python-Paket), `config/`, `tests/`,
-   `requirements*.txt`, `Dockerfile`, `docker-compose.yml`, `.env.example`
-   und `.dockerignore` an.
-5. Weiter geht's ab [Weiter mit Docker Compose](#weiter-mit-docker-compose)
-   bzw. [Alternative ohne Docker](#alternative-ohne-docker-lxc--systemd).
-
-Das Skript ist idempotent: erneutes Ausfuehren ueberschreibt die Dateien
-einfach neu (z. B. um eine neue Version einzuspielen, siehe
-[Updates einspielen](#updates-einspielen)). Eigene `.env` und `mapping.yaml`
-auf dem SMB-Share bleiben davon unberuehrt, da sie nicht Teil des Skripts
-sind.
-
-### Variante B: Fertigen Ordner per scp/sftp uebertragen
-
-Falls irgendein Rechner (Laptop, Jump-Host, ...) sowohl Zugriff auf den
-Code als auch Netzwerkzugriff auf den Proxmox-Host hat, aber der
-Proxmox-Host selbst offline/isoliert ist:
-
-1. Auf dem Rechner mit dem Code ein Archiv bauen:
-   ```bash
-   tar czf mail2nas.tar.gz \
-     mail2nas requirements.txt requirements-dev.txt \
-     Dockerfile docker-compose.yml .env.example .dockerignore \
-     config tests
-   ```
-2. Archiv auf den Proxmox-Host bzw. in die LXC kopieren:
-   ```bash
-   scp mail2nas.tar.gz root@proxmox-host:/opt/
-   # bei einer LXC ohne direkten SSH-Zugriff z. B. ueber den Proxmox-Host:
-   pct push <CTID> mail2nas.tar.gz /opt/mail2nas.tar.gz
-   ```
-3. Auf dem Zielsystem entpacken:
-   ```bash
-   mkdir -p /opt/mail2nas
-   tar xzf /opt/mail2nas.tar.gz -C /opt/mail2nas
-   cd /opt/mail2nas
-   ```
-
-Beide Varianten fuehren zum selben Ergebnis: ein vollstaendiger
-`/opt/mail2nas`-Ordner, bereit fuer die Konfiguration.
-
-## Weiter mit Docker Compose
-
-Empfohlener Weg, sobald der Ordner (per Variante A oder B) auf dem Zielsystem
-liegt:
+`scripts/bootstrap.sh` enthaelt das komplette Projekt in einer einzigen Datei.
+Auf einem Rechner mit Zugriff herunterladen, auf das Zielsystem bringen
+(Copy & Paste in eine SSH-Sitzung genuegt, oder `scp`), dort:
 
 ```bash
-apt-get update && apt-get install -y docker.io docker-compose-plugin
-
+bash bootstrap.sh /opt/mail2nas
 cd /opt/mail2nas
 cp .env.example .env
-$EDITOR .env    # IMAP- und SMB-Zugangsdaten eintragen
-
 docker compose up -d --build
-docker compose logs -f
+docker compose exec mail2nas python -m mail2nas.cli password   # Startpasswort
 ```
 
-Es ist nichts zu mounten: mit dem Default `STORAGE_BACKEND=smb` verbindet sich
-mail2nas selbst mit `//SMB_HOST/SMB_SHARE`. Beim Start wird einmal testweise
-geschrieben, damit falsche Zugangsdaten oder fehlende Schreibrechte sofort im
-Log stehen statt erst bei der ersten Mail.
+Ein Update geht genauso: neue `bootstrap.sh` ausfuehren, dann
+`MAIL2NAS_OFFLINE=1 bash /opt/mail2nas/scripts/proxmox/update.sh` - das baut,
+migriert und raeumt auf, ohne etwas herunterzuladen.
 
-Die Stichwort-Zuordnungen werden danach in der
-[Weboberflaeche](#weboberflaeche) gepflegt: `http://<host>:8080/`, Anmeldung
-mit `WEB_PASSWORD` aus der `.env`.
-
-Wer die Oberflaeche nicht will (`WEB_ENABLED=false`), legt `mapping.yaml`
-stattdessen von Hand auf die Wurzel des Shares (Pfad relativ dazu ist in
-`MAPPING_PATH` konfigurierbar). Da das Share hier nirgends gemountet ist, geht
-das ueber einen beliebigen SMB-Client - Windows-Explorer, die Dateiverwaltung
-des NAS, oder `smbclient`:
+### Variante 4: Docker Compose von Hand
 
 ```bash
-smbclient //nas.local/Belege -U mail2nas -c 'put config/mapping.example.yaml mapping.yaml'
-```
-
-### Variante mit bereits gemountetem Share
-
-Ist das Share ohnehin schon vom Betriebssystem eingebunden (eigener
-fstab-Eintrag, Bind-Mount vom Proxmox-Host), kann mail2nas stattdessen einfach
-in dieses Verzeichnis schreiben. Dann `STORAGE_BACKEND=local` setzen, `NAS_PATH`
-auf das gemountete Verzeichnis zeigen lassen und die Compose-Override-Datei
-mitgeben, die den Bind-Mount ergaenzt:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
-```
-
-### Testlauf ohne Nebenwirkungen
-
-`DRY_RUN=true` in der `.env` setzen und `docker compose up` laufen lassen:
-es wird nur geloggt, was passieren wuerde - es werden weder Dateien
-geschrieben noch IMAP-Flags/Ordner veraendert.
-
-```bash
-docker compose logs -f | grep -i dry-run
-```
-
-## Alternative ohne Docker (LXC + systemd)
-
-Falls kein Docker gewuenscht ist, laeuft das Script genauso in einer
-schlanken Debian-LXC mit Python-venv - auch das komplett ohne git, sobald
-der Ordner per Bootstrap-Skript oder scp vorliegt (siehe oben).
-
-```bash
+git clone https://github.com/Internerd/mail2nas.git /opt/mail2nas
 cd /opt/mail2nas
-
-apt-get update && apt-get install -y python3-venv python3-pip
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-
-# Systembenutzer fuer den Dienst anlegen
-useradd --system --home /opt/mail2nas --shell /usr/sbin/nologin mail2nas || true
+cp .env.example .env        # optional - ohne .env gelten die Defaults
+docker compose up -d --build
+docker compose logs | grep "generated one"   # oder: python -m mail2nas.cli password
 ```
 
-Auch hier wird nichts gemountet - die SMB-Zugangsdaten stehen in der `.env`,
-die nur dem Dienstbenutzer gehoert. Danach `.env` anlegen:
+Die `.env` enthaelt nur noch Port, Zeitzone und Log-Level, siehe
+[Wo die Konfiguration liegt](#wo-die-konfiguration-liegt).
+
+### Ohne Docker (systemd)
+
+Moeglich, aber mit mehr Handarbeit - Docker ist der getestete Weg.
 
 ```bash
-cp .env.example .env
-$EDITOR .env
-chown -R mail2nas:mail2nas /opt/mail2nas
-chmod 600 /opt/mail2nas/.env
-```
+apt-get install -y python3-venv cups-client
+useradd --system --home /var/lib/mail2nas --create-home mail2nas
+git clone https://github.com/Internerd/mail2nas.git /opt/mail2nas
+python3 -m venv /opt/mail2nas/venv
+/opt/mail2nas/venv/bin/pip install -r /opt/mail2nas/requirements.txt
 
-Anschliessend als systemd-Service einrichten
-(`/etc/systemd/system/mail2nas.service`):
-
-```ini
+cat > /etc/systemd/system/mail2nas.service <<'EOF'
 [Unit]
-Description=mail2nas IMAP-to-SMB archiver
-After=network-online.target remote-fs.target
+Description=mail2nas
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=/opt/mail2nas/.env
-Environment=STATE_DB_PATH=/opt/mail2nas/state.db
-ExecStart=/opt/mail2nas/venv/bin/python -m mail2nas.main
-WorkingDirectory=/opt/mail2nas
-Restart=on-failure
-RestartSec=10
 User=mail2nas
+WorkingDirectory=/opt/mail2nas
+Environment=STATE_DB_PATH=/var/lib/mail2nas/state.db
+Environment=WEB_PORT=8080
+ExecStart=/opt/mail2nas/venv/bin/python -m mail2nas.main
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now mail2nas
+cat /var/lib/mail2nas/initial-password.txt
 ```
 
-Diese Datei kann genauso wie das Bootstrap-Skript per Copy&Paste (`nano
-/etc/systemd/system/mail2nas.service`) angelegt werden. Danach aktivieren:
+## Erste Einrichtung
 
-```bash
-systemctl daemon-reload
-systemctl enable --now mail2nas
-systemctl status mail2nas
-journalctl -u mail2nas -f
-```
+Nach dem ersten Aufruf von `http://<ip>:8080/` fuehrt die **Uebersicht** durch
+die Einrichtung. Die Reihenfolge:
 
-Die Weboberflaeche laeuft im systemd-Betrieb im selben Prozess mit, sobald
-`WEB_ENABLED=true` in der `.env` steht - ein zweiter Dienst ist nicht noetig.
-Alternativ `mapping.yaml` wie im Docker-Abschnitt beschrieben von Hand auf die
-Wurzel der Freigabe (bzw. den konfigurierten `MAPPING_PATH`) legen.
+1. **Anmelden** mit dem Startpasswort und unter **Passwort** ein eigenes
+   setzen. Das Startpasswort wird dabei auch vom Server geloescht.
+2. **Archiv einrichten** (Konfiguration -> Archiv hinzufuegen): Server,
+   Freigabe, Benutzer, Passwort des NAS. **Verbindung testen** schreibt eine
+   winzige Testdatei und loescht sie wieder - danach steht fest, dass
+   Zugangsdaten und Schreibrechte stimmen.
+3. **Postfach anlegen** (Konfiguration -> Postfach hinzufuegen): IMAP-Server,
+   Benutzer, Passwort, Ordner. **Anmeldung und Ordner pruefen** meldet sich
+   an und zeigt, wie viele ungelesene Mails warten - ohne eine anzufassen.
+4. **Zuordnungen anlegen**: Stichwort eintippen, Zielordner aus der Liste der
+   Ordner auf dem NAS waehlen (oder einen neuen anlegen). Eine
+   `mapping.yaml` aus einer anderen Installation laesst sich importieren.
+5. Optional: **Drucker**, **Zustelladressen**, **Abholordner**, und unter
+   **Einstellungen** Ordnernamen, Grenzwerte und den Testmodus.
 
-Soll stattdessen ein bereits gemountetes Verzeichnis verwendet werden:
-`STORAGE_BACKEND=local` und `STORAGE_ROOT=/mnt/nas` in der `.env` setzen, und
-in der Unit `After=`/`RequiresMountsFor=` auf den Mountpunkt zeigen lassen.
+Solange kein Archiv eingerichtet und erfolgreich getestet ist, holt mail2nas
+**keine** Mail ab - die Oberflaeche sagt das auf jeder Seite. So kann nichts
+an einem Ort landen, an dem es niemand erwartet.
 
-## Wie mail2nas auf das Share zugreift
+**Zum Ausprobieren** gibt es unter Einstellungen den **Testmodus**: es wird
+nichts abgelegt, gedruckt oder als gelesen markiert, nur protokolliert, was
+passieren wuerde (`docker compose logs -f`).
 
-Standardmaessig (`STORAGE_BACKEND=smb`) spricht mail2nas das SMB-Protokoll
-**direkt aus der Anwendung**. Es wird nirgends ein Dateisystem eingehaengt:
-nicht im Docker-Container, nicht in der LXC und nicht auf dem Proxmox-Host.
-
-Der Grund ist eine harte Kernel-Grenze: CIFS ist nicht als `FS_USERNS_MOUNT`
-markiert, und `mount(2)` ist fuer solche Dateisysteme aus dem User-Namespace
-einer **unprivilegierten LXC** verboten. Das gilt unabhaengig davon, wer den
-Mount versucht:
-
-- Dockers `local`-Volume-Treiber mit `type: cifs` setzt den `mount()`-Syscall
-  selbst ab und scheitert mit der wenig aussagekraeftigen Meldung
-  `failed to mount local volume: ... : invalid argument`. Zusaetzlich landet
-  das SMB-Passwort dabei dauerhaft in den Volume-Metadaten des Docker-Daemons
-  und ist per `docker volume inspect` auslesbar.
-- `mount.cifs` innerhalb der LXC scheitert am selben Syscall - auch mit
-  gelockerten AppArmor-Profilen.
-
-Frueher wurde deshalb auf dem Proxmox-Host gemountet und das Verzeichnis per
-Bind-Mount in die LXC gereicht. Das funktioniert, hat aber zwei Nachteile, die
-sich nicht wegkonfigurieren lassen:
-
-- Der Mountpunkt ist fuer **jeden mit Root-Shell auf dem Node** sichtbar, nicht
-  nur fuer diesen einen Container.
-- Die SMB-Zugangsdaten muessen in einer Datei auf dem Host liegen. Wer dort
-  root wird, hat damit Zugriff auf die gesamte Freigabe - und die Datei landet
-  in jedem Host-Backup.
-
-Mit dem SMB-Backend entfaellt beides. Die SMB-Zugangsdaten stehen nur noch in
-der `.env` der LXC (`chmod 600`) - auf dem Host liegt weder ein Mount noch ein
-Passwort - und der Zugriff endet an der Container-Grenze:
+## Die Weboberflaeche
 
 ```
-mail2nas (im Container)  --SMB3-->  //nas/share
-        keine Mounts, kein cifs-utils, keine Host-Konfiguration
+http://<container-ip>:8080/
 ```
 
-Weitere Eigenschaften:
+| Seite | Inhalt |
+|---|---|
+| **Uebersicht** | Einrichtungsschritte, Zustand des Archivs, je Postfach: verbunden / Fehler / zuletzt ok, Anzahl verarbeiteter Mails, Probleme mit Abholordnern |
+| **Zuordnungen** | Stichwort -> Ordner, Reihenfolge mit Pfeilen, je Zeile Postfach, Archiv und Drucken; Export und Import als `mapping.yaml` |
+| **Konfiguration** | Postfaecher, Archive, Drucker (inkl. Suche im Netzwerk), Zustelladressen, Abholordner - jeweils mit Test-Knopf |
+| **Einstellungen** | Ordner fuer Unsortiertes und Quarantaene, Dateinamen, gesperrte Dateitypen, Abrufintervall, Grenzwerte, Drucken, Testmodus |
+| **Passwort** | eigenes Passwort setzen |
 
-- Verbindungen werden bei Fehlern automatisch einmal neu aufgebaut - ein
-  NAS-Neustart oder eine abgelaufene Session beendet den Dienst nicht.
-- Anhaenge werden unter einem temporaeren Namen geschrieben und erst danach
-  umbenannt. Ein abgebrochener Transfer hinterlaesst dadurch nie eine
-  abgeschnittene Datei unter einem Namen, der wie eine vollstaendige Rechnung
-  aussieht.
-- Die Verbindung ist per Default SMB3-verschluesselt (`SMB_ENCRYPT=true`).
-  Aeltere NAS-Firmware kann das ablehnen - dann `SMB_ENCRYPT=false` setzen.
-- Mit `SMB_ROOT` laesst sich alles auf einen Unterordner der Freigabe
-  begrenzen.
+Jede Aenderung wirkt sofort - **ein Neustart des Containers ist nie noetig**.
+Geaenderte Zugangsdaten eines Postfachs bauen nur dessen Verbindung neu auf;
+Einstellungen gelten ab der naechsten Mail.
 
-### Wann `STORAGE_BACKEND=local` sinnvoll ist
-
-Wenn das Share aus anderen Gruenden ohnehin schon vom Betriebssystem
-eingebunden ist, oder wenn statt SMB etwas ganz anderes darunterliegt (NFS,
-lokale Platte, ZFS-Dataset). Dann schreibt mail2nas einfach in das
-konfigurierte Verzeichnis `STORAGE_ROOT`, und um den Mount kuemmert sich das
-System. Fuer Docker ergaenzt `docker-compose.local.yml` den noetigen
-Bind-Mount:
-
-```
-Host   /etc/fstab:  //nas/share  ->  /mnt/mail2nas-<CTID>   (cifs)
-                          |
-            pct -mp0 Bind-Mount   ->  /mnt/nas   (in der LXC)
-                          |
-   docker-compose.local.yml       ->  /mnt/nas   (im Container)
-```
-
-In einer unprivilegierten LXC muss der `fstab`-Eintrag auf dem Host dann
-`uid=101000,gid=101000` setzen: der Container laeuft als uid 1000, und Proxmox
-bildet den User-Namespace ab 100000 ab. Ohne das gehoerten die Dateien im
-Container niemandem und waeren nicht beschreibbar. Bei einem privilegierten
-Container bleibt es bei `uid=1000`.
-
-## Weboberflaeche
-
-Eine kleine, passwortgeschuetzte Seite zum Pflegen der Stichwort-Zuordnungen -
-damit die `mapping.yaml` nicht mehr von Hand bearbeitet werden muss. Sie laeuft
-im selben Prozess wie der Archiver mit, es ist also kein zweiter Dienst und
-kein zweiter Container noetig.
-
-```
-http://<host-oder-container-ip>:8080/
-```
-
-Was sie kann:
-
-- **Stichwort zuordnen**: Stichwort eintippen und einen Zielordner aus einer
-  Liste der Ordner waehlen, die auf der Freigabe tatsaechlich existieren. Statt
-  einen Pfad zu tippen und sich zu vertippen, waehlt man aus - genau das ist
-  der Punkt der Oberflaeche. Ein neuer Ordner kann direkt angelegt werden.
-- **Reihenfolge festlegen**: Die Liste wird von oben nach unten geprueft, die
-  erste passende Zuordnung gewinnt. Mit den Pfeilen `↑`/`↓` laesst sich jede
-  Zeile verschieben - so kommt z. B. `Rechnungskorrektur` ueber `RE`.
-- **Zuordnung aendern oder loeschen**: pro Zeile ein Auswahlfeld und ein
-  Loeschen-Knopf. Der Ordner auf der Freigabe bleibt beim Loeschen bestehen,
-  entfernt wird nur die Regel.
-- **Postfach je Zuordnung**: sobald mehr als ein Postfach eingerichtet ist,
-  hat jede Zeile zusaetzlich ein Auswahlfeld - „alle Postfaecher" oder genau
-  eines.
-- **Drucken je Zuordnung**: pro Zeile ein Auswahlfeld „nicht drucken /
-  drucken auf ..." - so wird z. B. nur ausgedruckt, was als Rechnung erkannt
-  wurde. Siehe [Drucken](#drucken).
-- **Konfiguration**: Postfaecher und Drucker anlegen/aendern/loeschen und die
-  Mapping-Datei verschieben, siehe unten.
-- **Passwort aendern**: nach dem Login unter „Passwort". Dabei werden alle
-  anderen angemeldeten Sitzungen abgemeldet.
-
-Aenderungen landen sofort in der `mapping.yaml` auf der Freigabe und wirken
-beim naechsten Durchlauf des Archivers - kein Neustart noetig.
-
-### Stichwoerter, Reihenfolge und Platzhalter
+### Zuordnungen: Stichwoerter, Reihenfolge, Platzhalter
 
 - **Gross-/Kleinschreibung ist egal.** `re`, `RE` und `Re` sind dasselbe.
 - **Gesucht wird als Teilstring**, nicht als ganzes Wort: `RE` passt auch auf
-  „VORAB-RECHNUNG". Wer das nicht will, nimmt ein laengeres Stichwort.
-- **`*` steht fuer beliebig viele Zeichen, `?` fuer genau eines.** Beispiele:
+  "VORAB-RECHNUNG". Wer das nicht will, nimmt ein laengeres Stichwort.
+- **`*` steht fuer beliebig viele Zeichen, `?` fuer genau eines:**
+
   | Stichwort | passt auf | passt nicht auf |
   |---|---|---|
-  | `RE*` | „Ihre RE-4711" | „Angebot" |
-  | `RE*2026` | „RE-4711 vom 03.2026" | „RE-4711 vom 03.2025" |
-  | `Rechn?ng` | „Rechnung", „Rechnang" | „Rechnuung" |
+  | `RE*` | "Ihre RE-4711" | "Angebot" |
+  | `RE*2026` | "RE-4711 vom 03.2026" | "RE-4711 vom 03.2025" |
+  | `Rechn?ng` | "Rechnung", "Rechnang" | "Rechnuung" |
 
-  Alle anderen Sonderzeichen sind normale Zeichen - `RE.` sucht woertlich
-  nach „RE." und nicht nach einem regulaeren Ausdruck. Maximal 5 Platzhalter
-  pro Stichwort.
-- **Die Reihenfolge entscheidet.** Frueher gewann automatisch das laengere
-  Stichwort; jetzt steht die Prioritaet explizit in der Liste und ist mit den
-  Pfeilen aenderbar. Eine bestehende `mapping.yaml` im alten Format wird genau
-  in diese Reihenfolge uebernommen (laengstes Stichwort zuerst), es aendert
-  sich also nichts an der Einsortierung.
+  Alle anderen Zeichen gelten woertlich - `RE.` ist kein regulaerer Ausdruck.
+  Hoechstens 5 `*` pro Stichwort.
+- **Die Reihenfolge entscheidet**: die erste passende Zuordnung gewinnt. Mit
+  den Pfeilen kommt `Rechnungskorrektur` ueber `RE`.
+- **Jeder Anhang einzeln**: zuerst zaehlt sein eigener Dateiname, dann der
+  Betreff. Eine Mail mit `Rechnung_4711.pdf` und `Lieferschein_4711.pdf` wird
+  so auf `rechnungen/` und `lieferscheine/` aufgeteilt. Anhaenge ohne
+  Hinweis im Namen (`scan0001.pdf`) folgen dem Betreff.
+- **Je Zuordnung waehlbar**: fuer welches Postfach sie gilt, auf welchem
+  Archiv der Ordner liegt (sobald es mehrere gibt) und ob gedruckt wird.
+
+### Sichern und uebertragen
+
+Unter Zuordnungen -> *Sichern und uebertragen*:
+
+- **Als mapping.yaml herunterladen** - eine lesbare Sicherung aller
+  Zuordnungen.
+- **mapping.yaml importieren** - wahlweise anhaengen (Stichwoerter, die es
+  schon gibt, werden uebersprungen) oder ersetzen. Gelesen werden das aktuelle
+  Format und das alte (`Stichwort: ordner`). Verweise auf Postfaecher,
+  Drucker oder Archive, die es in dieser Installation nicht gibt, werden auf
+  den Standard gesetzt. Ein Ordner ausserhalb des Archivs (`../`, `/etc`)
+  bricht den Import ab, ohne etwas zu aendern.
+
+```yaml
+version: 2
+rules:
+  - keyword: Rechnungskorrektur   # steht vor "RE" - sonst griffe "RE" zuerst
+    folder: korrekturen
+  - keyword: "RE*"
+    folder: rechnungen
+    account: "2"                  # nur fuer das Postfach mit dieser ID
+    print: true                   # zusaetzlich drucken
+    printer: "1"                  # ID eines Druckers; weglassen = der des Postfachs
+    archive: "3"                  # ID eines Archivs; weglassen = Standard-Archiv
+```
+
+Beispiel-Datei: [`config/mapping.example.yaml`](config/mapping.example.yaml).
 
 ### Mehrere Postfaecher
 
-Unter „Konfiguration" lassen sich beliebig viele IMAP-Postfaecher anlegen, mit
-je eigenem Server, Ordner und Abrufmodus. Jedes bekommt einen eigenen
-Verbindungs-Thread, damit ein Postfach im IDLE-Modus die anderen nicht
-blockiert. Ein Postfach kann pausiert (`aktiv` aus) statt geloescht werden.
+Beliebig viele IMAP-Postfaecher, je mit eigenem Server, Ordner und Abrufmodus.
+Jedes laeuft in einem eigenen Thread, damit ein Postfach im IDLE-Modus die
+anderen nicht blockiert. Pausieren (Haken "aktiv" weg) statt loeschen ist
+moeglich. Je Postfach einstellbar:
 
-Jede Zuordnung gilt wahlweise fuer alle Postfaecher oder nur fuer eines. Wird
-ein Postfach geloescht, bleiben seine Zuordnungen bestehen, greifen aber nicht
-mehr - die Oberflaeche zeigt sie dann als „(geloeschtes Postfach)".
+- **Verarbeitete Mails verschieben nach** - sonst nur als gelesen markiert.
+- **Zu grosse Mails verschieben nach** - Mails ueber der Maximalgroesse werden
+  gar nicht geladen, nur markiert (und ggf. verschoben).
+- **Alle Anhaenge drucken**, **Drucker** und **Im Archiv ablegen** - siehe
+  [Drucken](#drucken).
 
-Aenderungen an einem Postfach greifen innerhalb weniger Sekunden; die
-betroffene IMAP-Verbindung wird dafuer neu aufgebaut, die anderen laufen
-weiter. Reines Umbenennen loest keinen Reconnect aus.
+Wird ein Postfach geloescht, bleiben seine Zuordnungen stehen und greifen
+nicht mehr - die Oberflaeche zeigt sie als "(geloeschtes Postfach)".
 
-Die erste Konfiguration kommt aus den `IMAP_*`-Variablen der `.env`: daraus
-wird beim allerersten Start ein Postfach angelegt. Danach gilt die Datenbank,
-und die Variablen werden ignoriert - auch wenn das letzte Postfach in der
-Oberflaeche geloescht wurde, kommt es nicht aus der `.env` zurueck.
+### Einstellungen
 
-### Mapping-Datei verschieben
+| Einstellung | Bedeutung | Standard |
+|---|---|---|
+| Ordner fuer Anhaenge ohne Treffer | im Standard-Archiv | `unsorted` |
+| Quarantaene-Ordner | fuer gesperrte Dateitypen | `quarantaene` |
+| Dateiname beginnt mit | Datum und Absender / nur Datum / nur Absender / nichts | Datum und Absender |
+| Stichwoerter auch im Mailtext suchen | sonst nur Dateiname und Betreff | aus |
+| Gesperrte Dateitypen | gehen immer in die Quarantaene; leer = keine Pruefung | `exe, js, ps1, jar, lnk, sh, ...` |
+| Abrufintervall | Polling bzw. IDLE-Erneuerung (10 s - 24 h) | 300 s |
+| Max. Groesse je Anhang / je Mail | dahinter wird uebersprungen bzw. gar nicht geladen | 25 / 50 MB |
+| Max. Anhaenge je Mail | Schutz vor Mails mit tausenden Anhaengen | 20 |
+| Abholordner: fertig nach | so lange muss eine Datei unveraendert sein | 20 s |
+| Drucken erlaubt | Notschalter fuer alles Drucken | an |
+| Druckbare Dateitypen | nur diese gehen an einen Drucker; leer = Standardliste | PDF, PS, Text, Bilder |
+| Zeitgrenze je Druckauftrag | danach gilt er als gescheitert | 120 s |
+| Testmodus | nichts ablegen, drucken oder markieren - nur protokollieren | aus |
 
-Unter „Konfiguration" laesst sich der Pfad der `mapping.yaml` (relativ zur
-Archiv-Wurzel) aendern. Die vorhandene Datei wird dabei an den neuen Ort
-kopiert und am alten geloescht; der Archiver zieht innerhalb weniger Sekunden
-nach. Pfade ausserhalb der Archiv-Wurzel werden abgelehnt.
+Ungueltige Werte (Buchstaben im Intervall, ein Ordner ausserhalb des Archivs,
+Fallback gleich Quarantaene) werden mit einer Meldung abgelehnt; es bleibt
+dann alles beim Alten.
 
 ### Passwort
 
-`WEB_PASSWORD` in der `.env` ist das **Startpasswort**. Beim ersten Start wird
-es gehasht (scrypt) in der lokalen State-Datenbank abgelegt; ab dann gilt der
-gespeicherte Wert und `WEB_PASSWORD` wird ignoriert - eine Aenderung in der
-Oberflaeche ueberlebt also Neustarts und Updates. Mindestlaenge 8 Zeichen.
+Beim allerersten Start erzeugt mail2nas ein zufaelliges Passwort
+(`abcd-efgh-...`, ohne verwechselbare Zeichen). Es steht
 
-Das Passwort in der `.env` nach der ersten Anmeldung zu aendern bringt nichts
-mehr; wer es wirklich zuruecksetzen muss, loescht den Eintrag in der
-State-Datenbank:
+- in der Ausgabe von Installer und Update,
+- im Container-Log (`docker compose logs | grep "generated one"`),
+- in `/data/initial-password.txt` im Container (`chmod 600`),
+- und per `docker compose exec mail2nas python -m mail2nas.cli password`.
+
+Sobald ein eigenes gesetzt ist, wird diese Datei geloescht. Gespeichert wird
+nur ein Hash (scrypt). Beim Aendern werden alle anderen Sitzungen abgemeldet.
+
+**Passwort vergessen?** In der LXC:
 
 ```bash
-docker compose exec -T mail2nas python - <<'EOF'
-import sqlite3
-conn = sqlite3.connect("/data/state.db")
-conn.execute("DELETE FROM settings WHERE key = 'web_password_hash'")
-conn.commit()
-EOF
-docker compose restart
+cd /opt/mail2nas && docker compose exec mail2nas python -m mail2nas.cli reset-password
 ```
 
-Danach gilt wieder das `WEB_PASSWORD` aus der `.env`.
+Das gibt ein neues Zufallspasswort aus und meldet alle Sitzungen ab.
 
-### Sicherheit
+### Sicherheit der Oberflaeche
 
-Die Oberflaeche ist fuer das eigene LAN gedacht und entsprechend gebaut:
+Die Oberflaeche gehoert ins eigene LAN und ist entsprechend gebaut:
 
 - Ein Passwort, keine Benutzerverwaltung. Nach 5 Fehlversuchen ist die
   Anmeldung fuer eine Minute gesperrt (pro IP).
 - Session-Cookie mit `HttpOnly` und `SameSite=Lax`, CSRF-Token in jedem
   Formular, Sitzungsdauer 12 Stunden.
 - Kein JavaScript, keine externen Ressourcen, strikte Content-Security-Policy.
-- Zielordner werden genauso geprueft wie beim Archiver: `..` und absolute
-  Pfade werden abgelehnt, es kann also auch ueber die Oberflaeche nichts
-  ausserhalb der Archiv-Wurzel angelegt werden.
+- Gespeicherte Passwoerter (IMAP, SMB) werden nie zurueck ins Formular
+  geschrieben; ein leeres Feld heisst "unveraendert".
+- Zielordner werden wie beim Ablegen geprueft: `..` und absolute Pfade werden
+  abgelehnt.
 
-**Nicht direkt aus dem Internet erreichbar machen.** Es gibt keine
-TLS-Terminierung und keine Zwei-Faktor-Authentisierung. Wer von aussen
-zugreifen will, nimmt VPN oder einen Reverse-Proxy mit HTTPS davor - und setzt
-dann `WEB_COOKIE_SECURE=true`, damit das Session-Cookie nur noch ueber TLS
-gesendet wird.
+**Nicht direkt ins Internet stellen.** Es gibt kein TLS und keine
+Zwei-Faktor-Anmeldung. Von aussen nur per VPN oder hinter einem Reverse-Proxy
+mit HTTPS - dann `WEB_COOKIE_SECURE=true` in der `.env` setzen.
 
-Abschalten laesst sich das Ganze mit `WEB_ENABLED=false`; die `mapping.yaml`
-ist dann wieder ausschliesslich von Hand zu pflegen.
+Wer die Oberflaeche bedienen kann, kann Postfaecher und Archive anlegen - das
+Passwort ist also so wertvoll wie die Zugangsdaten darin.
 
-`GET /healthz` antwortet ohne Anmeldung mit `ok` - praktisch fuer ein
-Monitoring-Check.
+`GET /healthz` antwortet ohne Anmeldung mit `ok` (fuer Monitoring und den
+Docker-Healthcheck).
+
+## Archive: wohin abgelegt wird
+
+Ein Archiv ist der Ort, an dem Anhaenge landen. Es gibt zwei Arten:
+
+| Art | Angaben | wann |
+|---|---|---|
+| **SMB-Freigabe** (Standard) | Server, Freigabe, Benutzer, Passwort, optional Domain, Port, Unterordner, Verschluesselung | der Normalfall - es wird nichts gemountet |
+| **Gemountetes Verzeichnis** | Pfad, z. B. `/mnt/nas` | wenn das Betriebssystem die Freigabe ohnehin einbindet, oder fuer NFS/ZFS/lokale Platten |
+
+Das **erste aktive** Archiv ist das Standard-Archiv: dorthin geht alles ohne
+eigene Angabe, und dort liegen der Fallback- und der Quarantaene-Ordner.
+Zuordnungen, Zustelladressen und Abholordner koennen jeweils ein anderes
+waehlen - `Vertrag -> vertraege` kann so auf einem anderen NAS landen als
+`Rechnung -> rechnungen`.
+
+### Warum nichts gemountet wird
+
+mail2nas spricht SMB **direkt aus der Anwendung** (SMB3, per Default
+verschluesselt). Es wird kein Dateisystem eingehaengt - nicht im Container,
+nicht in der LXC, nicht auf dem Proxmox-Host.
+
+Grund ist eine harte Kernel-Grenze: CIFS ist nicht als `FS_USERNS_MOUNT`
+markiert, `mount(2)` ist dafuer aus einer **unprivilegierten LXC** verboten -
+egal ob per `mount.cifs` oder per Dockers cifs-Volume-Treiber (der zusaetzlich
+das SMB-Passwort in den Volume-Metadaten ablegt). Frueher wurde deshalb auf
+dem Proxmox-Host gemountet; das machte den Mount fuer jeden mit Root-Shell auf
+dem Node sichtbar und legte die Zugangsdaten in eine Datei auf dem Host, die
+in jedem Host-Backup landete. Mit direktem SMB entfaellt beides:
+
+```
+mail2nas (im Container)  --SMB3-->  //nas/freigabe
+        keine Mounts, kein cifs-utils, keine Host-Konfiguration
+```
+
+Weitere Eigenschaften:
+
+- Faellt die Verbindung weg (NAS-Neustart, abgelaufene Sitzung), wird sie
+  automatisch neu aufgebaut.
+- Anhaenge werden unter einem temporaeren Namen geschrieben und erst danach
+  umbenannt - ein abgebrochener Transfer hinterlaesst nie eine abgeschnittene
+  Datei, die wie eine vollstaendige Rechnung aussieht.
+- Aeltere NAS-Firmware lehnt SMB3-Verschluesselung manchmal ab - dann den
+  Haken "Verbindung verschluesseln" im Archiv entfernen.
+- Mit "Unterordner" laesst sich alles auf einen Teil der Freigabe begrenzen.
+
+### Bereitschaft
+
+Beim Start und nach jeder Aenderung am Standard-Archiv macht mail2nas einen
+**Schreibtest**. Erst wenn der gelingt, werden Postfaecher und Abholordner
+bearbeitet; schlaegt er fehl, steht der Grund in der Uebersicht und es wird
+jede Minute erneut probiert. Ein NAS im Standby oder ein falsches Passwort
+fuehrt also nie dazu, dass Anhaenge irgendwo landen, wo sie niemand sucht.
+
+Faellt ein Archiv **im Betrieb** aus, schlaegt das Ablegen fehl, die Mail
+bleibt ungelesen und wird beim naechsten Durchlauf erneut versucht. Zeigt
+etwas auf ein geloeschtes oder pausiertes Archiv, wird ins Standard-Archiv
+gelegt und das protokolliert - lieber am falschen Ort als verloren. Das letzte
+Archiv laesst sich nicht loeschen.
+
+### Gemountetes Verzeichnis
+
+Soll doch in ein vom Betriebssystem eingebundenes Verzeichnis geschrieben
+werden: in der `.env` `NAS_PATH=/pfad/auf/dem/host` setzen und mit
+`docker-compose.local.yml` starten (das Update-Skript tut das automatisch,
+sobald `NAS_PATH` gesetzt ist). Im Container heisst das Verzeichnis dann
+`/mnt/nas` - diesen Pfad als Archiv vom Typ "Gemountetes Verzeichnis"
+eintragen.
+
+```
+Host   /etc/fstab:  //nas/share  ->  /mnt/mail2nas-<CTID>   (cifs)
+            pct -mp0 Bind-Mount  ->  /mnt/nas   (in der LXC, = NAS_PATH)
+   docker-compose.local.yml      ->  /mnt/nas   (im Container)
+```
+
+In einer unprivilegierten LXC muss der fstab-Eintrag auf dem Host
+`uid=101000,gid=101000` setzen (der Container laeuft als uid 1000, Proxmox
+verschiebt den User-Namespace um 100000). Ist das Verzeichnis **kein
+Mountpoint**, warnt die Uebersicht - genau so sieht ein vergessener Mount aus,
+und dann wuerde in die Container-Platte statt aufs NAS geschrieben.
 
 ## Drucken
 
-Anhaenge koennen zusaetzlich zur Ablage ausgedruckt werden. Alles daran wird
-in der Weboberflaeche eingestellt; in der `.env` steht nur, ob und womit
-ueberhaupt gedruckt werden darf.
+Anhaenge koennen zusaetzlich zur Ablage ausgedruckt werden - oder statt der
+Ablage. Alles daran wird in der Weboberflaeche eingestellt.
 
 ### Drucker einmal anlegen, ueberall auswaehlen
 
-Unter **Konfiguration → Drucker** wird jeder Drucker genau einmal eingetragen:
+Unter **Konfiguration -> Drucker** wird jeder Drucker genau einmal
+eingetragen:
 
 | Feld | Bedeutung |
 |---|---|
-| Anzeigename | wie er in den Auswahlfeldern erscheint, z. B. „Buero EG" |
+| Anzeigename | wie er in den Auswahlfeldern erscheint, z. B. "Buero EG" |
 | Warteschlange in CUPS | der Queue-Name, wie ihn `lpstat -p` zeigt |
 | CUPS-Server | leer = lokaler `cupsd`, sonst z. B. `cups.lan:631` |
 | Kopien | 1-20 |
-| Druckoptionen | wie bei `lp -o`, jeweils ohne `-o`, durch Leerzeichen getrennt: `media=A4 sides=two-sided-long-edge` |
+| Druckoptionen | wie bei `lp -o`, ohne `-o`, durch Leerzeichen getrennt: `media=A4 sides=two-sided-long-edge` |
 | Aktiv | pausierte Drucker bleiben gespeichert, es geht nichts an sie raus |
 
-Danach taucht der Drucker ueberall als Auswahlfeld auf - beim Postfach und bei
-jeder Zuordnung. Aendert sich der Queue-Name, wird er an dieser einen Stelle
-korrigiert.
-
-Der Knopf **Testseite drucken** schickt eine Seite mit den Einstellungen
-dieses Druckers an die Warteschlange. Damit laesst sich pruefen, ob alles
-stimmt, bevor die erste Rechnung ankommt - Fehlermeldungen von CUPS erscheinen
-direkt auf der Seite.
+Danach taucht der Drucker ueberall als Auswahlfeld auf - beim Postfach, bei
+jeder Zuordnung, Zustelladresse und jedem Abholordner. **Testseite drucken**
+prueft die Warteschlange; Fehlermeldungen von CUPS erscheinen direkt auf der
+Seite.
 
 ### Drucker im Netzwerk finden
 
-Unter **Konfiguration → Im Netzwerk suchen** sucht mail2nas Drucker, statt sie
-abtippen zu lassen. Zwei Quellen:
+**Konfiguration -> Im Netzwerk suchen** findet
 
-- **Warteschlangen eines CUPS-Servers** (`lpstat -v` gegen den eingetragenen
-  Server). Die sind sofort verwendbar: „Uebernehmen" fuellt das
-  Drucker-Formular vor, speichern, Testseite drucken, fertig.
-- **Geraete, die sich im Netz selbst ankuendigen** (mDNS/DNS-SD, also
-  AirPrint bzw. „driverless"). Die werden mit Modellname und IPP-Adresse
-  angezeigt - sie sind aber noch keine Warteschlange. Dafuer steht der
-  passende `lpadmin`-Befehl direkt daneben:
+- **Warteschlangen eines CUPS-Servers** (`lpstat -v`) - sofort verwendbar:
+  "Uebernehmen" fuellt das Formular vor.
+- **Geraete, die sich per mDNS/DNS-SD ankuendigen** (AirPrint, "driverless")
+  - mit dem passenden `lpadmin`-Befehl, um daraus eine Warteschlange zu machen:
 
   ```bash
   lpadmin -p Kyocera_M2540 -v ipp://192.168.1.50:631/ipp/print -E -m everywhere
   ```
 
-Beides ist Zusatz, kein Muss: ein Drucker laesst sich weiterhin von Hand
-eintragen. Zwei Einschraenkungen, die man kennen sollte:
-
-- **mDNS braucht Multicast.** In einem normalen Docker-Bridge-Netz kommt davon
-  nichts an, dann bleibt die Liste leer (die Seite sagt das auch). Wer die
-  Suche dort braucht, startet den Container mit `network_mode: host` - oder
-  nutzt einfach den CUPS-Server, der ueber die normale Route erreichbar ist.
-- Gesucht wird nur auf Knopfdruck, nichts laeuft im Hintergrund.
+mDNS braucht Multicast; im Docker-Bridge-Netz kommt davon nichts an (die Seite
+sagt das). Dann den CUPS-Server nutzen oder den Container mit
+`network_mode: host` starten. Gesucht wird nur auf Knopfdruck.
 
 ### Drucken per Mail-Adresse (Zustelladressen)
 
-Der direkteste Weg zu einem Ausdruck: **eine Mail mit Anhang an eine dafuer
-eingerichtete Adresse schicken.** Unter **Konfiguration → Zustelladressen**
-wird festgelegt, was mit Mail an eine bestimmte Adresse passiert:
+Der direkteste Weg zum Ausdruck: **eine Mail an eine dafuer eingerichtete
+Adresse schicken.** Unter **Konfiguration -> Zustelladressen**:
 
 | Feld | Bedeutung |
 |---|---|
-| Empfaengeradresse | `drucker@firma.de` (genau diese), `@firma.de` (ganze Domain) oder `drucker-*@firma.de` (Platzhalter) |
+| Empfaengeradresse | `drucker@firma.de`, `@firma.de` (ganze Domain) oder `drucker-*@firma.de` |
 | Nur von diesem Absender | optional, gleiche Schreibweise. Leer = von jedem |
 | Anhaenge drucken | an/aus, dazu der Drucker |
-| Anhaenge per SMB ablegen | an/aus, dazu optional ein fester Zielordner |
+| Anhaenge ablegen | an/aus, dazu optional ein fester Zielordner und ein Archiv |
 
-Typischer Aufbau: beim Mailanbieter ein **Alias** `drucker-buero@firma.de`
-anlegen, das in das ohnehin ueberwachte Archiv-Postfach zugestellt wird. Ein
-eigenes IMAP-Konto pro Drucker braucht es dafuer nicht.
+Typisch: beim Mailanbieter einen **Alias** `drucker-buero@firma.de` anlegen,
+der ins ohnehin ueberwachte Postfach zugestellt wird - ein eigenes IMAP-Konto
+braucht es nicht. Erkannt wird die Adresse an `Delivered-To`,
+`X-Original-To`, `Envelope-To`, `To`, `Cc` und `Resent-To`.
 
-**Erkannt wird die Adresse an den Kopfzeilen** `Delivered-To`,
-`X-Original-To`, `Envelope-To`, `To`, `Cc` und `Resent-To`. Damit wird ein
-Alias auch dann gefunden, wenn im `To:` etwas anderes steht - genau das
-passiert bei Weiterleitungen und Verteilern.
-
-**Sind Empfaenger- und Absenderadresse gesetzt, muessen beide passen.** Der
-Absender ist damit ein Zugriffsschutz: „drucken darf nur, wer aus unserer
-Domain schreibt". Weil ein Ausdruck Papier und Toner kostet, ist das die
-sichere Richtung - nicht „eines von beiden genuegt".
-
-Drei Beispiele:
+**Sind Empfaenger und Absender gesetzt, muessen beide passen** - der Absender
+ist ein Zugriffsschutz ("drucken darf nur, wer aus unserer Domain schreibt").
+Die erste passende Zustelladresse gewinnt.
 
 | Zustelladresse | Drucken | Ablegen | Wirkung |
 |---|---|---|---|
-| `drucker-buero@firma.de`, Absender `@firma.de` | ja, Buero EG | nein | Kollegen mailen einen Anhang hin, er kommt aus dem Drucker, das NAS bleibt sauber |
+| `drucker-buero@firma.de`, Absender `@firma.de` | ja, Buero EG | nein | Kollegen mailen etwas hin, es kommt aus dem Drucker |
 | `rechnungen@firma.de` | nein | ja, Ordner `rechnungen` | reine Ablage, ohne dass ein Stichwort passen muss |
-| `alles@firma.de` | ja, Buero EG | ja | Papier **und** Archiv |
+| `alles@firma.de` | ja | ja | Papier **und** Archiv |
 
-Die **erste passende Zustelladresse gewinnt** (wie bei den Zuordnungen). Sie
-entscheidet dann ueber Drucken und Ablegen; die Stichwort-Zuordnungen
-bestimmen nur noch den Zielordner, falls die Adresse keinen vorgibt.
+### Wann gedruckt wird - und auf welchem Drucker
 
-### Wann gedruckt wird
+Drei Schalter, kombinierbar:
 
-Drei Schalter, die sich kombinieren lassen:
+- **Je Zustelladresse** - die spezifischste Aussage; sie entscheidet auch,
+  **ob** gedruckt wird.
+- **Je Postfach**: "Alle Anhaenge dieses Postfachs drucken".
+- **Je Zuordnung**: nur was diese Regel trifft, z. B. nur Rechnungen.
 
-- **Je Zustelladresse**: siehe oben - die spezifischste Aussage, weil jemand
-  die Adresse bewusst adressiert hat.
-- **Je Postfach** (Konfiguration → Postfach bearbeiten): „Alle Anhaenge dieses
-  Postfachs drucken". Damit geht alles, was in diesem Postfach ankommt, aufs
-  Papier - unabhaengig von den Stichwoertern.
-- **Je Zuordnung** (Zuordnungen): das Auswahlfeld in der Zeile. Gedruckt wird
-  dann nur, was diese Regel trifft, also z. B. nur Rechnungen. Die Regel wird
-  wie gewohnt zuerst gegen den Dateinamen des Anhangs und dann gegen den
-  Betreff geprueft.
-
-**Welcher Drucker es wird**, entscheidet sich von speziell nach allgemein:
-
-1. der Drucker der passenden Zustelladresse,
-2. sonst der Drucker, den die passende Zuordnung nennt,
-3. sonst der Drucker des Postfachs,
-4. sonst wird nicht gedruckt (und das steht als Warnung im Log).
-
-Passt eine Zustelladresse, hat sie auch das letzte Wort darueber, **ob**
-gedruckt wird: steht dort „nicht drucken", bleibt es dabei, auch wenn das
-Postfach oder eine Zuordnung drucken wollte.
-
-Damit laesst sich genau das Beispiel abbilden, fuer das die Funktion gebaut
-wurde:
+Der Drucker ergibt sich von speziell nach allgemein: Zustelladresse ->
+Zuordnung -> Postfach. Ist keiner gesetzt, wird nicht gedruckt (Warnung im
+Log). Beispiel:
 
 | Postfach | Einstellung | Ergebnis |
 |---|---|---|
-| A | „alle Anhaenge drucken" auf Drucker A, „im Archiv ablegen" aus | jeder Anhang kommt sofort auf Drucker A, nichts landet auf dem NAS |
-| B | Postfach ohne „alles drucken", Zuordnung `Rechnung` mit Drucker B | Anhaenge werden normal abgelegt, aber nur die Rechnungen kommen zusaetzlich auf Drucker B |
+| A | "alle Anhaenge drucken" auf Drucker A, "im Archiv ablegen" aus | alles kommt aus Drucker A, nichts aufs NAS |
+| B | Zuordnung `Rechnung` mit Drucker B | alles wird abgelegt, Rechnungen zusaetzlich auf Drucker B gedruckt |
 
-### Nur drucken, nicht ablegen
+### Nur drucken - ohne dass etwas verloren geht
 
-Der Haken **„Anhaenge im Archiv ablegen"** je Postfach laesst sich abschalten.
-Dann wird nur gedruckt und nichts gespeichert. Zwei Ausnahmen, damit daraus
-kein stiller Datenverlust wird:
+Ist "Anhaenge im Archiv ablegen" aus, wird nur gedruckt. Damit daraus nie ein
+stiller Verlust wird:
 
-- Anhaenge mit **gesperrter Dateiendung** landen weiterhin im
-  Quarantaene-Ordner. Sie koennen ohnehin nicht gedruckt werden, und sie
-  wortlos wegzuwerfen waere genau der falsche Umgang mit dem einen Anhang, den
-  sich jemand ansehen sollte.
-- Wuerde ein Anhang **weder abgelegt noch gedruckt** (z. B. weil kein Drucker
-  konfiguriert ist), steht das als Warnung im Log.
+- **Kommt nichts aus dem Drucker** - kein Drucker gewaehlt, CUPS nicht
+  erreichbar, ein Format, das nicht gedruckt werden kann - wird der Anhang
+  **doch abgelegt** und das im Log gemeldet. Die Mail wird ja gleich als
+  gelesen markiert; das waere die letzte Gelegenheit.
+- Anhaenge mit **gesperrter Dateiendung** landen immer in der Quarantaene.
 
 ### Was gedruckt wird - und was nicht
 
-- Gedruckt wird **erst nach der Ablage**. Das Archiv ist das Original, das
-  Papier die Kopie: ein Drucker ohne Papier darf nie der Grund sein, dass ein
-  Anhang nicht gespeichert wurde. Scheitert ein Druckauftrag, steht er im Log
-  und die Mail gilt trotzdem als verarbeitet - sonst wuerde bei jedem Versuch
-  eine weitere Kopie im Archiv landen.
-- **Anhaenge in Quarantaene werden nie gedruckt.** Eine `.exe` an einen
-  Druckertreiber zu geben ist nichts, was passieren soll.
-- Es gehen nur Formate raus, die CUPS selbst versteht (`PRINTABLE_EXTENSIONS`,
-  Default: PDF, PostScript, Text, Bilder). Ein `.docx` an eine Warteschlange
-  zu schicken produziert einen Stapel Zeichensalat, deshalb steht es nicht in
-  der Liste. Wer Office-Dateien drucken will, braucht im Container einen
-  Konverter und traegt die Endung dann selbst nach.
+- Gedruckt wird **nach** der Ablage. Das Archiv ist das Original, Papier die
+  Kopie: ein Drucker ohne Papier darf nie der Grund sein, dass etwas nicht
+  gespeichert wurde. Ein gescheiterter Druck wird gemeldet, die Mail gilt
+  trotzdem als verarbeitet - sonst laege bei jedem Versuch eine weitere Kopie
+  im Archiv.
+- **Quarantaene wird nie gedruckt.**
+- Nur Formate, die CUPS selbst versteht (Einstellungen -> Druckbare
+  Dateitypen). Ein `.docx` ohne Konverter kaeme als Zeichensalat heraus.
 
 ### Voraussetzung: CUPS
 
-Gedruckt wird ueber den CUPS-Client `lp`. Der steckt im Container-Image
-(Paket `cups-client`), ein **Druckerdienst laeuft dort aber nicht**. Der
-Drucker muss also entweder
-
-- an einem CUPS-Server im Netz haengen, der beim Drucker unter „CUPS-Server"
-  eingetragen wird (`cups.lan:631`), oder
-- an einem `cupsd` auf dem Docker-Host, der fuer den Container erreichbar ist.
-
-Fehlt `lp` (z. B. in einem selbst gebauten aelteren Image), sagt das die
-Fehlermeldung beim Testdruck genau so. Ganz abschalten laesst sich das Ganze
-mit `PRINTING_ENABLED=false` - dann verschwinden auch die Auswahlfelder.
-
-## Mehrere Archive (mehrere NAS oder Freigaben)
-
-Anfangs gibt es genau ein Archiv - das aus der `.env`. Unter **Konfiguration →
-Archive** lassen sich weitere anlegen: eine zweite Freigabe auf demselben NAS,
-ein Geraet im Nebengebaeude, ein gemountetes Verzeichnis. Jedes Archiv ist
-entweder
-
-| Art | Angaben | wann |
-|---|---|---|
-| **SMB-Freigabe** | Server, Freigabe, Benutzer, Passwort, optional Domain/Port/Unterordner | der Normalfall - es wird nichts gemountet |
-| **Gemountetes Verzeichnis** | Pfad, z. B. `/mnt/nas2` | wenn das Betriebssystem die Freigabe ohnehin schon einbindet |
-
-Das **erste aktive** Archiv ist das Standard-Archiv. Dort liegt die
-`mapping.yaml`, und dorthin geht alles, was kein eigenes Archiv nennt. Das
-erste Archiv wird beim ersten Start aus der `.env` uebernommen - eine
-bestehende Installation sieht also genau das, was sie vorher hatte, nur jetzt
-unter einem Namen und editierbar.
-
-Ein Archiv waehlen koennen:
-
-- **jede Zuordnung** (Spalte „Archiv", sobald es mehr als eines gibt) -
-  `Vertrag → vertraege` kann damit auf einem anderen NAS landen als
-  `Rechnung → rechnungen`,
-- **jede Zustelladresse**,
-- **jeder Abholordner**, getrennt fuer Quelle und Ziel.
-
-Ein paar Eigenschaften, die im Betrieb zaehlen:
-
-- **Verbindung testen** schreibt eine winzige Datei und loescht sie wieder.
-  Damit steht fest, dass Zugangsdaten und Schreibrechte stimmen, bevor die
-  erste Rechnung ankommt.
-- Zeigt etwas auf ein **geloeschtes oder pausiertes** Archiv, wird ins
-  Standard-Archiv gelegt und das protokolliert - lieber am falschen Ort als
-  verloren.
-- Ist ein Archiv gerade **nicht erreichbar**, schlaegt das Ablegen fehl, die
-  Mail bleibt ungelesen und wird beim naechsten Durchlauf erneut versucht.
-  Nichts geht verloren, und ein NAS im Standby bremst die anderen nicht.
-- Das Passwort wird nie zurueck ins Formular geschrieben; leer lassen heisst
-  „unveraendert".
-- Das letzte Archiv laesst sich nicht loeschen.
+Gedruckt wird ueber `lp` (Paket `cups-client` im Image). Ein Druckerdienst
+laeuft im Container **nicht** - der Drucker muss an einem CUPS-Server haengen,
+der beim Drucker eingetragen wird, oder an einem `cupsd` auf dem Docker-Host.
 
 ## Abholordner (Scan-to-Folder)
 
-Nicht jedes Geraet mailt seine Scans - viele legen sie per SMB direkt auf dem
-NAS ab. Unter **Konfiguration → Abholordner** wird so ein Ordner eingetragen,
-und mail2nas raeumt ihn ab: dieselben Stichwort-Zuordnungen, dieselbe
-Quarantaene, dieselbe Benennung wie bei Mailanhaengen - nur ganz ohne
-Postfach.
+Viele Kopierer mailen ihre Scans nicht, sondern legen sie per SMB in einen
+Ordner. Unter **Konfiguration -> Abholordner** wird so ein Ordner eingetragen,
+und mail2nas raeumt ihn ab - mit denselben Zuordnungen, derselben Quarantaene,
+derselben Benennung wie bei Mailanhaengen.
 
 | Feld | Bedeutung |
 |---|---|
 | Abholordner | Ordner, in den das Geraet schreibt, z. B. `scans/kopierer-flur` |
 | Zielordner | wohin die Dokumente sollen. Leer = nach Stichwoertern |
 | Archiv / Zielarchiv | auf welchem NAS Quelle und Ziel liegen |
-| Drucken | zusaetzlich auf einem der angelegten Drucker ausgeben |
+| Drucken | zusaetzlich auf einem Drucker ausgeben |
 
-Was dabei garantiert ist:
-
-- **Eine Datei wird erst angefasst, wenn sie fertig ist** - konkret: wenn sie
-  eine einstellbare Zeit lang (Default 20 s) unveraendert war. Sonst landet
-  eine noch laufende Uebertragung als halbes PDF im Archiv.
-- **Der Ordner ist ein Postausgang, kein Archiv**: Abgeholtes wird von dort
-  *verschoben*. Bliebe das Original liegen, kaeme es bei jedem Durchlauf
-  erneut.
-- Existiert der Ordner noch nicht, wird er **angelegt** - das Geraet braucht
-  ihn ja, um ueberhaupt hineinschreiben zu koennen.
-- **Unterordner werden mitgelesen** (Geraete legen gern einen pro Benutzer
-  oder Scanprofil an). Versteckte und halbfertige Dateien (`.tmp`, `.part`,
+- **Eine Datei wird erst angefasst, wenn sie fertig ist** - wenn sie eine
+  einstellbare Zeit (Standard 20 s) unveraendert war.
+- **Der Ordner ist ein Postausgang**: Abgeholtes wird *verschoben*, sonst kaeme
+  es bei jedem Durchlauf erneut. Dafuer braucht mail2nas dort Loeschrechte.
+- Fehlt der Ordner, wird er **angelegt** - das Geraet braucht ihn ja.
+- **Unterordner werden mitgelesen**. Versteckte, halbfertige (`.tmp`, `.part`,
   `.crdownload`) und leere Dateien bleiben liegen.
-- Ohne Zielordner entscheiden die Zuordnungen - dabei greifen nur die fuer
-  „alle Postfaecher": eine Datei aus einem Ordner gehoert zu keinem Postfach.
-- **Gesperrte Dateiendungen** kommen auch hier in die Quarantaene und werden
-  nie gedruckt.
+- Ohne Zielordner greifen nur Zuordnungen fuer "alle Postfaecher".
 - Ein Zielordner *im* Abholordner wird abgelehnt - das waere eine
   Endlosschleife.
-- Geprueft wird alle 30 Sekunden; ueber SMB ist das ein Verzeichnis-Listing,
-  kein Dauerbetrieb.
+- Geprueft wird alle 30 Sekunden.
 
-## Konfiguration (Environment-Variablen)
+## Wo die Konfiguration liegt
 
-| Variable | Beschreibung | Default |
+| Was | Wo |
+|---|---|
+| Postfaecher, Archive, Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Passwort-Hash, verarbeitete Message-IDs | SQLite-Datenbank `/data/state.db` im Docker-Volume `state` (`chmod 600`) |
+| Port, Zeitzone, Log-Level | `/opt/mail2nas/.env` |
+| Startpasswort (bis es geaendert wird) | `/data/initial-password.txt` im Volume |
+
+**Nichts davon liegt auf dem NAS.** Die Datenbank enthaelt die IMAP- und
+SMB-Passwoerter im Klartext (sie muessen ja zum Anmelden verwendbar sein) und
+gehoert deshalb nicht auf eine Freigabe, die viele lesen koennen.
+
+Die komplette `.env`:
+
+| Variable | Bedeutung | Standard |
 |---|---|---|
-| `IMAP_HOST` / `IMAP_PORT` / `IMAP_SSL` | IMAP-Server des **ersten** Postfachs; danach in der Oberflaeche gepflegt | - / `993` / `true` |
-| `IMAP_USER` / `IMAP_PASSWORD` | IMAP-Login des ersten Postfachs | - |
-| `IMAP_FOLDER` | Zu ueberwachender Ordner des ersten Postfachs | `INBOX` |
-| `IMAP_PROCESSED_FOLDER` | Optional: Zielordner fuer verarbeitete Mails | leer (nur `\Seen`) |
-| `IMAP_MODE` | `idle` (Push) oder `poll` | `poll` |
-| `POLL_INTERVAL_SECONDS` | Intervall im Poll-Modus bzw. IDLE-Refresh | `300` |
-| `STORAGE_BACKEND` | `smb` (direkt per SMB, nichts gemountet) oder `local` (in ein gemountetes Verzeichnis schreiben) | `local` |
-| `SMB_HOST` / `SMB_SHARE` | NAS und Freigabename, nur bei `STORAGE_BACKEND=smb` | - |
-| `SMB_USER` / `SMB_PASSWORD` | SMB-Login mit Schreibrechten auf die Zielordner | - |
-| `SMB_DOMAIN` | Domain/Workgroup, leer lassen wenn nicht noetig | leer |
-| `SMB_PORT` | Port des SMB-Servers | `445` |
-| `SMB_ROOT` | Unterordner innerhalb der Freigabe, unter dem alles abgelegt wird | leer (Wurzel) |
-| `SMB_ENCRYPT` | SMB3-Verschluesselung erzwingen (`false` fuer aeltere Server) | `true` |
-| `STORAGE_ROOT` | Wurzelverzeichnis des gemounteten Shares, nur bei `STORAGE_BACKEND=local` | `/mnt/nas` |
-| `MAPPING_PATH` | Pfad zur `mapping.yaml`, relativ zur Archiv-Wurzel; spaeter in der Oberflaeche aenderbar | `mapping.yaml` |
-| `FALLBACK_FOLDER` | Zielordner ohne Mapping-Treffer | `unsorted` |
-| `MATCH_BODY` | Zusaetzlich den Mailtext durchsuchen | `false` |
-| `FILENAME_PREFIX` | `none` \| `date` \| `sender` \| `date_sender` | `date_sender` |
-| `IMAP_OVERSIZED_FOLDER` | Optional: Zielordner fuer zu grosse Mails (siehe `MAX_MESSAGE_SIZE_MB`) | leer (nur `\Seen`) |
-| `STATE_DB_PATH` | Pfad zur SQLite-Datei fuer bereits verarbeitete Mails | `/data/state.db` |
-| `MAX_ATTACHMENT_SIZE_MB` | Einzelne Anhaenge ueber diesem Limit werden uebersprungen | `25` |
-| `MAX_MESSAGE_SIZE_MB` | Mails ueber diesem Limit werden gar nicht erst geladen | `50` |
-| `MAX_ATTACHMENTS_PER_MESSAGE` | Anhaenge ueber diesem Limit werden nicht mehr verarbeitet | `20` |
-| `BLOCKED_EXTENSIONS` | Komma-Liste Dateiendungen, die immer in `QUARANTINE_FOLDER` landen. **Nur Vorbelegung** - danach unter „Konfiguration → Quarantaene und Abholen" gepflegt | siehe `.env.example` |
-| `QUARANTINE_FOLDER` | Zielordner fuer Anhaenge mit gesperrter Dateiendung | `quarantaene` |
-| `NAS_PATH` | Nur mit `docker-compose.local.yml`: Verzeichnis des Docker-Hosts, das nach `/mnt/nas` im Container gebunden wird | `/mnt/nas` |
-| `PRINTING_ENABLED` | [Drucken](#drucken) ueberhaupt zulassen; `false` ist der Notausschalter | `true` |
-| `LP_BINARY` | Pfad zum `lp`-Client, falls nicht im `PATH` | `lp` |
-| `LPSTAT_BINARY` | Pfad zu `lpstat` (nur fuer die Druckersuche) | neben `LP_BINARY` |
-| `PRINT_TIMEOUT_SECONDS` | Danach gilt ein Druckauftrag als gescheitert | `120` |
-| `PRINTABLE_EXTENSIONS` | Komma-Liste der Dateiendungen, die an einen Drucker gegeben werden | siehe `.env.example` |
-| `PRINTER_DESTINATION` | Optional: CUPS-Warteschlange, aus der beim ersten Start **ein** Drucker angelegt wird; danach in der Oberflaeche gepflegt | leer (keiner) |
-| `PRINTER_NAME` / `PRINTER_SERVER` / `PRINTER_OPTIONS` / `PRINTER_COPIES` | Anzeigename, CUPS-Server, `lp -o`-Optionen und Kopien dieses ersten Druckers | Warteschlange / leer / leer / `1` |
-| `WEB_ENABLED` | [Weboberflaeche](#weboberflaeche) zum Pflegen der Zuordnungen starten | `false` |
-| `WEB_HOST` / `WEB_PORT` | Adresse und Port der Weboberflaeche | `0.0.0.0` / `8080` |
-| `WEB_PASSWORD` | Startpasswort (mind. 8 Zeichen); nur bis zur ersten Aenderung in der Oberflaeche relevant | - |
-| `WEB_COOKIE_SECURE` | Session-Cookie nur ueber HTTPS senden (hinter einem TLS-Reverse-Proxy auf `true`) | `false` |
-| `DRY_RUN` | Nichts schreiben, nur loggen | `false` |
-| `LOG_LEVEL` | Log-Level | `INFO` |
+| `WEB_PORT` | Port der Weboberflaeche (Host und Container) | `8080` |
+| `WEB_HOST` | Adresse, auf der sie im Container lauscht | `0.0.0.0` |
+| `WEB_COOKIE_SECURE` | Session-Cookie nur ueber HTTPS (hinter einem TLS-Proxy auf `true`) | `false` |
+| `TZ` | Zeitzone fuer Dateinamen-Datum und Log | `Europe/Berlin` |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING` | `INFO` |
+| `WEB_PASSWORD` | optionales Startpasswort (sonst wird eins erzeugt); nur bis zur ersten Aenderung relevant | leer |
+| `NAS_PATH` | nur fuer ein gemountetes Verzeichnis: Host-Pfad, der als `/mnt/nas` in den Container kommt | leer |
+| `STATE_DB_PATH` | Pfad der Datenbank (setzt `docker-compose.yml`) | `/data/state.db` |
+| `LP_BINARY` / `LPSTAT_BINARY` | nur falls die CUPS-Werkzeuge woanders liegen | `lp` / `lpstat` |
 
-**Die `IMAP_*`-Variablen sind Startwerte.** Beim allerersten Start wird daraus
-das erste Postfach angelegt; danach gilt die in der Oberflaeche gepflegte
-Konfiguration und die Variablen werden ignoriert. Dasselbe gilt fuer
-`WEB_PASSWORD`, `MAPPING_PATH` und die `PRINTER_*`-Variablen. Alles andere in
-dieser Tabelle wird bei jedem Start aus der `.env` gelesen.
+Aeltere `.env`-Dateien mit `IMAP_*`, `SMB_*`, `MAPPING_PATH`,
+`FALLBACK_FOLDER` usw. funktionieren weiter: ihre Werte werden beim ersten
+Start **einmalig** in die Datenbank uebernommen und danach ignoriert. Das
+Update-Skript raeumt sie anschliessend aus der `.env`.
 
-**Zum Default von `STORAGE_BACKEND`:** Der Default ist bewusst `local`, damit
-eine bestehende Installation, deren `.env` diese Variable noch nicht kennt,
-nach einem Update unveraendert mit ihrem gemounteten Share weiterlaeuft. Alle
-Installationswege (`.env.example`, die Skripte in `scripts/`) setzen den Wert
-ausdruecklich auf `smb`.
+### Sichern
 
-**Die SMB-Zugangsdaten stehen in der `.env`** (`chmod 600`, nur in der LXC bzw.
-auf dem Zielsystem). Auf dem Proxmox-Host liegen keine Zugangsdaten und kein
-Mount mehr - siehe
-[Wie mail2nas auf das Share zugreift](#wie-mail2nas-auf-das-share-zugreift).
+Die Datenbank ist die ganze Konfiguration. Sichern im laufenden Betrieb
+(konsistent, per SQLite-Backup-API):
 
-## Mapping-Datei und Mehrfach-Anhaenge
-
-Normalerweise wird diese Datei ueber die [Weboberflaeche](#weboberflaeche)
-gepflegt. Sie bleibt aber eine gewoehnliche YAML-Datei auf der Freigabe und
-laesst sich genauso von Hand bearbeiten - die Oberflaeche schreibt exakt
-dieses Format:
-
-```yaml
-version: 2
-rules:
-  - keyword: Rechnungskorrektur
-    folder: korrekturen
-  - keyword: "RE*"
-    folder: rechnungen
-  - keyword: Bestellung
-    folder: einkauf
-    account: "2"        # nur fuer Postfach mit dieser ID
-  - keyword: Rechnung
-    folder: rechnungen
-    print: true         # zusaetzlich ausdrucken (nach der Ablage)
-    printer: "1"        # ID eines angelegten Druckers; weglassen = Drucker
-                        # des Postfachs
+```bash
+cd /opt/mail2nas
+docker compose exec mail2nas python -c "import sqlite3; sqlite3.connect('/data/state.db').backup(sqlite3.connect('/data/state.db.bak'))"
+docker compose cp mail2nas:/data/state.db.bak ./state-$(date +%F).db
+chmod 600 ./state-*.db
 ```
 
-Die Liste wird von oben nach unten geprueft, die erste passende Zuordnung
-gewinnt. `account`, `print` und `printer` sind optional; fehlt `account`, gilt
-die Zuordnung fuer alle Postfaecher, und ohne `print` wird nichts gedruckt.
-Zu Platzhaltern und Reihenfolge siehe
-[Weboberflaeche](#stichwoerter-reihenfolge-und-platzhalter), zum Drucken
-[Drucken](#drucken).
+Die Sicherung enthaelt die Passwoerter - entsprechend ablegen. Die
+Zuordnungen allein gibt es zusaetzlich als lesbaren Export in der Oberflaeche.
+Ein Proxmox-Backup der LXC enthaelt das Volume ohnehin.
 
-**Aeltere Dateien werden weiter gelesen.** Das frueheres Flachformat
+## Updates
 
-```yaml
-RE: rechnungen
-Lieferschein: lieferscheine
+### Kurzfassung
+
+| Wo | Befehl |
+|---|---|
+| Proxmox-Host | Helper-Skript starten, **"Bestehende Installation aktualisieren"**: `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/mail2nas.sh)"` |
+| in der LXC | `mail2nas-update` |
+| in der LXC, falls der Befehl noch fehlt (aeltere Installation) | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"` |
+| ohne GitHub-Zugriff | neue `bootstrap.sh` ausfuehren, dann `MAIL2NAS_OFFLINE=1 bash /opt/mail2nas/scripts/proxmox/update.sh` |
+
+Das Update fragt nichts und braucht keine Zugangsdaten.
+
+### Was beim Update passiert
+
+1. **Sicherung**: `.env` -> `.env.bak.<Zeitstempel>` (`chmod 600`), Datenbank ->
+   `/data/state.db.bak-<Zeitstempel>` im Volume.
+2. **Code holen**. Eine Installation ohne git (per bootstrap.sh oder scp) wird
+   dabei in einen git-Checkout umgewandelt. Lokale Aenderungen am Code werden
+   verworfen, `.env` und Sicherungen bleiben.
+3. **Neu bauen** (`--pull`, damit auch Basis-Image und Abhaengigkeiten
+   Sicherheitsupdates bekommen) und starten.
+4. **Uebernahme abwarten**: beim ersten Start einer neuen Version uebernimmt
+   mail2nas, was bisher in der `.env` stand - Postfach, Archiv, erster Drucker,
+   Ordner, Grenzwerte, Quarantaene-Liste, Testmodus, Startpasswort - sowie die
+   **`mapping.yaml` vom NAS**. Die Datei heisst danach `mapping.yaml.migriert`,
+   damit niemand weiter eine Datei bearbeitet, die nichts mehr bewirkt. Die
+   Oberflaeche meldet unter Zuordnungen, wie viele Regeln uebernommen wurden.
+   Postfaecher werden erst abgeholt, **nachdem** die Regeln uebernommen sind -
+   sonst landeten die ersten Mails nach dem Update im Fallback-Ordner.
+5. **`.env` aufraeumen**: sobald die Uebernahme bestaetigt ist, bleiben nur
+   Port, Zeitzone, Log-Level (und `NAS_PATH`, falls gemountet wird). Die
+   Passwoerter stehen dann nur noch in der Datenbank - und in der Sicherung aus
+   Schritt 1, die nach einer Kontrolle geloescht werden sollte.
+   (`MAIL2NAS_KEEP_ENV=1` laesst die `.env`, wie sie ist.)
+6. **Aufraeumen**: alte Images, und das Docker-cifs-Volume der ersten
+   Versionen.
+
+Ein erneuter Aufruf ist jederzeit gefahrlos.
+
+### Von welchen Versionen
+
+| Generation | erkennbar an | was das Update tut |
+|---|---|---|
+| **Docker-cifs-Volume** (erste Versionen) | `SMB_HOST`/`SMB_SHARE`/`SMB_USER`/`SMB_PASSWORD` in der `.env`, kein `STORAGE_BACKEND` | Archiv wird als **direktes SMB** uebernommen; das alte Volume `mail2nas_nas` wird entfernt |
+| **Share auf dem Proxmox-Host gemountet** | `NAS_PATH` bzw. kein SMB in der `.env`, Bind-Mount `/mnt/nas` | Archiv als gemountetes Verzeichnis `/mnt/nas`; der Bind-Mount bleibt aktiv. Das Helper-Skript bietet die **Umstellung auf direktes SMB** an (siehe unten) |
+| **Direktes SMB** (`STORAGE_BACKEND=smb`) | | Archiv als SMB uebernommen, kein Mount |
+| **mit Weboberflaeche und Archiven** | Postfaecher/Archive schon in der Datenbank | nur die restlichen `.env`-Werte und die `mapping.yaml` werden uebernommen |
+| **Offline-Installation** (bootstrap.sh, scp) | kein `.git` | wird in einen git-Checkout umgewandelt, danach wie oben |
+
+### Host-Mount auf direktes SMB umstellen
+
+Installationen aus der Host-Mount-Zeit haben die SMB-Zugangsdaten in
+`/etc/mail2nas-smb-credentials-<CTID>` auf dem Proxmox-Host. Das Helper-Skript
+findet die Datei beim Update und fragt, ob umgestellt werden soll. Dann
+
+1. wird mit diesen Zugangsdaten ein **Schreibtest** gemacht - schlaegt er fehl,
+   bleibt alles, wie es ist,
+2. schreibt mail2nas ab sofort direkt per SMB,
+3. auf Wunsch (zweite Nachfrage) werden der Bind-Mount aus der LXC entfernt
+   (Container-Neustart), der fstab-Eintrag geloescht (Sicherung
+   `/etc/fstab.bak.*`), der Mount abgebaut und die Zugangsdatei geloescht.
+
+Danach liegen auf dem Host weder Mount noch Passwort.
+
+### Zurueckrollen
+
+```bash
+cd /opt/mail2nas
+git log --oneline -5                         # frueheren Stand suchen
+git reset --hard <commit>
+cp .env.bak.<Zeitstempel> .env               # alte .env zurueck
+docker compose exec mail2nas python -c "import shutil; shutil.copy('/data/state.db.bak-<Zeitstempel>', '/data/state.db')"
+docker compose up -d --build
 ```
 
-wird beim Laden uebernommen, laengstes Stichwort zuerst - also genau die
-Prioritaet, die diese Version implizit hatte. Umgeschrieben wird die Datei
-erst, wenn in der Oberflaeche etwas gespeichert wird.
+Wer auf eine Version vor der Datenbank-Konfiguration zurueckgeht, muss
+ausserdem `mapping.yaml.migriert` auf dem NAS wieder in `mapping.yaml`
+umbenennen.
 
-**Mehrere Anhaenge pro Mail werden einzeln behandelt.** Jeder Anhang wird
-zuerst anhand seines EIGENEN Dateinamens gegen das Mapping geprueft; erst
-wenn der Dateiname selbst keinen Treffer liefert, greift der Treffer aus
-Betreff (bzw. Mailtext, siehe `MATCH_BODY`) als Fallback fuer diesen Anhang.
-Dadurch landet z. B. eine Mail mit `Rechnung_4711.pdf` UND
-`Lieferschein_4711.pdf` im Anhang korrekt aufgeteilt in `rechnungen/` bzw.
-`lieferscheine/` - nicht beide im selben Ordner. Anhaenge, deren Name keinen
-Hinweis gibt (z. B. `scan0001.pdf`), folgen weiterhin dem Mail-weiten Treffer
-bzw. landen im `FALLBACK_FOLDER`.
+## Kommandozeile
+
+Fuer die wenigen Dinge, die ohne Browser gehen muessen - in der LXC:
+
+```bash
+cd /opt/mail2nas
+docker compose exec mail2nas python -m mail2nas.cli status          # Uebernahme, Anzahl Postfaecher/Archive/Regeln
+docker compose exec mail2nas python -m mail2nas.cli password        # Startpasswort anzeigen
+docker compose exec mail2nas python -m mail2nas.cli reset-password  # neues Zufallspasswort
+```
+
+`archive-to-smb` (liest Zugangsdaten als JSON von stdin) nutzt das
+Helper-Skript fuer die Umstellung vom Host-Mount.
 
 ## Sicherheit: Angriffsflaeche ueber Mail/Anhaenge
 
-Mails und ihre Anhaenge kommen von aussen und sind grundsaetzlich nicht
-vertrauenswuerdig. mail2nas geht deshalb mit mehreren Massnahmen defensiv
-damit um:
+Mails und Anhaenge kommen von aussen und sind nicht vertrauenswuerdig:
 
-- **Keine Pfad-Traversal ueber Dateinamen**: Anhang-Dateinamen werden vor dem
-  Schreiben normalisiert und auf ein sicheres Zeichenset reduziert
-  (`mail2nas/filenames.py::sanitize_filename`) - Zeichen wie `/`, `..` oder
-  Steuerzeichen (auch ueber Unicode-Tricks wie fullwidth-Slashes oder
-  Right-to-Left-Override) koennen so nicht aus dem Zielordner ausbrechen.
-- **Keine Pfad-Traversal ueber Zielordner**: Auch die Zielordner aus
-  `mapping.yaml` sind nicht vertrauenswuerdig - die Datei liegt auf dem Share
-  und ist damit fuer jeden mit Schreibrechten aenderbar. `safe_join()` weist
-  absolute Pfade und `..`-Komponenten ab und prueft zusaetzlich, dass das
-  Ergebnis unterhalb von `STORAGE_ROOT` bleibt; abgewiesene Ziele landen im
-  `FALLBACK_FOLDER` statt ausserhalb des Shares. (Ohne diese Pruefung wuerde
-  bereits ein Eintrag wie `RE: /etc/cron.d` genuegen: in Python ersetzt ein
-  absoluter rechter Operand beim Pfad-Join den kompletten Wurzelpfad.)
-  Verschachtelte Ziele wie `rechnungen/2026` bleiben normal nutzbar.
-- **Atomares Schreiben**: Anhaenge werden in eine temporaere Datei geschrieben
-  und erst dann an ihren endgueltigen Namen umbenannt. Bricht die
-  SMB-Verbindung mitten im Transfer ab, entsteht so keine abgeschnittene
-  Datei, die spaeter faelschlich als vollstaendige Rechnung durchgeht.
-- **Groessenlimits gegen Speicher-/Platten-Erschoepfung**: Die Groesse der
-  gesamten Mail wird per `RFC822.SIZE` geprueft, *bevor* der Inhalt geladen
-  wird (`MAX_MESSAGE_SIZE_MB`); einzelne Anhaenge werden zusaetzlich einzeln
-  begrenzt (`MAX_ATTACHMENT_SIZE_MB`). Beides schuetzt vor einer einzelnen
-  ueberdimensionierten Mail, die den Host/das Share volllaufen laesst.
-- **Limit fuer Anhaenge pro Mail** (`MAX_ATTACHMENTS_PER_MESSAGE`): schuetzt
-  vor Mails mit tausenden Mini-Anhaengen.
-- **Quarantaene fuer ausfuehrbare Dateitypen** (in der Weboberflaeche unter
-  „Quarantaene und Abholen", vorbelegt aus `BLOCKED_EXTENSIONS`,
-  `QUARANTINE_FOLDER`): Anhaenge mit Endungen wie `.exe`, `.js`, `.ps1`,
-  `.jar`, `.lnk`, `.sh` usw. werden IMMER in einen separaten
-  Quarantaene-Ordner geschrieben - unabhaengig davon, ob der Dateiname
-  zufaellig auf ein Mapping-Stichwort passt. Das verhindert, dass ein
-  Angreifer eine Datei einfach `Rechnung.exe` nennt, um sie in den
-  Rechnungsordner zu schleusen. Die Datei wird dabei nicht geloescht,
-  sondern bleibt fuer eine manuelle Pruefung erhalten - **niemals von dort
-  oeffnen/ausfuehren**, ohne den Inhalt vorher zu verifizieren.
-- **Nichts Gesperrtes geht an einen Drucker**: Anhaenge in Quarantaene werden
-  nie gedruckt, auch nicht bei „alle Anhaenge drucken" - eine vermutete
-  ausfuehrbare Datei hat an einem Druckertreiber nichts verloren. Ebenso
-  werden nur Formate gespoolt, die in `PRINTABLE_EXTENSIONS` stehen. Die
-  Druckdatei liegt waehrend der Uebergabe an CUPS als temporaere Datei mit
-  Rechten `0600` und wird danach sofort geloescht.
-- **Kein automatisches Entpacken/Ausfuehren**: mail2nas speichert Anhaenge
-  ausschliesslich als Rohbytes. ZIP-/Office-/PDF-Inhalte werden nicht
-  entpackt, geparst oder ausgefuehrt - das eliminiert ganze Klassen von
-  Angriffen (Zip-Bombs, Makro-Ausfuehrung, Parser-Exploits) von vornherein,
-  verlagert die Verantwortung aber auf die Person, die die abgelegte Datei
-  spaeter oeffnet (siehe Hinweis zu `.exe` oben).
-- **TLS/Zertifikatspruefung fuer IMAP** ist per Default aktiv (`IMAP_SSL=true`,
-  Standardport `993`) und nutzt den Python-Standard-`ssl`-Kontext inkl.
-  Zertifikatsvalidierung.
-- **Idempotenz statt Wiederholungs-DoS**: bereits verarbeitete Message-IDs
-  werden in SQLite vermerkt, damit eine kaputte/boesartige Mail nicht bei
-  jedem Zyklus erneut komplett verarbeitet wird.
-- **Eine kaputte `mapping.yaml` legt den Dienst nicht lahm**: Da die Datei auf
-  dem Share von Hand bearbeitet wird, ist eine halb geschriebene oder
-  ungueltige Version nur eine Frage der Zeit. Statt die Ausnahme bis in die
-  IMAP-Schleife durchschlagen zu lassen (was in einer Reconnect-Endlosschleife
-  endete, in der gar nichts mehr archiviert wurde), wird der Fehler einmal
-  geloggt und mit dem letzten funktionierenden Regelsatz weitergearbeitet.
-- **Fail-fast beim Start**: Ist `STORAGE_ROOT` nicht vorhanden oder nicht
-  beschreibbar, bricht der Dienst mit einer klaren Meldung ab, statt Anhaenge
-  in das Dateisystem des Containers zu schreiben, wo sie mit dem naechsten
-  Neustart verschwinden wuerden. Fehlerhafte Konfigurationswerte
-  (`IMAP_MODE`, `FILENAME_PREFIX`, Zahlenwerte, Portbereich) werden beim Start
-  benannt, statt still ein anderes Verhalten zu waehlen.
+- **Keine Pfad-Traversal ueber Dateinamen**: Anhang-Namen werden normalisiert
+  und auf ein sicheres Zeichenset reduziert (`sanitize_filename`) - auch
+  Unicode-Tricks wie Fullwidth-Slashes oder Right-to-Left-Override brechen
+  nicht aus dem Zielordner aus.
+- **Keine Pfad-Traversal ueber Zielordner**: Ordner aus Zuordnungen, Adressen
+  und Importen werden beim Speichern und nochmals beim Ablegen geprueft;
+  absolute Pfade und `..` werden abgewiesen, ein abgewiesenes Ziel landet im
+  Fallback-Ordner statt ausserhalb des Archivs.
+- **Atomares Schreiben**: temporaerer Name, dann Umbenennen - nie eine
+  abgeschnittene Datei unter einem vollstaendig aussehenden Namen.
+- **Groessenlimits**: die Mailgroesse wird per `RFC822.SIZE` geprueft,
+  *bevor* der Inhalt geladen wird; Anhaenge und ihre Anzahl sind zusaetzlich
+  begrenzt.
+- **Quarantaene fuer ausfuehrbare Dateitypen**: `.exe`, `.js`, `.ps1`,
+  `.jar`, `.lnk`, `.sh` usw. gehen **immer** in den Quarantaene-Ordner, auch
+  wenn ein Stichwort passt - "Rechnung.exe" landet nie im Rechnungsordner. Die
+  Datei bleibt zur Pruefung erhalten - **niemals von dort oeffnen**, ohne den
+  Inhalt zu kennen.
+- **Nichts Gesperrtes geht an einen Drucker**; nur bekannte Formate werden
+  gespoolt. Die Druckdatei liegt waehrend der Uebergabe mit `0600` im
+  Temp-Verzeichnis und wird sofort geloescht.
+- **Kein Entpacken, kein Parsen, kein Ausfuehren**: Anhaenge werden als
+  Rohbytes gespeichert. Zip-Bombs, Makros und Parser-Exploits spielen damit
+  hier keine Rolle - die Verantwortung liegt bei dem, der die Datei spaeter
+  oeffnet.
+- **Begrenzter Aufwand beim Matching**: Platzhalter-Stichwoerter und der
+  durchsuchte Text sind in der Laenge begrenzt, die Empfaengerliste einer Mail
+  auch - eine praeparierte Mail kann einen Worker nicht lahmlegen.
+- **TLS mit Zertifikatspruefung** fuer IMAP (Standard-`ssl`-Kontext), SMB3
+  mit Verschluesselung; IMAP-Befehle haben ein Zeitlimit, damit ein haengender
+  Server den Worker nicht fuer immer blockiert.
+- **Idempotenz**: verarbeitete Message-IDs werden vermerkt, eine kaputte Mail
+  wird nicht in jeder Runde erneut komplett verarbeitet.
 
-Diese Massnahmen reduzieren die Angriffsflaeche deutlich, ersetzen aber
-keinen Virenscanner. Wer mail2nas produktiv gegen das offene Internet
-betreibt, sollte zusaetzlich serverseitiges Antivirus/Spam-Filtering vor dem
-IMAP-Postfach (z. B. beim Mail-Provider oder per vorgeschaltetem
-Mailserver/ClamAV) einplanen.
+Das ersetzt keinen Virenscanner. Wer Mail aus dem offenen Internet verarbeitet,
+sollte vor dem Postfach filtern (beim Provider oder per ClamAV).
 
 ## Betrieb & Troubleshooting
 
-- **Logs pruefen**: `docker compose logs -f` bzw. `journalctl -u mail2nas -f`.
-  Jede verarbeitete Mail wird mit UID, Betreff, getroffenem Stichwort,
-  Zielordner und gespeicherten Dateien geloggt.
-- **Nichts passiert**: pruefen, ob `mapping.yaml` unter dem konfigurierten
-  `MAPPING_PATH` in der Wurzel der Freigabe liegt (beim Start wird geloggt,
-  wie viele Regeln geladen wurden - `Loaded N mapping rule(s)`), und ob im
-  IMAP-Ordner ueberhaupt ungelesene Mails liegen.
-- **Mail landet immer im Fallback-Ordner**: Stichwort in `mapping.yaml`
-  pruefen (Betreff-Text muss das Stichwort als Teilstring enthalten, Gross-/
-  Kleinschreibung ist egal); bei Bedarf `MATCH_BODY=true` setzen, um auch
-  den Mailtext zu durchsuchen.
-- **Mail wird doppelt verarbeitet**: sollte durch die SQLite-Statusdatei
-  (`STATE_DB_PATH`) verhindert werden. Bei einem kompletten Neuaufsetzen des
-  Containers/Diensts bleibt diese Datei erhalten, solange das zugehoerige
-  Volume (`state`) bzw. der Pfad im systemd-Betrieb nicht geloescht wird.
-- **`Cannot archive to //... over SMB`**: der Startup-Schreibtest ist
-  fehlgeschlagen, der Dienst startet bewusst nicht. Die Meldung enthaelt den
-  Original-Fehler des Servers:
-  - `STATUS_LOGON_FAILURE` -> `SMB_USER`/`SMB_PASSWORD`/`SMB_DOMAIN` pruefen.
-  - `STATUS_BAD_NETWORK_NAME` bzw. `No such file or directory` auf einem Pfad
-    direkt unterhalb der Freigabe -> `SMB_SHARE` (oder `SMB_ROOT`) stimmt
-    nicht, Gross-/Kleinschreibung beachten.
-  - `STATUS_ACCESS_DENIED` -> der Benutzer darf nicht schreiben (ggf. nur im
-    per `SMB_ROOT` gesetzten Unterordner).
-  - Timeouts/`Connection refused` -> `SMB_HOST`/`SMB_PORT` und Firewall.
-  - Meldungen rund um Verschluesselung/Dialekt -> `SMB_ENCRYPT=false` testen,
-    aeltere NAS-Firmware unterstuetzt SMB3-Encryption nicht.
-- **`STORAGE_ROOT ... does not exist`** (nur bei `STORAGE_BACKEND=local`): das
-  Share ist nicht gemountet. Entweder den Mount reparieren oder auf
-  `STORAGE_BACKEND=smb` umstellen, dann wird kein Mount mehr gebraucht.
-- **Weboberflaeche nicht erreichbar**: `docker compose ps` zeigt, ob der Port
-  veroeffentlicht ist; `docker compose logs | grep "Web UI"` zeigt, ob sie
-  ueberhaupt gestartet ist (`WEB_ENABLED=true` gesetzt?). `curl
-  http://localhost:8080/healthz` muss `ok` liefern. Steht im Log
-  `Web UI cannot listen on ...`, ist der Port belegt - `WEB_PORT` aendern.
-- **Passwort der Weboberflaeche vergessen**: siehe
-  [Weboberflaeche -> Passwort](#passwort).
-- **Ein Postfach wird nicht abgeholt**: unter „Konfiguration" pruefen, ob es
-  auf `aktiv` steht. Im Log steht je Postfach eine Zeile
-  `Account <Name> <benutzer>: watching INBOX on <host>`; Verbindungsfehler
-  erscheinen mit demselben Praefix, sodass sich bei mehreren Postfaechern
-  zuordnen laesst, welches betroffen ist.
-- **Mail landet trotz passender Zuordnung im Fallback**: die Reihenfolge
-  pruefen (eine weiter oben stehende Zuordnung kann zuerst greifen) und ob die
-  Zuordnung auf ein anderes Postfach eingeschraenkt ist.
-- **`No enabled IMAP account configured`**: es ist kein Postfach aktiv - in der
-  Oberflaeche unter „Konfiguration" eines anlegen oder aktivieren.
-- **Es wird nichts gedruckt**: zuerst den Testdruck beim Drucker ausloesen -
-  dessen Fehlermeldung kommt direkt von CUPS. Im Log stehen die haeufigen
-  Faelle im Klartext:
-  - `lp nicht gefunden` -> das Image ist aelter als die Druckfunktion, neu
-    bauen (`docker compose build --pull`).
-  - `no usable printer is configured` -> das Postfach bzw. die Zuordnung soll
-    drucken, es ist aber kein (aktiver) Drucker ausgewaehlt.
-  - `is not in PRINTABLE_EXTENSIONS` -> das Format wird bewusst nicht
-    gespoolt, siehe [Drucken](#drucken).
-  - Nichts davon im Log -> `PRINTING_ENABLED` steht auf `false`.
-- **`Zu viele Fehlversuche`**: die Anmeldesperre laeuft nach einer Minute von
-  selbst ab.
+Der erste Blick gehoert immer der **Uebersicht** in der Weboberflaeche: dort
+steht der Zustand des Archivs und je Postfach der letzte Fehler im Klartext.
+Details liefert das Log:
 
-### Im Abholordner bleibt alles liegen
+```bash
+cd /opt/mail2nas && docker compose logs -f
+```
 
-1. Steht im Log eine Zeile mit `Pickup <Name>`? Dann wurde der Ordner
-   angesehen. Ohne Zeile ist der Ordner pausiert oder es gibt ihn nicht -
-   mail2nas legt ihn beim ersten Durchlauf an und sagt das einmal.
-2. Wurde die Datei gerade erst geschrieben? Es wird gewartet, bis sie die
-   eingestellte Zeit unveraendert ist (Konfiguration → Quarantaene und
-   Abholen).
-3. Heisst sie `.tmp`, `.part` oder faengt sie mit einem Punkt an? Dann gilt
-   sie als unfertig. Auch leere Dateien bleiben liegen.
-4. Darf mail2nas in dem Ordner **loeschen**? Ohne Loeschrecht wird bewusst
-   nichts abgeholt, sonst entstuende bei jedem Durchlauf eine weitere Kopie.
-5. Geprueft wird alle 30 Sekunden - ein bisschen Geduld gehoert dazu.
+- **"Noch kein Archiv eingerichtet" / "nicht bereit"**: ohne funktionierendes
+  Archiv wird bewusst nichts abgeholt. Der Grund steht in der Uebersicht:
+  - `STATUS_LOGON_FAILURE` -> Benutzer/Passwort/Domain des Archivs pruefen.
+  - `STATUS_BAD_NETWORK_NAME` oder `No such file` direkt unter der Freigabe ->
+    Freigabename (oder Unterordner) stimmt nicht, Gross-/Kleinschreibung
+    beachten.
+  - `STATUS_ACCESS_DENIED` -> der Benutzer darf dort nicht schreiben.
+  - Timeout / `Connection refused` -> Server, Port 445, Firewall.
+  - Meldungen zu Verschluesselung/Dialekt -> Haken "Verbindung verschluesseln"
+    entfernen (aeltere NAS-Firmware).
+  - "kein Mountpoint" (gemountetes Verzeichnis) -> der Mount fehlt, siehe
+    [Gemountetes Verzeichnis](#gemountetes-verzeichnis).
+- **Ein Postfach zeigt "Fehler"**: der Text daneben kommt vom IMAP-Server.
+  "Anmeldung und Ordner pruefen" auf der Postfach-Seite testet dieselben Daten
+  gezielt. Haeufig: App-Passwort noetig, falscher Ordnername, Port/TLS.
+- **Mail landet im Fallback-Ordner**: Reihenfolge der Zuordnungen pruefen
+  (eine weiter oben greift zuerst), ob die Zuordnung auf ein anderes Postfach
+  beschraenkt ist, und ob das Stichwort wirklich im Dateinamen oder Betreff
+  steht - sonst unter Einstellungen den Mailtext mit durchsuchen lassen.
+- **Nach dem Update keine Zuordnungen**: unter Zuordnungen steht, ob und woher
+  sie uebernommen wurden. War die alte `mapping.yaml` fehlerhaft, liegt sie
+  unveraendert auf dem NAS - korrigieren und importieren.
+- **Es passiert gar nichts**: im Testmodus? (Hinweis in der Uebersicht.)
+  Liegen im ueberwachten Ordner ueberhaupt *ungelesene* Mails?
+- **Weboberflaeche nicht erreichbar**: `docker compose ps` (laeuft der
+  Container, ist er "healthy"?), `curl http://localhost:8080/healthz` in der
+  LXC. `Web UI cannot listen on ...` im Log heisst: Port belegt - `WEB_PORT`
+  in der `.env` aendern.
+- **Passwort vergessen**: `docker compose exec mail2nas python -m mail2nas.cli reset-password`.
+- **"Zu viele Fehlversuche"**: die Sperre laeuft nach einer Minute ab.
+- **Es wird nicht gedruckt**: zuerst "Testseite drucken" beim Drucker - die
+  Fehlermeldung kommt direkt von CUPS. Im Log:
+  - `lp nicht gefunden` -> Image zu alt, `mail2nas-update`.
+  - `no usable printer is configured` -> Drucken ist gewuenscht, aber kein
+    aktiver Drucker gewaehlt.
+  - `is not in PRINTABLE_EXTENSIONS` -> Format bewusst nicht gedruckt
+    (Einstellungen -> Druckbare Dateitypen).
+  - gar nichts -> "Drucken erlaubt" unter Einstellungen aus?
+- **An eine Adresse gemailt, nichts gedruckt**: steht im Log
+  `is addressed to ...`? Wenn nicht, wurde die Adresse nicht erkannt - die
+  Kopfzeilen der Mail ansehen ("Original anzeigen") und die Adresse genau so
+  eintragen, oder mit `@firma.de` / `drucker-*@firma.de` arbeiten. Ist ein
+  Absender eingetragen, muss auch der passen.
+- **Abholordner bleibt voll**: Datei noch zu jung (Einstellungen -> fertig
+  nach)? Endet sie auf `.tmp`/`.part` oder beginnt mit einem Punkt? Darf
+  mail2nas dort loeschen? Ohne Loeschrecht wird bewusst nichts abgeholt.
 
-### Es wird nicht gedruckt, obwohl an die Adresse gemailt wurde
+## Bekannte Grenzen
 
-Der Reihe nach:
+- **Nur ungelesene Mails** werden verarbeitet. Wer eine Mail im Mailprogramm
+  oeffnet, bevor mail2nas sie gesehen hat, nimmt sie ihm weg - daher ein
+  eigenes Postfach bzw. ein eigener Ordner.
+- Scheitert das Ablegen **mitten** in einer Mail mit mehreren Anhaengen (NAS
+  faellt aus), wird die ganze Mail spaeter erneut verarbeitet; die schon
+  abgelegten Anhaenge liegen dann doppelt (mit Zaehler im Namen) vor.
+- Die Liste verarbeiteter Message-IDs waechst mit jeder Mail (wenige Bytes pro
+  Mail - auch nach Jahren unkritisch).
+- Ein Passwort fuer alle, keine Benutzerrollen, kein TLS von Haus aus.
 
-1. Steht im Log `is addressed to ...`? Dann hat die Zustelladresse gepasst und
-   das Problem liegt weiter hinten (Drucker, CUPS).
-2. Steht es nicht da, wurde die Adresse nicht erkannt. Haeufigster Grund: die
-   Mail wurde ueber ein Alias zugestellt, das im Postfach nur noch in
-   `Delivered-To` steht - und dort ist eine andere Schreibweise drin als
-   eingetragen. Die Kopfzeilen der Mail im Mailprogramm ansehen
-   („Original anzeigen") und die Adresse genau so eintragen, oder mit
-   `@firma.de` bzw. `drucker-*@firma.de` arbeiten.
-3. Ist zusaetzlich eine **Absenderadresse** hinterlegt, muss auch die passen -
-   sonst wird bewusst nicht gedruckt.
-4. Passt eine andere Zustelladresse weiter oben? Die erste passende gewinnt.
-5. Ist die Dateiendung ueberhaupt druckbar (`PRINTABLE_EXTENSIONS`) und nicht
-   in Quarantaene? Beides steht sonst als Warnung im Log.
-
-## Tests
+## Tests und Entwicklung
 
 ```bash
 python3 -m venv venv
@@ -1091,292 +847,115 @@ venv/bin/pip install -r requirements-dev.txt
 venv/bin/pytest
 ```
 
-Die Suite deckt unter anderem die oben beschriebenen Schutzmassnahmen ab
-(Traversal-Versuche ueber Zielordner, Quarantaene, Groessen- und
-Anzahl-Limits, kaputte `mapping.yaml`, Konfigurationsvalidierung).
+Die Suite deckt u. a. die Schutzmassnahmen ab (Traversal ueber Zielordner und
+Importe, Quarantaene, Groessenlimits), die Uebernahme aller alten
+`.env`-Generationen und der `mapping.yaml`, die Bereitschaftspruefung, die
+Weboberflaeche und das Update-Skript (gegen nachgebaute Installationen aller
+Generationen, mit einem stellvertretenden `docker`).
 
-`scripts/bootstrap.sh` enthaelt eine eingebettete Kopie aller Projektdateien
-und wird generiert, nicht von Hand gepflegt. Nach Aenderungen an einer
-eingebetteten Datei:
+`scripts/bootstrap.sh` wird generiert, nicht von Hand gepflegt:
 
 ```bash
 python3 scripts/regenerate-bootstrap.py          # neu erzeugen
 python3 scripts/regenerate-bootstrap.py --check  # nur pruefen (fuer CI)
 ```
 
+Aufbau des Codes:
+
+| Modul | Aufgabe |
+|---|---|
+| `main.py` | Start, Supervisor (Bereitschaft, Worker je Postfach, Abholordner) |
+| `web.py` | Weboberflaeche |
+| `options.py` | allgemeine Einstellungen in der Datenbank |
+| `legacy.py`, `migrate.py` | Uebernahme aelterer Installationen |
+| `archiver.py`, `scanning.py` | Mail bzw. Abholordner verarbeiten |
+| `mapping.py` | Zuordnungen: Speicherung, Matching, Import/Export |
+| `accounts.py`, `archives.py`, `printers.py`, `addresses.py`, `pickups.py` | die jeweiligen Tabellen |
+| `storage.py` | SMB und lokales Verzeichnis |
+| `printing.py`, `discovery.py` | Drucken, Drucker finden |
+| `cli.py` | Befehle fuer die Skripte |
+
 ## Sicherheitshinweise
 
-- `.env` niemals committen (steht in `.gitignore`) und mit restriktiven
-  Dateirechten ablegen (`chmod 600 .env`). Das Proxmox-Helper-Skript und
-  `scripts/proxmox/install.sh` setzen diese Rechte automatisch.
-- Dediziertes IMAP-Konto mit App-Passwort statt Zugangsdaten eines
-  Hauptpostfachs verwenden.
-- Dedizierten SMB-Benutzer mit Schreibrechten nur auf die relevanten
-  Zielordner einrichten, statt vollem Share-Zugriff.
-- Die Weboberflaeche gehoert ins eigene LAN, nicht ins Internet: ein Passwort,
-  kein TLS von Haus aus. Details unter [Weboberflaeche](#weboberflaeche). Das
-  Startpasswort aus der `.env` nach der ersten Anmeldung dort aendern.
-- **Die State-Datenbank enthaelt IMAP-Passwoerter im Klartext.** Seit die
-  Postfaecher in der Oberflaeche gepflegt werden, liegen sie dort statt nur in
-  der `.env` - sie muessen ja zum Anmelden verwendbar sein, ein Hash geht
-  nicht. mail2nas setzt die Datei beim Start auf `chmod 600`; sie verdient
-  denselben Schutz wie die `.env`:
-  - Das Docker-Volume `state` (bzw. `STATE_DB_PATH` im systemd-Betrieb) nicht
-    breiter freigeben als noetig.
-  - **Backups des Volumes enthalten die Passwoerter** - entsprechend ablegen.
-  - Wer Zugriff auf die Weboberflaeche hat, kann Postfaecher anlegen und damit
-    Mails von beliebigen Servern abholen lassen. Das Passwort dort ist also
-    kein „nur Zuordnungen"-Passwort.
-- Die SMB-Zugangsdaten stehen ausschliesslich in der `.env` des Zielsystems.
-  Es liegen keine Zugangsdaten und kein Mount auf dem Proxmox-Host, also
-  bekommt auch niemand ueber eine Host-Shell oder ein Host-Backup Zugriff auf
-  die Freigabe. Nur beim optionalen `STORAGE_BACKEND=local` gilt das nicht:
-  dort ist der Mountpunkt fuer jeden mit Root-Shell auf dem Node sichtbar und
-  die Credentials-Datei liegt auf dem Host.
-- Siehe auch den ausfuehrlichen Abschnitt
-  [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
-  zu Groessenlimits, Dateiendungs-Quarantaene und Pfad-Traversal-Schutz.
-- Sicherheitsluecken bitte nicht als oeffentliches GitHub-Issue melden,
-  siehe [SECURITY.md](SECURITY.md).
+- **Die Datenbank enthaelt IMAP- und SMB-Passwoerter im Klartext** - sie
+  muessen zum Anmelden verwendbar sein. mail2nas haelt sie auf `chmod 600` im
+  Docker-Volume `state`. Backups des Volumes (und Proxmox-Backups der LXC)
+  enthalten die Passwoerter - entsprechend ablegen.
+- Die `.env` enthaelt nach dem Update keine Passwoerter mehr. Die Sicherungen
+  `.env.bak.*`, die das Update anlegt, schon - nach einer Kontrolle loeschen.
+- Dediziertes IMAP-Konto mit App-Passwort, dedizierter SMB-Benutzer mit
+  Schreibrechten nur auf die noetigen Ordner.
+- Weboberflaeche nur im LAN, Startpasswort gleich ersetzen.
+- Auf dem Proxmox-Host liegen weder Mount noch Zugangsdaten (ausser bei einer
+  noch nicht umgestellten Host-Mount-Installation).
+- Sicherheitsluecken bitte nicht als oeffentliches Issue melden, siehe
+  [SECURITY.md](SECURITY.md).
 
 ## Datenschutz (DSGVO)
 
 mail2nas verarbeitet E-Mails und Anhaenge, die typischerweise
 personenbezogene Daten enthalten (Namen, Adressen, Bankverbindungen in
 Rechnungen/Lieferscheinen usw.). Wer das Tool einsetzt, ist im Sinne der
-DSGVO fuer diese Verarbeitung verantwortlich. Ein paar Punkte, die dabei zu
-beachten sind:
+DSGVO fuer diese Verarbeitung verantwortlich. Ein paar Punkte:
 
-- **Datensparsamkeit im Log**: Es werden Betreff, Absenderadresse,
-  Anhang-Dateinamen und Zielpfade geloggt (siehe `LOG_LEVEL`), nicht der
-  Mailinhalt selbst. Trotzdem koennen Betreffzeilen personenbezogene Daten
-  enthalten - Logs entsprechend absichern (Zugriff beschraenken, ggf.
-  Aufbewahrungsfrist definieren).
-- **Zugriffsbeschraenkung auf den Ziel-Share**: Nur Personen/Konten mit
-  begruendetem Zugriff sollten Lese-/Schreibrechte auf den SMB-Share (und
-  die darin abgelegten Dokumente) haben.
-- **Verschluesselung**: IMAP-Verbindung laeuft per Default per TLS
-  (`IMAP_SSL=true`). Fuer den SMB-Transportweg empfiehlt sich `vers=3.0`
-  (unterstuetzt SMB-Verschluesselung) statt aelterer, unverschluesselter
-  SMB-Versionen, sofern Server und Client das anbieten.
-- **Auftragsverarbeitung**: Wird mail2nas fuer Mails Dritter betrieben (z. B.
-  als Dienstleister), kann eine Verarbeitung im Sinne von Art. 28 DSGVO
-  vorliegen - in diesem Fall einen Auftragsverarbeitungsvertrag (AVV) mit
-  den Beteiligten pruefen.
-- Dieses Projekt ist Software, keine Rechtsberatung - bei Unsicherheiten
-  bitte den eigenen Datenschutzbeauftragten/eine Rechtsberatung
-  hinzuziehen.
+- **Datensparsamkeit im Log**: geloggt werden Betreff, Absenderadresse,
+  Anhang-Dateinamen und Zielpfade, nicht der Mailinhalt. Betreffzeilen koennen
+  trotzdem personenbezogene Daten enthalten - Logs entsprechend absichern.
+- **Zugriffsbeschraenkung**: nur Personen mit begruendetem Zugriff sollten
+  Rechte auf die Freigabe, die Weboberflaeche und die LXC haben.
+- **Verschluesselung**: IMAP per TLS, SMB3 mit Verschluesselung (Standard).
+- **Auftragsverarbeitung**: wird mail2nas fuer Mails Dritter betrieben, kann
+  eine Verarbeitung im Sinne von Art. 28 DSGVO vorliegen - dann einen
+  Auftragsverarbeitungsvertrag pruefen.
+- Dieses Projekt ist Software, keine Rechtsberatung.
 
 ## Rechnungsarchivierung / GoBD-Hinweis
 
-mail2nas legt Anhaenge unveraendert (Rohbytes, keine Konvertierung) mit
-Datums-/Absender-Praefix im Dateinamen auf dem Ziel-Share ab. Das ist
-nuetzlich fuer die Sortierung, **ersetzt aber keine GoBD-konforme
-("revisionssichere") Rechnungsarchivierung**: Die "Grundsaetze zur
-ordnungsmaessigen Fuehrung und Aufbewahrung von Buechern, Aufzeichnungen und
-Unterlagen in elektronischer Form" (GoBD) verlangen fuer steuerlich relevante
-Belege (u. a. Rechnungen) zusaetzlich:
+mail2nas legt Anhaenge unveraendert (Rohbytes) mit Datums-/Absender-Praefix
+auf dem NAS ab. Das hilft beim Sortieren, **ersetzt aber keine GoBD-konforme
+("revisionssichere") Archivierung**. Fuer steuerlich relevante Belege
+verlangen die GoBD zusaetzlich:
 
-- **Unveraenderbarkeit/Nachvollziehbarkeit** der Ablage (z. B. WORM-Storage,
-  Versionierung mit Aenderungsprotokoll, oder ein dediziertes
-  Dokumentenmanagement-/Archivsystem) - ein normaler, beschreibbarer
-  SMB-Ordner erfuellt das alleine nicht.
-- **Vollstaendigkeit**: mail2nas archiviert nur, was per Mail ankommt und
-  einen Anhang hat - Papierbelege, Portale-Downloads o. ae. muessen separat
-  erfasst werden.
-- **Aufbewahrungsfristen** von aktuell 8 bzw. 10 Jahren (§ 147 AO), inkl.
-  Backup-/Ausfallsicherheit ueber diesen Zeitraum.
+- **Unveraenderbarkeit/Nachvollziehbarkeit** (z. B. WORM-Storage, Versionierung
+  mit Aenderungsprotokoll oder ein Dokumentenmanagementsystem) - ein normaler,
+  beschreibbarer SMB-Ordner erfuellt das alleine nicht.
+- **Vollstaendigkeit**: mail2nas erfasst nur, was per Mail oder Abholordner
+  ankommt.
+- **Aufbewahrungsfristen** von 8 bzw. 10 Jahren (§ 147 AO), inkl. Backup.
 
-mail2nas ist als **Zubringer/Sortier-Werkzeug** gedacht - fuer die
-tatsaechliche steuerlich relevante Archivierung sollte der Ziel-Share (oder
-ein nachgelagertes DMS) die oben genannten Anforderungen erfuellen. Im
-Zweifel den Steuerberater/die Steuerberaterin zur konkreten Umsetzung
-befragen.
+mail2nas ist ein **Zubringer/Sortier-Werkzeug**. Im Zweifel die
+Steuerberatung fragen.
 
 ## Haftungsausschluss
 
 mail2nas ist ein privates Open-Source-Projekt, keine kommerzielle Software
 und keine Rechts-, Steuer- oder Sicherheitsberatung. Es wird "wie besehen"
 ("as is"), ohne jegliche Gewaehrleistung bereitgestellt - siehe die
-vollstaendige Haftungsausschluss-Klausel in der [LICENSE](LICENSE) (MIT).
-Ergaenzend gilt:
+Haftungsausschluss-Klausel in der [LICENSE](LICENSE) (MIT). Ergaenzend:
 
-- **Keine Garantie fuer Vollstaendigkeit oder Korrektheit der Zustellung.**
-  mail2nas verarbeitet Mails automatisiert per Stichwort-Mapping; eine
-  Fehlklassifizierung, ein verpasster Anhang (z. B. wegen eines nicht
-  erkannten Formats, eines Netzwerk-/IMAP-Fehlers oder falscher
-  Mapping-Konfiguration) oder ein Ausfall des Dienstes koennen nicht
+- **Keine Garantie fuer Vollstaendigkeit oder Korrektheit der Ablage.**
+  Fehlklassifizierung, ein verpasster Anhang (nicht erkanntes Format, Netz-
+  oder IMAP-Fehler, falsche Zuordnung) oder ein Ausfall koennen nicht
   ausgeschlossen werden. Wer sich auf die vollstaendige, fristgerechte
-  Archivierung geschaeftskritischer Dokumente (z. B. Rechnungen) verlassen
-  muss, sollte zusaetzliche Kontrollen (Stichproben, Monitoring, Backups des
-  Quell-Postfachs) vorsehen - siehe auch den Abschnitt zu
-  [GoBD](#rechnungsarchivierung--gobd-hinweis) oben.
-- **Keine Haftung fuer Datenverlust oder -beschaedigung** auf dem Ziel-Share,
-  im Postfach oder in der Statusdatenbank, unabhaengig von der Ursache
-  (Softwarefehler, Fehlkonfiguration, Ausfall der zugrundeliegenden
-  Infrastruktur wie Proxmox/Docker/SMB/IMAP).
-- **Keine Haftung fuer Sicherheitsvorfaelle** trotz der in
-  [Sicherheit: Angriffsflaeche ueber Mail/Anhaenge](#sicherheit-angriffsflaeche-ueber-mailanhaenge)
-  beschriebenen Massnahmen. Diese reduzieren bekannte Risiken, koennen aber
-  keinen vollstaendigen Schutz garantieren (z. B. gegen bislang unbekannte
-  Schwachstellen in verwendeten Bibliotheken/Basis-Images). Sicherheitsupdates
-  (Docker-Base-Image, Python-Abhaengigkeiten, Betriebssystem der LXC) liegen
-  in der Verantwortung der betreibenden Person.
-- **Die Proxmox-/Installer-Skripte** (`scripts/proxmox/*.sh`,
-  `scripts/bootstrap.sh`) greifen aktiv in die Zielumgebung ein (legen
-  Container an, installieren Pakete, schreiben Dateien mit Zugangsdaten).
-  Vor dem Einsatz in produktiven Proxmox-Umgebungen empfiehlt sich ein
-  Testlauf in einer Nicht-Produktivumgebung.
-- Nutzung erfolgt vollstaendig auf eigenes Risiko der betreibenden Person
-  bzw. Organisation. Bei rechtlichen oder steuerlichen Unsicherheiten
-  (insbesondere zu DSGVO- oder GoBD-Konformitaet des Gesamtaufbaus) bitte
-  entsprechend fachkundigen Rat einholen - siehe
-  [Datenschutz (DSGVO)](#datenschutz-dsgvo) und
-  [GoBD-Hinweis](#rechnungsarchivierung--gobd-hinweis).
+  Archivierung geschaeftskritischer Dokumente verlassen muss, sollte
+  zusaetzliche Kontrollen vorsehen (Stichproben, Monitoring, Backups des
+  Postfachs).
+- **Keine Haftung fuer Datenverlust oder -beschaedigung** auf dem NAS, im
+  Postfach oder in der Datenbank, gleich aus welcher Ursache.
+- **Keine Haftung fuer Sicherheitsvorfaelle** trotz der beschriebenen
+  Massnahmen. Sicherheitsupdates (Basis-Image, Abhaengigkeiten, Betriebssystem
+  der LXC) liegen in der Verantwortung der betreibenden Person -
+  `mail2nas-update` holt die ersten beiden.
+- **Die Skripte** (`scripts/proxmox/*.sh`, `scripts/bootstrap.sh`) greifen in
+  die Zielumgebung ein (legen Container an, installieren Pakete, aendern bei
+  der Umstellung vom Host-Mount `/etc/fstab`). Vor produktivem Einsatz
+  empfiehlt sich ein Testlauf.
+- Nutzung auf eigenes Risiko. Bei rechtlichen oder steuerlichen
+  Unsicherheiten fachkundigen Rat einholen - siehe
+  [Datenschutz](#datenschutz-dsgvo) und [GoBD](#rechnungsarchivierung--gobd-hinweis).
 
 ## Lizenz
 
 MIT-Lizenz, siehe [LICENSE](LICENSE). Nutzung auf eigene Verantwortung, ohne
 Gewaehrleistung - siehe insbesondere den
-[Haftungsausschluss](#haftungsausschluss) sowie die Abschnitte zu
-Datenschutz und GoBD oben, falls das Tool fuer geschaeftliche/steuerlich
-relevante Zwecke eingesetzt wird.
-
-## Updates einspielen
-
-Updates brauchen **keine Neukonfiguration**. Weder Zugangsdaten noch
-Mapping-Regeln muessen erneut eingegeben werden.
-
-### Kurzfassung
-
-| Installiert per | Update-Befehl |
-|---|---|
-| Helper-Skript / git (Variante 1) | `pct exec <CTID> -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"` |
-| Bootstrap-Skript (Variante 2A) | `bootstrap.sh` erneut ausfuehren, dann `docker compose up -d --build` |
-| scp/tar (Variante 2B) | Archiv neu uebertragen, `.env` behalten, dann `docker compose up -d --build` |
-| systemd/venv | Code aktualisieren, `venv/bin/pip install -r requirements.txt`, `systemctl restart mail2nas` |
-
-Nach dem Update einmal ins Log schauen (`docker compose logs -f`): dort steht,
-wie viele Zuordnungen geladen wurden und welche Postfaecher ueberwacht werden.
-
-### Was beim Update automatisch migriert wird
-
-- **Die `mapping.yaml` im alten Flachformat** wird weiter gelesen und in die
-  gleiche Prioritaet uebernommen (laengstes Stichwort zuerst). Die Datei wird
-  erst umgeschrieben, wenn in der Oberflaeche etwas gespeichert wird - bis
-  dahin ist ein Downgrade auf eine aeltere Version problemlos moeglich.
-- **Das erste Postfach** wird beim ersten Start nach dem Update aus den
-  `IMAP_*`-Variablen der bestehenden `.env` angelegt. Es ist danach unter
-  „Konfiguration" sichtbar und wird ab dann von dort gepflegt.
-- **Die Druckeinstellungen** kommen als neue Spalten in die bestehende
-  Postfach-Tabelle, mit Defaults, die nichts aendern: es wird nichts gedruckt
-  und weiterhin alles abgelegt. Kein Postfach muss neu eingegeben werden.
-  Wer drucken will, legt unter „Konfiguration → Drucker" einen Drucker an -
-  erst dann erscheinen die Auswahlfelder, siehe [Drucken](#drucken).
-- **Die Zustelladressen** bekommen eine eigene, zunaechst leere Tabelle in
-  derselben Datenbank. Solange dort nichts steht, aendert sich nichts am
-  Verhalten - die Funktion ist ausschliesslich das, was man dort eintraegt,
-  siehe [Drucken per Mail-Adresse](#drucken-per-mail-adresse-zustelladressen).
-- **Das erste Archiv** wird beim ersten Start nach dem Update aus der `.env`
-  angelegt (SMB-Zugangsdaten oder `STORAGE_ROOT`, je nach `STORAGE_BACKEND`).
-  Es ist danach unter „Konfiguration → Archive" sichtbar und wird ab dann von
-  dort gepflegt; die `SMB_*`-Variablen dienen nur noch der Uebernahme. Bis ein
-  zweites dazukommt, aendert sich nichts.
-- **Die gesperrten Dateiendungen** werden beim ersten Speichern in der
-  Oberflaeche uebernommen. Bis dahin gilt weiter die `.env` - eine
-  Installation, die nie in die Oberflaeche schaut, verhaelt sich unveraendert.
-- **Zustelladressen aus der Vorversion** bekommen ihre Archiv-Spalte
-  automatisch dazu (Standard-Archiv), ohne dass etwas neu eingegeben werden
-  muss. Abholordner starten mit einer leeren Tabelle.
-- **Neue Konfigurationsvariablen** greifen mit ihren Defaults; eine alte `.env`
-  bleibt gueltig. Insbesondere bleibt `WEB_ENABLED` ohne Eintrag auf `false` -
-  wer die Weboberflaeche will, ergaenzt nach dem Update:
-  ```
-  WEB_ENABLED=true
-  WEB_PASSWORD=mindestens-8-zeichen
-  ```
-  und startet mit `docker compose up -d` neu.
-- **`STORAGE_BACKEND`** bleibt ohne Eintrag auf `local`, eine bestehende
-  Installation mit gemountetem Share laeuft also unveraendert weiter.
-  `update.sh` haengt in dem Fall automatisch `docker-compose.local.yml` an.
-
-### Mit git installiert (Variante 1) - der einfache Weg
-
-Ein Befehl, direkt vom Proxmox-Host aus:
-
-```bash
-pct exec <CTID> -- bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"
-```
-
-Oder innerhalb der LXC (`pct enter <CTID>`):
-
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"
-```
-
-`update.sh` fragt nichts ab und braucht keine Zugangsdaten. Es legt vor dem
-Update eine datierte Sicherung der `.env` an, holt den aktuellen Code, baut
-das Image mit `--pull` neu (damit auch das Python-Basis-Image aktuelle
-Sicherheitsupdates bekommt), startet den Dienst neu und raeumt alte Images
-auf.
-
-**Unangetastet bleiben dabei:**
-
-| Was | Wo | Warum es das Update ueberlebt |
-|---|---|---|
-| SMB-Zugangsdaten & alle .env-Einstellungen | `/opt/mail2nas/.env` | steht in `.gitignore`, wird von `git reset --hard` nicht beruehrt |
-| Stichwort-Zuordnungen | `mapping.yaml` auf dem SMB-Share | liegt gar nicht im Repo |
-| Postfaecher, Passwort der Weboberflaeche, bereits verarbeitete Mails | Docker-Volume `state` | benanntes Volume, bleibt ueber Rebuilds bestehen - es wird nach dem Update nichts doppelt archiviert |
-
-Das Volume `state` ist damit das einzige, was ausser der `.env` gesichert
-werden muss - und es enthaelt IMAP-Passwoerter, siehe
-[Sicherheitshinweise](#sicherheitshinweise).
-
-Bringt eine neue Version zusaetzliche Konfigurationsvariablen mit, greifen
-dafuer automatisch die dokumentierten Defaults - eine aeltere `.env` bleibt
-also gueltig und muss nicht angefasst werden. Wer die neuen Optionen nutzen
-will, ergaenzt sie einfach in der `.env` und ruft
-`docker compose up -d` auf.
-
-Von Hand geht es genauso:
-
-```bash
-cd /opt/mail2nas
-git fetch --depth 1 origin main && git reset --hard FETCH_HEAD
-docker compose up -d --build
-```
-
-Wer `STORAGE_BACKEND=local` verwendet, haengt dabei die Override-Datei mit an
-(`-f docker-compose.yml -f docker-compose.local.yml`), sonst fehlt der
-Bind-Mount des Shares. `update.sh` erkennt das anhand der `.env` selbst.
-
-Ein erneuter Aufruf von `scripts/proxmox/install.sh` ist ebenfalls
-gefahrlos: erkennt es eine vorhandene `.env` und bekommt keine Zugangsdaten
-uebergeben, wechselt es automatisch in den Update-Modus und laesst die
-Konfiguration unveraendert.
-
-### Ohne git installiert (Variante 2)
-
-- **Bootstrap-Skript erneut ausfuehren** (Variante A) - ueberschreibt alle
-  Code-Dateien, laesst `.env` und die auf dem SMB-Share liegende
-  `mapping.yaml` unangetastet. Danach:
-  ```bash
-  cd /opt/mail2nas && docker compose up -d --build
-  ```
-  (bzw. `systemctl restart mail2nas` im venv-Betrieb).
-- **Neues Archiv per scp uebertragen** (Variante B) und das alte
-  Verzeichnis ersetzen - `.env` vorher sichern, da sie nicht Teil des
-  Archivs ist.
-
-### Zurueckrollen
-
-`update.sh` legt vor jedem Lauf eine Kopie der `.env` als
-`.env.bak.<Zeitstempel>` an. Auf einen aelteren Codestand zurueck geht es
-mit dem gewuenschten Commit:
-
-```bash
-cd /opt/mail2nas
-git fetch --depth 50 origin main
-git reset --hard <commit-sha>
-docker compose up -d --build
-```
+[Haftungsausschluss](#haftungsausschluss).

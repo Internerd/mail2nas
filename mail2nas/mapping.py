@@ -1,17 +1,22 @@
-"""Keyword -> folder rules: file format, matching, and editing.
+"""Keyword -> folder rules: storage, matching, and editing.
 
-The rules live as YAML on the archive share, so they survive a broken web UI
-and stay editable by hand. Two things they have to express beyond the keyword
-and the target folder:
+The rules live in the local database, next to the mailboxes and archives,
+and are edited in the web UI. They used to be a `mapping.yaml` on the share;
+`migrate.py` carries such a file over once, and the YAML format lives on as
+the import/export format - a readable backup, and a way to move rules from one
+installation to another.
+
+Three things a rule expresses beyond keyword and target folder:
 
 * **Order.** The first matching rule wins, and the order is explicit rather
   than derived, so "Rechnungskorrektur" can be placed above "RE" instead of
   relying on it happening to be the longer word.
 * **Which mailbox a rule applies to**, once more than one IMAP account is
   configured.
-* **Whether the match is printed**, and on which of the configured printers.
+* **Whether the match is printed**, and on which of the configured printers,
+  and on which archive the folder is.
 
-Format (version 2)::
+Export format (version 2)::
 
     version: 2
     rules:
@@ -23,21 +28,22 @@ Format (version 2)::
         print: true
         printer: "1"
 
-The old flat `keyword: folder` format is still read: it is migrated in
-memory, longest keyword first, which is exactly the priority that version
-applied implicitly. Nothing is rewritten until the rules are saved.
+The old flat `keyword: folder` format is still read on import: longest
+keyword first, which is exactly the priority that version applied implicitly.
 """
 from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import threading
+from collections.abc import Callable
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 
 import yaml
 
 from .filenames import safe_relative_parts
-from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +53,7 @@ MAX_KEYWORD_LENGTH = 100
 # A pattern is a chain of ".*?" separated by literals, so matching cost grows
 # with (wildcards x text length). Mail subjects and bodies are attacker-
 # supplied, so both factors are bounded rather than trusted: without this a
-# keyword like "a*a*a*a*a*..." plus a large body (MATCH_BODY=true) would tie
+# keyword like "a*a*a*a*a*..." plus a large body (body matching enabled) would tie
 # up an account worker for a very long time.
 MAX_WILDCARDS = 5
 MAX_MATCH_LENGTH = 100_000
@@ -200,98 +206,116 @@ def dump_rules(rules: list[Rule]) -> str:
     return yaml.safe_dump(document, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
-class Mapping:
-    """The rule list, reloaded from the share when the file changes.
+def rules_from_yaml(text: str) -> list[Rule]:
+    """Parse an exported (or old on-share) rule file."""
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise MappingError(f"Die Datei ist kein gueltiges YAML: {exc}") from None
+    return parse_rules(raw)
 
-    Shared by every account worker, so reloading is guarded by a lock: each
-    worker calls `reload()` at the start of its cycle.
+
+class RuleStore:
+    """The rule list in the database, in priority order.
+
+    Saved as a whole: the UI always edits the complete, ordered list (moving
+    one rule changes the position of two), and replacing it in one
+    transaction means a reader never sees a list that is half old, half new.
     """
 
-    def __init__(self, storage: Storage, relative_path: str, fallback_folder: str):
-        self._storage = storage
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mapping_rules ("
+                "position INTEGER PRIMARY KEY, "
+                "keyword TEXT NOT NULL, "
+                "folder TEXT NOT NULL, "
+                "account TEXT NOT NULL DEFAULT 'all', "
+                "print INTEGER NOT NULL DEFAULT 0, "
+                "printer TEXT NOT NULL DEFAULT '', "
+                "archive TEXT NOT NULL DEFAULT '')"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    def load(self) -> list[Rule]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT keyword, folder, account, print, printer, archive "
+                "FROM mapping_rules ORDER BY position"
+            ).fetchall()
+        return [
+            Rule.create(keyword, folder, account, bool(printing), printer, archive)
+            for keyword, folder, account, printing, printer, archive in rows
+        ]
+
+    def save(self, rules: list[Rule]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM mapping_rules")
+            conn.executemany(
+                "INSERT INTO mapping_rules (position, keyword, folder, account, print, "
+                "printer, archive) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        position,
+                        rule.keyword,
+                        rule.folder,
+                        rule.account or ALL_ACCOUNTS,
+                        1 if rule.print_attachments else 0,
+                        rule.printer,
+                        rule.archive,
+                    )
+                    for position, rule in enumerate(rules)
+                ],
+            )
+
+    def count(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM mapping_rules").fetchone()[0])
+
+
+class Mapping:
+    """The rule list as the archiver sees it.
+
+    Shared by every account worker and the pickup runner. `reload()` is called
+    at the start of each cycle and re-reads the table - a handful of rows from
+    a local file, cheaper than any cleverness about noticing changes.
+    """
+
+    def __init__(self, store: RuleStore, fallback_folder: str | Callable[[], str] = "unsorted"):
+        self._store = store
         self._fallback_folder = fallback_folder
         self._lock = threading.Lock()
         self._rules: list[Rule] = []
-        self._mtime: float | None = None
-        self.set_path(relative_path)
+        self.reload()
 
     @property
-    def path(self) -> str:
-        return self._relative_path
+    def store(self) -> RuleStore:
+        return self._store
 
-    def set_storage(self, storage: Storage) -> None:
-        """Point at a different archive (the default one was reconfigured)."""
+    @property
+    def rules(self) -> list[Rule]:
         with self._lock:
-            if storage is self._storage:
-                return
-            self._storage = storage
-            self._mtime = None
-        self.set_path(self._relative_path)
+            return list(self._rules)
 
-    def set_path(self, relative_path: str) -> None:
-        """Point at a different mapping file and load it immediately."""
-        with self._lock:
-            self._relative_path = relative_path
-            self._display_path = self._storage.display(safe_relative_parts(relative_path))
-            self._mtime = None
-        self.reload(force=True)
-
-    def reload(self, force: bool = False) -> None:
-        with self._lock:
-            relative_path, display_path = self._relative_path, self._display_path
-            known_mtime, rule_count = self._mtime, len(self._rules)
-
+    def reload(self) -> None:
         try:
-            mtime = self._storage.modified_time(relative_path)
-        except FileNotFoundError:
-            if force:
-                logger.warning(
-                    "Mapping file %s not found, all mail will go to the fallback folder",
-                    display_path,
-                )
-                with self._lock:
-                    self._rules = []
-                    self._mtime = None
+            rules = self._store.load()
+        except Exception as exc:  # noqa: BLE001 - keep the last good rules
+            logger.error("Could not read the mapping rules (%s) - keeping the previous %d",
+                         exc, len(self._rules))
             return
-        except Exception as exc:  # noqa: BLE001 - a dropped share must not kill the loop
-            # With the SMB backend this is a network call, so it can fail for
-            # reasons that have nothing to do with the file itself. Keep the
-            # rules we already have; the next cycle tries again.
-            logger.warning(
-                "Could not check mapping file %s (%s) - keeping the previous %d rule(s)",
-                display_path,
-                exc,
-                rule_count,
-            )
-            return
-
-        if not force and known_mtime == mtime:
-            return
-
-        # The file can also be edited by hand on a network share, so a
-        # malformed or half-written version is a matter of when, not if. Keep
-        # serving the last good rules instead of letting the exception escape:
-        # it would propagate out of the IMAP loop and leave the service
-        # reconnecting in a tight loop, archiving nothing until someone noticed.
-        try:
-            rules = parse_rules(yaml.safe_load(self._storage.read_text(relative_path)))
-        except Exception as exc:  # noqa: BLE001
-            # Remember the mtime anyway, so a persistently broken file is
-            # reported once rather than on every single cycle.
-            with self._lock:
-                self._mtime = mtime
-            logger.error(
-                "Could not load mapping file %s (%s) - keeping the previous %d rule(s)",
-                display_path,
-                exc,
-                rule_count,
-            )
-            return
-
         with self._lock:
             self._rules = rules
-            self._mtime = mtime
-        logger.info("Loaded %d mapping rule(s) from %s", len(rules), display_path)
+
+    def save(self, rules: list[Rule]) -> None:
+        self._store.save(rules)
+        with self._lock:
+            self._rules = list(rules)
 
     def match(self, *texts: str, account_id: str | None = None) -> Rule | None:
         """Return the first rule that matches, or None.
@@ -308,29 +332,17 @@ class Mapping:
                 return rule
         return None
 
+    def fallback_folder(self) -> str:
+        value = self._fallback_folder
+        return value() if callable(value) else value
+
     def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
         """Return (target_folder, matched_keyword) for the first matching rule."""
         rule = self.match(*texts, account_id=account_id)
-        return (rule.folder, rule.keyword) if rule else (self._fallback_folder, None)
+        return (rule.folder, rule.keyword) if rule else (self.fallback_folder(), None)
 
 
 # --- editing helpers (used by the web UI) ------------------------------------
-
-
-def load_rules(storage: Storage, relative_path: str) -> list[Rule]:
-    """Read the rule list for editing.
-
-    A missing file is an empty rule list, not an error: that is the state
-    right after installation, and the UI is where it gets fixed.
-    """
-    try:
-        return parse_rules(yaml.safe_load(storage.read_text(relative_path)))
-    except FileNotFoundError:
-        return []
-
-
-def save_rules(storage: Storage, relative_path: str, rules: list[Rule]) -> None:
-    storage.write_text(relative_path, dump_rules(rules))
 
 
 def validate_keyword(keyword: str, existing: list[Rule], replacing: int | None = None) -> str:

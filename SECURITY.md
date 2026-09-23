@@ -2,7 +2,10 @@
 
 mail2nas verarbeitet unaufgefordert eingehende Mails/Anhaenge (siehe
 [README: Sicherheit](README.md#sicherheit-angriffsflaeche-ueber-mailanhaenge))
-und Zugangsdaten fuer IMAP- und SMB-Systeme. Meldungen zu Sicherheitsluecken
+und Zugangsdaten fuer IMAP- und SMB-Systeme. Diese Zugangsdaten und die
+gesamte Konfiguration liegen in der SQLite-Datenbank im Docker-Volume `state`
+(`/data/state.db` im Container) und werden ausschliesslich ueber die
+passwortgeschuetzte Weboberflaeche gepflegt. Meldungen zu Sicherheitsluecken
 sind daher ausdruecklich willkommen.
 
 ## Unterstuetzte Version
@@ -34,15 +37,19 @@ Insbesondere relevant fuer dieses Projekt:
 
 - Wege, ueber eine praeparierte Mail oder einen Anhang aus dem konfigurierten
   Zielordner auszubrechen (Pfad-Traversal), beliebigen Code auf dem Host
-  auszufuehren, oder die in `BLOCKED_EXTENSIONS`/`QUARANTINE_FOLDER`
-  implementierte Quarantaene zu umgehen.
+  auszufuehren, oder die Quarantaene fuer gesperrte Dateitypen
+  (Einstellungen "Gesperrte Dateiendungen"/"Quarantaene-Ordner") zu umgehen -
+  etwa so, dass ein gesperrter Anhang doch gedruckt wird.
 - Denial-of-Service ueber eine einzelne Mail/Verbindung (z. B. Umgehen der
-  `MAX_MESSAGE_SIZE_MB`/`MAX_ATTACHMENT_SIZE_MB`/`MAX_ATTACHMENTS_PER_MESSAGE`-
-  Limits, Speicher-Erschoepfung).
+  Groessen- und Anzahl-Limits aus den Einstellungen - Groesse je Mail, je
+  Anhang, Anhaenge je Mail -, Speicher-Erschoepfung).
 - Offenlegung von IMAP-/SMB-Zugangsdaten (z. B. in Logs, Fehlermeldungen,
-  oder durch unsichere Dateirechte, die die Installer-Skripte setzen).
+  in der Weboberflaeche oder einem Export, oder durch unsichere Dateirechte
+  auf Datenbank, `.env` oder `/data/initial-password.txt`).
+- Umgehen der Anmeldung, der CSRF-Pruefung oder der Anmeldesperre der
+  Weboberflaeche.
 - Unsichere Defaults in `docker-compose.yml`, `Dockerfile` oder den
-  Installations-/Bootstrap-Skripten (`scripts/`).
+  Installations-, Update- und Bootstrap-Skripten (`scripts/`).
 
 **Nicht** im Fokus: Fehlverhalten durch bewusst falsch konfigurierte
 Umgebungen (z. B. absichtlich deaktivierte TLS-Verifikation, offen

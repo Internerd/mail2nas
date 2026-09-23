@@ -686,19 +686,3 @@ class SmbStorage(Storage):
 
     def close(self) -> None:
         self._reset()
-
-
-def from_config(config) -> Storage:
-    """Build the storage backend described by the configuration."""
-    if config.storage_backend == "smb":
-        return SmbStorage(
-            host=config.smb_host,
-            share=config.smb_share,
-            user=config.smb_user,
-            password=config.smb_password,
-            domain=config.smb_domain,
-            port=config.smb_port,
-            root=config.smb_root,
-            encrypt=config.smb_encrypt,
-        )
-    return LocalStorage(config.storage_root)

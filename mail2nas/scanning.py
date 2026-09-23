@@ -36,30 +36,38 @@ class PickupRunner:
 
     def __init__(
         self,
-        config,
+        options,
         mapping,
         storages,
         pickups: PickupStore,
         printing=None,
-        blocked_extensions=None,
-        min_age_seconds: int = 20,
     ):
-        self.config = config
+        # Options snapshot or a callable returning the current one, like the
+        # archiver: quarantine list, folders and waiting time are all live.
+        self._options = options
         self.mapping = mapping
         self.storages = storages
         self.pickups = pickups
         self.printing = printing
-        self._blocked_extensions = blocked_extensions
-        self.min_age_seconds = min_age_seconds
         # Remembers the last problem reported per folder, so one that stays
         # unreachable is logged once instead of on every cycle.
         self._reported: dict[int, str] = {}
 
     @property
+    def options(self):
+        return self._options() if callable(self._options) else self._options
+
+    @property
     def blocked_extensions(self) -> frozenset[str]:
-        if self._blocked_extensions is None:
-            return self.config.blocked_extensions
-        return self._blocked_extensions()
+        return self.options.blocked_extensions
+
+    @property
+    def min_age_seconds(self) -> int:
+        return self.options.pickup_min_age
+
+    def problems(self) -> dict[int, str]:
+        """The folders that currently have a problem, for the overview page."""
+        return dict(self._reported)
 
     # --- one pass ------------------------------------------------------------
 
@@ -143,18 +151,18 @@ class PickupRunner:
             & self.blocked_extensions
         )
         if quarantined:
-            folder = self.config.quarantine_folder
+            folder = self.options.quarantine_folder
         elif pickup.has_fixed_target:
             folder = pickup.target_folder
         elif rule is not None:
             folder = rule.folder
         else:
-            folder = self.config.fallback_folder
+            folder = self.options.fallback_folder
 
         parts = self._target_parts(folder)
         out_name = self._build_filename(entry, pickup)
 
-        if self.config.dry_run:
+        if self.options.dry_run:
             logger.info(
                 "[dry-run] would move %s -> %s",
                 source.display(entry.parts),
@@ -191,7 +199,7 @@ class PickupRunner:
         return True
 
     def _printer_for(self, pickup: Pickup, quarantined: bool):
-        if self.printing is None or not self.config.printing_enabled:
+        if self.printing is None or not self.options.printing_enabled:
             return None
         if quarantined or not pickup.print_attachments:
             return None
@@ -207,7 +215,7 @@ class PickupRunner:
 
         for candidate, note in (
             (folder, None),
-            (self.config.fallback_folder, "fallback"),
+            (self.options.fallback_folder, "fallback"),
             ("unsorted", "built-in"),
         ):
             try:
@@ -223,7 +231,7 @@ class PickupRunner:
     def _build_filename(self, entry, pickup: Pickup) -> str:
         """Same naming as for mail, with the folder standing in for the sender."""
         filename = sanitize_filename(entry.name)
-        mode = self.config.filename_prefix
+        mode = self.options.filename_prefix
         if mode == "none":
             return filename
         date_prefix = datetime.fromtimestamp(entry.mtime).strftime("%Y-%m-%d")

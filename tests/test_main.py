@@ -2,13 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from mail2nas.accounts import AccountStore
 from mail2nas.main import reconcile
-from mail2nas.mapping import Mapping
-from mail2nas.runtime import Runtime
-from mail2nas.state import ProcessedStore, SettingsStore
-from mail2nas.storage import LocalStorage
-from tests.test_archiver import _make_config
+from tests.test_archiver import _make_runtime
 
 
 class FakeWorker:
@@ -32,16 +27,7 @@ class FakeWorker:
 
 @pytest.fixture
 def runtime(tmp_path):
-    config = _make_config(tmp_path)
-    storage = LocalStorage(config.storage_root)
-    return Runtime(
-        config,
-        storage,
-        Mapping(storage, config.mapping_path, config.fallback_folder),
-        ProcessedStore(config.state_db_path),
-        SettingsStore(config.state_db_path),
-        AccountStore(config.state_db_path),
-    )
+    return _make_runtime(tmp_path)
 
 
 def _add(runtime, **fields):
@@ -132,3 +118,147 @@ def test_a_dead_worker_is_replaced(runtime):
     reconcile(runtime, workers, FakeWorker)
 
     assert workers[account_id].is_alive()
+
+
+# --- readiness: nothing is filed before there is somewhere to file to -----------
+
+
+def _supervisor(runtime):
+    from mail2nas.main import Supervisor
+
+    return Supervisor(runtime, FakeWorker)
+
+
+def test_without_an_archive_no_mailbox_is_watched(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert supervisor.workers == {}
+    assert runtime.status.archive.ok is False
+    assert "Kein Archiv" in runtime.status.archive.detail
+
+
+def test_an_archive_that_fails_its_write_test_stops_the_workers(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    runtime.archives.add(name="Weg", backend="local", path=str(tmp_path / "gibt-es-nicht"))
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert supervisor.workers == {}
+    assert runtime.status.archive.ok is False
+
+
+def test_once_the_archive_works_the_mailboxes_are_watched(runtime):
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert len(supervisor.workers) == 1
+    assert runtime.status.archive.ok is True
+
+
+def test_an_archive_that_is_not_a_mount_point_is_flagged(runtime):
+    """A missing bind mount looks exactly like this - so it is said loudly."""
+    _supervisor(runtime).step()
+
+    assert "kein Mountpoint" in runtime.status.archive.detail
+
+
+def test_the_old_rule_file_is_taken_over_before_the_first_mail(tmp_path):
+    (tmp_path / "mapping.yaml").write_text("RE: rechnungen\nLieferschein: lieferscheine\n",
+                                           encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+    _add(runtime)
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["Lieferschein", "RE"]
+    assert not (tmp_path / "mapping.yaml").exists()
+    assert (tmp_path / "mapping.yaml.migriert").exists()
+
+
+def test_the_rule_file_is_found_where_the_old_env_said(tmp_path):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "regeln.yaml").write_text("RE: rechnungen\n", encoding="utf-8")
+    runtime = _make_runtime(tmp_path, environ={"MAPPING_PATH": "config/regeln.yaml"})
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["RE"]
+
+
+def test_a_broken_rule_file_is_left_alone_and_explained(tmp_path):
+    (tmp_path / "mapping.yaml").write_text("rules: [kaputt", encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+
+    _supervisor(runtime).step()
+
+    assert (tmp_path / "mapping.yaml").exists()
+    from mail2nas.migrate import SETTING_RULES_NOTE
+
+    assert "nicht uebernommen" in runtime.settings.get(SETTING_RULES_NOTE)
+
+
+def test_rules_already_in_the_database_are_not_overwritten(tmp_path):
+    from mail2nas.mapping import Rule
+
+    (tmp_path / "mapping.yaml").write_text("ALT: alt\n", encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+    runtime.mapping.save([Rule.create("NEU", "neu")])
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["NEU"]
+
+
+# --- IDLE reacts to a stop within seconds --------------------------------------
+
+
+class _IdleClient:
+    def __init__(self):
+        self.idle_calls = 0
+
+    def idle(self):
+        self.idle_calls += 1
+
+    def idle_check(self, timeout):
+        import time
+
+        time.sleep(0.01)
+        return []
+
+    def idle_done(self):
+        pass
+
+
+def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkeypatch):
+    import threading
+    import time
+
+    from mail2nas import main as main_module
+
+    monkeypatch.setattr(main_module, "IDLE_SLICE", 0.05)
+    account_id = _add(runtime, mode="idle")
+    worker = main_module._Worker(runtime, runtime.accounts.get(account_id))
+
+    class _Archiver:
+        def run_once(self, client):
+            return 0
+
+    thread = threading.Thread(
+        target=worker._run_idle, args=(_Archiver(), _IdleClient(), "test"), daemon=True
+    )
+    thread.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    worker.stop()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 1  # not the 300 s poll interval

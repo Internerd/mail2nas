@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import textwrap
 
 import pytest
@@ -9,35 +8,43 @@ from mail2nas.mapping import (
     Mapping,
     MappingError,
     Rule,
-    load_rules,
+    RuleStore,
+    dump_rules,
     move_rule,
-    save_rules,
+    rules_from_yaml,
     set_printing,
     validate_keyword,
 )
-from mail2nas.storage import LocalStorage
+
+
+def _store(tmp_path) -> RuleStore:
+    return RuleStore(str(tmp_path / "state.db"))
 
 
 def _write_rules(tmp_path, rules) -> None:
-    """Write rules in the current format, as (keyword, folder[, account])."""
-    save_rules(
-        LocalStorage(str(tmp_path)),
-        "mapping.yaml",
-        [Rule.create(*rule) for rule in rules],
-    )
+    """Store rules as (keyword, folder[, account]) tuples."""
+    _store(tmp_path).save([Rule.create(*rule) for rule in rules])
 
 
 def _write_mapping(path, content: str) -> None:
-    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    """Store the rules of a YAML snippet - as an import or the migration would."""
+    _store(path.parent).save(rules_from_yaml(textwrap.dedent(content)))
 
 
-def _mapping(tmp_path, fallback_folder="unsorted", relative="mapping.yaml") -> Mapping:
-    return Mapping(LocalStorage(str(tmp_path)), relative, fallback_folder=fallback_folder)
+def _mapping(tmp_path, fallback_folder="unsorted") -> Mapping:
+    return Mapping(_store(tmp_path), fallback_folder)
+
+
+def load_rules(tmp_path) -> list[Rule]:
+    return _store(tmp_path).load()
+
+
+def save_rules(tmp_path, rules) -> None:
+    _store(tmp_path).save(rules)
 
 
 def test_resolve_matches_case_insensitive(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, """
+    _write_mapping(tmp_path / "mapping.yaml", """
         RE: rechnungen
         LS: lieferscheine
     """)
@@ -50,8 +57,7 @@ def test_resolve_matches_case_insensitive(tmp_path):
 
 
 def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+    _write_mapping(tmp_path / "mapping.yaml", "RE: rechnungen\n")
     mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Newsletter August")
@@ -60,9 +66,17 @@ def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
     assert keyword is None
 
 
-def test_resolve_prefers_longer_keyword_match(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, """
+def test_the_fallback_follows_the_settings_page(tmp_path):
+    current = {"folder": "unsorted"}
+    mapping = Mapping(_store(tmp_path), lambda: current["folder"])
+
+    current["folder"] = "sonstiges"
+
+    assert mapping.resolve("Newsletter")[0] == "sonstiges"
+
+
+def test_an_old_flat_file_keeps_its_longest_keyword_first_priority(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
         RE: rechnungen
         Rechnungskorrektur: korrekturen
     """)
@@ -74,8 +88,8 @@ def test_resolve_prefers_longer_keyword_match(tmp_path):
     assert keyword == "Rechnungskorrektur"
 
 
-def test_missing_mapping_file_falls_back_to_default(tmp_path):
-    mapping = _mapping(tmp_path, relative="does-not-exist.yaml")
+def test_no_rules_means_everything_goes_to_the_fallback(tmp_path):
+    mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Rechnung 123")
 
@@ -83,67 +97,46 @@ def test_missing_mapping_file_falls_back_to_default(tmp_path):
     assert keyword is None
 
 
-def test_reload_picks_up_changes(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+def test_reload_picks_up_changes_made_in_the_ui(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
     mapping = _mapping(tmp_path)
     assert mapping.resolve("RE 1")[0] == "rechnungen"
 
-    _write_mapping(mapping_path, "RE: invoices\n")
-    # Nudge mtime forward in case the filesystem has coarse timestamp resolution.
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
-
+    _write_rules(tmp_path, [("RE", "invoices")])
     mapping.reload()
 
     assert mapping.resolve("RE 1")[0] == "invoices"
 
 
-def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
-    """A half-written mapping.yaml on the share must not take the service down."""
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = _mapping(tmp_path)
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
-
-    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
-
-    mapping.reload()  # must not raise
-
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
-
-
-def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+def test_saving_through_the_mapping_takes_effect_at_once(tmp_path):
     mapping = _mapping(tmp_path)
 
-    mapping_path.write_text("- just\n- a\n- list\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+    mapping.save([Rule.create("LS", "lieferscheine")])
 
-    mapping.reload()
-
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("LS 7")[0] == "lieferscheine"
+    assert [r.keyword for r in load_rules(tmp_path)] == ["LS"]
 
 
-def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = _mapping(tmp_path)
+def test_the_order_survives_the_database(tmp_path):
+    rules = [Rule.create(k, "x") for k in ("Zeta", "Alpha", "Mitte")]
+    save_rules(tmp_path, rules)
 
-    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+    assert [r.keyword for r in load_rules(tmp_path)] == ["Zeta", "Alpha", "Mitte"]
 
-    with caplog.at_level("ERROR"):
-        mapping.reload()
-        mapping.reload()
-        mapping.reload()
 
-    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+@pytest.mark.parametrize("text", ["RE: [unclosed\n", "- just\n- a\n- list\n"])
+def test_an_unreadable_import_is_refused_with_a_reason(text):
+    with pytest.raises(MappingError):
+        rules_from_yaml(text)
+
+
+def test_export_and_import_round_trip(tmp_path):
+    rules = [
+        Rule.create("Rechnungskorrektur", "korrekturen"),
+        Rule.create("RE*", "rechnungen", "2", True, "1", "3"),
+    ]
+
+    assert rules_from_yaml(dump_rules(rules)) == rules
 
 
 # --- priority: explicit order, first match wins --------------------------------
@@ -159,9 +152,9 @@ def test_first_matching_rule_wins_regardless_of_keyword_length(tmp_path):
 
 def test_moving_a_rule_up_changes_which_one_wins(tmp_path):
     _write_rules(tmp_path, [("RE", "rechnungen"), ("Rechnungskorrektur", "korrekturen")])
-    rules = load_rules(LocalStorage(str(tmp_path)), "mapping.yaml")
+    rules = load_rules(tmp_path)
 
-    save_rules(LocalStorage(str(tmp_path)), "mapping.yaml", move_rule(rules, 1, -1))
+    save_rules(tmp_path, move_rule(rules, 1, -1))
 
     assert _mapping(tmp_path).resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
 
@@ -190,11 +183,8 @@ def test_old_flat_file_is_read_with_its_original_priority(tmp_path):
     assert mapping.resolve("RE-1")[0] == "rechnungen"
 
 
-def test_saving_writes_the_versioned_format(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "2")])
-
-    text = storage.read_text("mapping.yaml")
+def test_the_export_uses_the_versioned_format(tmp_path):
+    text = dump_rules([Rule.create("RE", "rechnungen", "2")])
 
     assert "version: 2" in text
     assert "keyword: RE" in text
@@ -328,19 +318,15 @@ def test_a_rule_without_print_settings_prints_nothing(tmp_path):
 
 
 def test_print_settings_survive_a_save_and_reload(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "all", True, "2")])
+    save_rules(tmp_path, [Rule.create("RE", "rechnungen", "all", True, "2")])
 
-    reloaded = load_rules(storage, "mapping.yaml")[0]
+    reloaded = load_rules(tmp_path)[0]
 
     assert (reloaded.print_attachments, reloaded.printer) == (True, "2")
 
 
-def test_a_file_that_never_used_printing_stays_unchanged(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen")])
-
-    text = storage.read_text("mapping.yaml")
+def test_an_export_without_printing_stays_short(tmp_path):
+    text = dump_rules([Rule.create("RE", "rechnungen")])
 
     assert "print" not in text
     assert "printer" not in text

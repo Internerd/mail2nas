@@ -6,8 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mail2nas.storage import LocalStorage, SmbStorage, from_config
-from tests.test_archiver import _make_config
+from mail2nas.storage import LocalStorage, SmbStorage
 
 
 # --- local backend ------------------------------------------------------------
@@ -143,27 +142,6 @@ def test_smb_reraises_when_the_retry_also_fails(monkeypatch):
 
     with pytest.raises(OSError, match="permission denied"):
         storage._with_reconnect("write", always_broken)
-
-
-# --- backend selection ---------------------------------------------------------
-
-
-def test_from_config_selects_the_configured_backend(tmp_path):
-    local = from_config(_make_config(tmp_path, storage_backend="local"))
-    assert isinstance(local, LocalStorage)
-
-    smb = from_config(
-        _make_config(
-            tmp_path,
-            storage_backend="smb",
-            smb_host="nas.local",
-            smb_share="Belege",
-            smb_user="u",
-            smb_password="p",
-        )
-    )
-    assert isinstance(smb, SmbStorage)
-    assert smb.description == "//nas.local/Belege"
 
 
 # --- listing and moving files (pickup folders) --------------------------------

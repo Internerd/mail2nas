@@ -1,11 +1,13 @@
-"""Minimal web UI for editing the keyword -> folder mapping.
+"""The web UI - where mail2nas is configured, all of it.
 
-Deliberately small: one password, one page for the rules, one page for
-changing that password. No user accounts, no JavaScript, no external assets.
+Mailboxes, archives, keyword rules, printers, delivery addresses, pickup
+folders and the general settings are all edited here and stored in the local
+database; the `.env` only says which port this page listens on. A fresh
+installation starts with nothing but a password, and the overview page walks
+through what is still missing.
 
-It edits `mapping.yaml` on the share through the same storage backend the
-archiver uses, so the file stays the single source of truth and the archiver
-picks up changes on its next cycle without a restart.
+Deliberately plain: one password, no user accounts, no JavaScript, no external
+assets - so the Content-Security-Policy can forbid everything but inline CSS.
 
 This is a LAN tool. It authenticates with a single password over whatever
 transport it is put behind - see the README for why it should not be exposed
@@ -14,10 +16,11 @@ to the internet without a TLS-terminating reverse proxy in front.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 
@@ -39,9 +42,9 @@ from .mapping import (
     ALL_ACCOUNTS,
     MappingError,
     Rule,
-    load_rules,
+    dump_rules,
     move_rule,
-    save_rules,
+    rules_from_yaml,
     set_account,
     set_archive,
     set_printing,
@@ -49,6 +52,9 @@ from .mapping import (
     validate_keyword,
 )
 from .addresses import AddressError
+from .migrate import SETTING_RULES_NOTE
+from .options import FILENAME_PREFIXES, LIMITS, OptionsError
+from .options import validate as validate_options
 from .archives import ArchiveError
 from .pickups import PICKUP_INTERVAL, PickupError
 from .discovery import discover
@@ -109,12 +115,12 @@ BASE_TEMPLATE = """
   :root {
     color-scheme: light dark;
     --bg: #f6f7f9; --fg: #1b1d21; --muted: #5c6470; --line: #d7dbe0;
-    --card: #ffffff; --accent: #2f6feb; --danger: #b3261e; --ok: #1f7a3d;
+    --card: #ffffff; --accent: #2f6feb; --danger: #b3261e; --ok: #1f7a3d; --warn: #9a6700;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #16181c; --fg: #e6e8ea; --muted: #9aa2ad; --line: #2e333a;
-      --card: #1e2126; --accent: #6a9bff; --danger: #ef6a63; --ok: #63c98c;
+      --card: #1e2126; --accent: #6a9bff; --danger: #ef6a63; --ok: #63c98c; --warn: #e3b341;
     }
   }
   * { box-sizing: border-box; }
@@ -155,6 +161,15 @@ BASE_TEMPLATE = """
   .msg { border-radius: 8px; padding: .6rem .8rem; margin-bottom: .75rem; border: 1px solid; }
   .msg.error { color: var(--danger); border-color: var(--danger); }
   .msg.ok { color: var(--ok); border-color: var(--ok); }
+  .msg.warn { color: var(--warn); border-color: var(--warn); }
+  .state-ok { color: var(--ok); font-weight: 600; }
+  .state-bad { color: var(--danger); font-weight: 600; }
+  .state-wait { color: var(--warn); font-weight: 600; }
+  ol.steps li { margin-bottom: .45rem; }
+  ol.steps li.done { color: var(--muted); }
+  input[type=number] { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: .4rem .5rem; width: 8rem; }
+  textarea { font: inherit; }
   dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; margin: 0; font-size: .88rem; }
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-all; }
@@ -174,8 +189,10 @@ BASE_TEMPLATE = """
     <h1>mail2nas</h1>
     {% if logged_in %}
     <nav>
+      <a href="{{ url_for('overview_page') }}">Uebersicht</a> &middot;
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
       <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
+      <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -184,6 +201,10 @@ BASE_TEMPLATE = """
     </nav>
     {% endif %}
   </header>
+  {% if logged_in and setup_hint %}
+    <div class="msg warn">{{ setup_hint }}
+      <a href="{{ url_for('overview_page') }}">Zur Einrichtung</a></div>
+  {% endif %}
   {% for category, message in messages %}
     <div class="msg {{ category }}">{{ message }}</div>
   {% endfor %}
@@ -209,6 +230,19 @@ LOGIN_BODY = """
 """
 
 MAPPING_BODY = """
+{% if migration_note %}
+<div class="msg warn">{{ migration_note }}
+  <form class="inline" method="post" action="{{ url_for('dismiss_migration_note') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="link" type="submit">Ausblenden</button>
+  </form>
+</div>
+{% endif %}
+{% if not storage_ok %}
+<div class="msg warn">Das Standard-Archiv ist nicht erreichbar oder noch nicht eingerichtet -
+  die Ordnerliste bleibt leer. Neue Ordner lassen sich trotzdem eintragen; sie werden
+  beim ersten Anhang angelegt.</div>
+{% endif %}
 <div class="card">
   <h2 style="margin-top:0">Stichwort einem Ordner zuordnen</h2>
   <form method="post" action="{{ url_for('add_rule') }}">
@@ -380,13 +414,33 @@ MAPPING_BODY = """
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Ablage</h2>
-  <dl>
-    <dt>Archiv</dt><dd>{{ storage_description }}</dd>
-    <dt>Mapping-Datei</dt><dd>{{ mapping_path }}</dd>
-    <dt>Ohne Treffer</dt><dd>{{ fallback_folder }}</dd>
-    <dt>Gesperrte Dateiendungen</dt><dd>{{ quarantine_folder }}</dd>
-  </dl>
+  <h2 style="margin-top:0">Sichern und uebertragen</h2>
+  <p class="hint" style="margin-top:0">Die Zuordnungen liegen in der Datenbank des
+  Containers. Als Datei exportiert sind sie eine lesbare Sicherung - und lassen sich
+  in eine andere Installation uebernehmen.</p>
+  <p><a href="{{ url_for('export_rules') }}"><button class="secondary" type="button">
+    Als mapping.yaml herunterladen</button></a></p>
+  <form method="post" action="{{ url_for('import_rules') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="rules_file">mapping.yaml importieren</label>
+        <input id="rules_file" name="rules_file" type="file" accept=".yaml,.yml,.txt" required>
+      </div>
+      <div class="field">
+        <label for="import_mode">Vorhandene Zuordnungen</label>
+        <select id="import_mode" name="mode">
+          <option value="append">behalten, neue anhaengen</option>
+          <option value="replace">ersetzen</option>
+        </select>
+      </div>
+      <button type="submit">Importieren</button>
+    </div>
+  </form>
+  <p class="hint" style="margin-bottom:0">Gelesen werden das aktuelle Format und das alte
+  (<code>Stichwort: ordner</code>). Beim Anhaengen werden Stichwoerter, die es schon gibt,
+  uebersprungen. Ohne Treffer landet alles in <strong>{{ fallback_folder }}</strong>,
+  gesperrte Dateitypen in <strong>{{ quarantine_folder }}</strong>.</p>
 </div>
 """
 
@@ -446,7 +500,8 @@ CONFIG_BODY = """
   <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
   CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
   {% else %}
-  <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
+  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Einstellungen</a>
+  abgeschaltet.</p>
   {% endif %}
   <p style="margin-bottom:0">
     <a href="{{ url_for('new_printer') }}">
@@ -476,11 +531,13 @@ CONFIG_BODY = """
     {% endfor %}
   </table>
   </div>
-  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dort liegt die
-  Mapping-Datei, dorthin geht alles ohne eigene Angabe. Zuordnungen, Zustelladressen
-  und Abholordner koennen jeweils ein anderes waehlen.</p>
+  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dorthin geht alles
+  ohne eigene Angabe. Zuordnungen, Zustelladressen und Abholordner koennen jeweils ein
+  anderes waehlen.</p>
   {% else %}
-  <p class="hint">Es wird das Archiv aus der .env verwendet: {{ storage_description }}</p>
+  <p class="hint"><strong>Noch kein Archiv eingerichtet</strong> - solange wird nichts
+  abgeholt. Meist ist das eine SMB-Freigabe auf dem NAS; gemountet werden muss dafuer
+  nichts.</p>
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
     <button type="button">Archiv hinzufuegen</button></a></p>
@@ -516,33 +573,6 @@ CONFIG_BODY = """
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_pickup') }}">
     <button type="button">Abholordner hinzufuegen</button></a></p>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">Quarantaene und Abholen</h2>
-  <form method="post" action="{{ url_for('save_settings') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div class="field">
-      <label for="blocked_extensions">Gesperrte Dateiendungen</label>
-      <input id="blocked_extensions" name="blocked_extensions" type="text"
-             value="{{ blocked_extensions }}">
-    </div>
-    <p class="hint">Anhaenge mit einer dieser Endungen landen <strong>immer</strong> im
-    Ordner <code>{{ quarantine_folder }}</code> - auch wenn ein Stichwort passt und auch
-    wenn sie aus einem Abholordner kommen. So kann „Rechnung.exe" nicht im
-    Rechnungsordner landen. Gedruckt wird so etwas nie.
-    Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
-    <strong>Leer heisst: keine Pruefung.</strong></p>
-    <div class="row" style="margin-top:.6rem">
-      <div class="field">
-        <label for="pickup_min_age">Abholordner: Datei gilt als fertig nach (Sekunden)</label>
-        <input id="pickup_min_age" name="pickup_min_age" type="text" value="{{ pickup_min_age }}">
-      </div>
-      <button type="submit">Speichern</button>
-    </div>
-    <p class="hint" style="margin-bottom:0">Wirkt sofort, ohne Neustart. Die
-    <code>.env</code> gibt nur noch den Startwert vor.</p>
-  </form>
 </div>
 
 <div class="card">
@@ -583,37 +613,9 @@ CONFIG_BODY = """
     <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
-<div class="card">
-  <h2 style="margin-top:0">Mapping-Datei</h2>
-  <form method="post" action="{{ url_for('move_mapping') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div class="row">
-      <div class="field">
-        <label for="mapping_path">Pfad relativ zur Archiv-Wurzel</label>
-        <input id="mapping_path" name="mapping_path" type="text" value="{{ mapping_path }}" required>
-      </div>
-      <button type="submit">Verschieben</button>
-    </div>
-    <p class="hint">Die vorhandene Datei wird an den neuen Ort kopiert und am
-    alten geloescht. Archiv: {{ storage_description }}</p>
-  </form>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">Feste Einstellungen</h2>
-  <p class="hint" style="margin-top:0">Diese kommen aus der .env und brauchen einen
-  Neustart des Containers.</p>
-  <dl>
-    <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
-    <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
-    <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
-    <dt>Archiv aus der .env</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
-    <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
-    <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
-    <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
-    <dt>Testmodus (DRY_RUN)</dt><dd>{{ 'an' if dry_run else 'aus' }}</dd>
-  </dl>
-</div>
+<p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
+Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
+<a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
 """
 
 ACCOUNT_BODY = """
@@ -726,6 +728,16 @@ ACCOUNT_BODY = """
 </div>
 
 {% if account %}
+<div class="card">
+  <h2 style="margin-top:0">Verbindung testen</h2>
+  <form method="post" action="{{ url_for('test_account', account_id=account.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Anmeldung und Ordner pruefen</button>
+    <p class="hint">Meldet sich mit den gespeicherten Daten an und oeffnet den Ordner -
+    liest und veraendert keine Mail.</p>
+  </form>
+</div>
+
 <div class="card">
   <h2 style="margin-top:0">Postfach loeschen</h2>
   <form method="post" action="{{ url_for('delete_account', account_id=account.id) }}">
@@ -1055,8 +1067,9 @@ ARCHIVE_BODY = """
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
     </div>
   </form>
-  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dort
-  liegt die Mapping-Datei, und dorthin geht alles, was kein eigenes Archiv nennt.
+  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dorthin
+  geht alles, was kein eigenes Archiv nennt, und dort liegen der Fallback- und der
+  Quarantaene-Ordner.
   Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
   mountet nichts.</p>
 </div>
@@ -1181,6 +1194,200 @@ PICKUP_BODY = """
 {% endif %}
 """
 
+OVERVIEW_BODY = """
+{% if initial_password %}
+<div class="msg warn">Angemeldet mit dem automatisch erzeugten Startpasswort. Bitte unter
+  <a href="{{ url_for('password_page') }}">Passwort</a> ein eigenes setzen.</div>
+{% endif %}
+
+{% if steps_open %}
+<div class="card">
+  <h2 style="margin-top:0">Einrichtung</h2>
+  <ol class="steps">
+    {% for step in steps %}
+    <li class="{{ 'done' if step.done }}">
+      {% if step.done %}&#10003;{% endif %}
+      <a href="{{ step.url }}">{{ step.title }}</a> - <span class="hint">{{ step.hint }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  <p class="hint" style="margin-bottom:0">Alles wird hier eingestellt und sofort
+  uebernommen - ein Neustart des Containers ist nie noetig.</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">Status</h2>
+  <table>
+    <tr><th>Was</th><th>Zustand</th><th>Details</th></tr>
+    <tr>
+      <td class="keyword">Standard-Archiv</td>
+      <td>{% if archive_status.ok %}<span class="state-ok">bereit</span>
+          {% elif archive_status.ok is none %}<span class="state-wait">wird geprueft</span>
+          {% else %}<span class="state-bad">nicht bereit</span>{% endif %}</td>
+      <td>{{ archive_status.detail or '-' }}</td>
+    </tr>
+    {% for row in workers %}
+    <tr>
+      <td class="keyword">{{ row.label }}</td>
+      <td>{% if row.state == 'verbunden' %}<span class="state-ok">verbunden</span>
+          {% elif row.state == 'Fehler' %}<span class="state-bad">Fehler</span>
+          {% else %}<span class="state-wait">{{ row.state }}</span>{% endif %}</td>
+      <td>{% if row.detail %}{{ row.detail }}{% endif %}
+          {% if row.processed %}<span class="hint">&middot; {{ row.processed }} verarbeitet</span>{% endif %}
+          {% if row.last_ok %}<span class="hint">&middot; zuletzt ok {{ row.last_ok }}</span>{% endif %}
+          {% if row.last_error %}<br><span class="state-bad">{{ row.last_error }}</span>
+            <span class="hint">({{ row.last_error_at }})</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    {% for problem in pickup_problems %}
+    <tr><td class="keyword">Abholordner</td><td><span class="state-bad">Problem</span></td>
+      <td>{{ problem }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if not workers and ready %}
+  <p class="hint">Kein aktives Postfach - es wird keine Mail abgeholt.</p>
+  {% endif %}
+  {% if dry_run %}
+  <p class="state-wait">Testmodus ist an: es wird nichts abgelegt, gedruckt oder als
+  gelesen markiert, nur protokolliert.</p>
+  {% endif %}
+  <p class="hint" style="margin-bottom:0">Stand {{ now }} &middot; laeuft seit {{ started }}.
+  Details stehen im Container-Log (<code>docker compose logs -f</code>).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Auf einen Blick</h2>
+  <dl>
+    <dt>Postfaecher</dt><dd>{{ counts.accounts }}</dd>
+    <dt>Archive</dt><dd>{{ counts.archives }}</dd>
+    <dt>Zuordnungen</dt><dd>{{ counts.rules }}</dd>
+    <dt>Drucker</dt><dd>{{ counts.printers }}</dd>
+    <dt>Zustelladressen</dt><dd>{{ counts.addresses }}</dd>
+    <dt>Abholordner</dt><dd>{{ counts.pickups }}</dd>
+  </dl>
+</div>
+"""
+
+SETTINGS_BODY = """
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <div class="card">
+    <h2 style="margin-top:0">Ablage</h2>
+    <div class="row">
+      <div class="field">
+        <label for="fallback_folder">Ordner fuer Anhaenge ohne Treffer</label>
+        <input id="fallback_folder" name="fallback_folder" type="text" value="{{ o.fallback_folder }}">
+      </div>
+      <div class="field">
+        <label for="quarantine_folder">Quarantaene-Ordner</label>
+        <input id="quarantine_folder" name="quarantine_folder" type="text"
+               value="{{ o.quarantine_folder }}">
+      </div>
+      <div class="field">
+        <label for="filename_prefix">Dateiname beginnt mit</label>
+        <select id="filename_prefix" name="filename_prefix">
+          {% for value, text in prefixes.items() %}
+            <option value="{{ value }}" {% if o.filename_prefix == value %}selected{% endif %}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p style="margin:.7rem 0 .2rem"><label><input type="checkbox" name="match_body" value="1"
+      {% if o.match_body %}checked{% endif %}> Stichwoerter auch im Mailtext suchen
+      (sonst nur Dateiname und Betreff)</label></p>
+    <p class="hint" style="margin-bottom:0">Beide Ordner liegen im Standard-Archiv, relativ zu
+    dessen Wurzel. Beispiel fuer den Dateinamen:
+    <code>2026-03-01_lieferant_example.com_Rechnung.pdf</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Gesperrte Dateitypen</h2>
+    <div class="field">
+      <label for="blocked_extensions">Endungen, die immer in die Quarantaene gehen</label>
+      <input id="blocked_extensions" name="blocked_extensions" type="text" style="max-width:100%"
+             value="{{ blocked }}">
+    </div>
+    <p class="hint" style="margin-bottom:0">Gilt auch, wenn ein Stichwort passt und auch fuer
+    Abholordner - so kann &bdquo;Rechnung.exe&ldquo; nie im Rechnungsordner landen. Gedruckt
+    wird so etwas nie. Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
+    <strong>Leer heisst: keine Pruefung.</strong></p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Abruf und Grenzwerte</h2>
+    <div class="row">
+      <div class="field">
+        <label for="poll_interval">Abrufintervall (Sekunden)</label>
+        <input id="poll_interval" name="poll_interval" type="number" value="{{ o.poll_interval }}"
+               min="{{ limits.poll_interval[0] }}" max="{{ limits.poll_interval[1] }}">
+      </div>
+      <div class="field">
+        <label for="max_attachment_size_mb">Max. Groesse je Anhang (MB)</label>
+        <input id="max_attachment_size_mb" name="max_attachment_size_mb" type="number"
+               value="{{ o.max_attachment_size_mb }}" min="1">
+      </div>
+      <div class="field">
+        <label for="max_message_size_mb">Max. Groesse je Mail (MB)</label>
+        <input id="max_message_size_mb" name="max_message_size_mb" type="number"
+               value="{{ o.max_message_size_mb }}" min="1">
+      </div>
+      <div class="field">
+        <label for="max_attachments_per_message">Max. Anhaenge je Mail</label>
+        <input id="max_attachments_per_message" name="max_attachments_per_message" type="number"
+               value="{{ o.max_attachments_per_message }}" min="1">
+      </div>
+      <div class="field">
+        <label for="pickup_min_age">Abholordner: fertig nach (Sekunden)</label>
+        <input id="pickup_min_age" name="pickup_min_age" type="number"
+               value="{{ o.pickup_min_age }}" min="0">
+      </div>
+    </div>
+    <p class="hint" style="margin-bottom:0">Das Intervall gilt im Polling-Modus und als
+    Erneuerung bei IDLE. Mails ueber der Maximalgroesse werden gar nicht erst geladen,
+    sondern nur als gelesen markiert (und ggf. in den Ordner fuer zu grosse Mails
+    verschoben). Eine Datei im Abholordner wird erst angefasst, wenn sie so lange
+    unveraendert ist - ein Scan, der noch geschrieben wird, bleibt liegen.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Drucken</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="printing_enabled" value="1"
+      {% if o.printing_enabled %}checked{% endif %}> Drucken erlaubt</label></p>
+    <div class="row">
+      <div class="field">
+        <label for="printable_extensions">Druckbare Dateitypen</label>
+        <input id="printable_extensions" name="printable_extensions" type="text"
+               style="max-width:100%" value="{{ printable }}">
+      </div>
+      <div class="field">
+        <label for="print_timeout">Zeitgrenze je Druckauftrag (Sekunden)</label>
+        <input id="print_timeout" name="print_timeout" type="number"
+               value="{{ o.print_timeout }}" min="5">
+      </div>
+    </div>
+    <p class="hint" style="margin-bottom:0">Ausgeschaltet ist das der Notschalter: es wird
+    nichts gedruckt, egal was bei Postfaechern, Zuordnungen und Adressen steht. Nur die
+    genannten Formate gehen an einen Drucker (leer = Standardliste) - ein .docx ohne
+    Konverter kaeme als Zeichensalat heraus.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Testmodus</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="dry_run" value="1"
+      {% if o.dry_run %}checked{% endif %}> Nur protokollieren - nichts ablegen, nichts
+      drucken, keine Mail als gelesen markieren</label></p>
+    <p class="hint" style="margin-bottom:0">Zum Ausprobieren neuer Zuordnungen: im
+    Container-Log steht dann, was passiert waere. Achtung: im Testmodus wird dieselbe
+    Mail bei jedem Durchlauf erneut geprueft.</p>
+  </div>
+
+  <button type="submit">Einstellungen speichern</button>
+  <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
+</form>
+"""
+
 PASSWORD_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Passwort aendern</h2>
@@ -1201,9 +1408,26 @@ PASSWORD_BODY = """
     <button type="submit">Passwort aendern</button>
   </form>
   <p class="hint">Nach der Aenderung werden alle anderen angemeldeten Sitzungen
-  abgemeldet. Ein in der .env gesetztes WEB_PASSWORD wird ab dann ignoriert.</p>
+  abgemeldet. Passwort vergessen? Auf dem Server:
+  <code>docker compose exec mail2nas python -m mail2nas.cli reset-password</code></p>
 </div>
 """
+
+
+def test_imap(account, timeout: int = 20) -> int:
+    """Log in, open the folder, count unseen mail. Raises on any failure."""
+    from imapclient import IMAPClient
+
+    client = IMAPClient(account.host, port=account.port, ssl=account.ssl, timeout=timeout)
+    try:
+        client.login(account.user, account.password)
+        client.select_folder(account.folder, readonly=True)
+        return len(client.search(["UNSEEN"]))
+    finally:
+        try:
+            client.logout()
+        except Exception:  # noqa: BLE001 - the answer is already known
+            pass
 
 
 def create_app(runtime) -> Flask:
@@ -1211,7 +1435,7 @@ def create_app(runtime) -> Flask:
     config, settings = runtime.config, runtime.settings
 
     def storage():
-        """The default archive - looked up per request, because it is editable."""
+        """The default archive, or None - looked up per request, it is editable."""
         return runtime.storage
     app = Flask(__name__)
     app.config.update(
@@ -1255,6 +1479,7 @@ def create_app(runtime) -> Flask:
             title=title,
             body=body,
             logged_in=logged_in(),
+            setup_hint=_setup_hint() if request.endpoint != "overview_page" else "",
             csrf_token=csrf_token(),
             messages=get_flashed_messages(with_categories=True),
         )
@@ -1288,12 +1513,12 @@ def create_app(runtime) -> Flask:
 
     @app.get("/")
     def index():
-        return redirect(url_for("mapping_page") if logged_in() else url_for("login"))
+        return redirect(url_for("overview_page") if logged_in() else url_for("login"))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if logged_in():
-            return redirect(url_for("mapping_page"))
+            return redirect(url_for("overview_page"))
 
         if request.method == "POST":
             require_csrf()
@@ -1312,7 +1537,7 @@ def create_app(runtime) -> Flask:
                 session.permanent = True
                 session["auth_version"] = session_version()
                 logger.info("Web UI: successful login from %s", client)
-                return redirect(url_for("mapping_page"))
+                return redirect(url_for("overview_page"))
 
             throttle.record_failure(client)
             logger.warning("Web UI: failed login from %s", client)
@@ -1328,9 +1553,23 @@ def create_app(runtime) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _setup_hint() -> str:
+        """One line on every page while something essential is missing."""
+        if runtime.default_archive() is None:
+            return "Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt."
+        if runtime.status.archive.ok is False:
+            return "Das Standard-Archiv ist nicht bereit: " + runtime.status.archive.detail
+        if not runtime.accounts.enabled() and not (runtime.pickups and runtime.pickups.enabled()):
+            return "Noch kein aktives Postfach - es wird keine Mail abgeholt."
+        return ""
+
+    def _changed() -> None:
+        """Tell the supervisor to look at the configuration now, not in 5 s."""
+        runtime.changed.set()
+
     def _printers() -> list:
         """The printers offered in the dropdowns, or none if printing is off."""
-        if runtime.printers is None or not config.printing_enabled:
+        if runtime.printers is None or not runtime.options.printing_enabled:
             return []
         return runtime.printers.all()
 
@@ -1346,10 +1585,10 @@ def create_app(runtime) -> Flask:
         return True, value
 
     def _rules() -> list[Rule]:
-        return load_rules(storage(), runtime.mapping_path)
+        return runtime.rule_store.load()
 
     def _save(rules: list[Rule]) -> None:
-        save_rules(storage(), runtime.mapping_path, rules)
+        runtime.mapping.save(rules)
 
     def _index(rules: list[Rule]) -> int:
         try:
@@ -1369,12 +1608,14 @@ def create_app(runtime) -> Flask:
             rules = []
             flash(str(exc), "error")
 
-        try:
-            folders = storage().list_folders()
-        except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
-            folders = []
-            logger.warning("Web UI: could not list folders (%s)", exc)
-            flash(f"Ordnerliste konnte nicht geladen werden: {exc}", "error")
+        folders, storage_ok = [], False
+        if storage() is not None:
+            try:
+                folders = storage().list_folders()
+                storage_ok = True
+            except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
+                logger.warning("Web UI: could not list folders (%s)", exc)
+                flash(f"Ordnerliste konnte nicht geladen werden: {exc}", "error")
 
         def folder_options(current: str) -> list[str]:
             # A rule may point at a folder that does not exist yet (it is
@@ -1394,11 +1635,84 @@ def create_app(runtime) -> Flask:
             printers=printers,
             printer_keys=[printer.key for printer in printers],
             **_archive_context(),
-            storage_description=storage().description,
-            mapping_path=runtime.mapping_path,
-            fallback_folder=config.fallback_folder,
-            quarantine_folder=config.quarantine_folder,
+            storage_ok=storage_ok,
+            migration_note=settings.get(SETTING_RULES_NOTE) or "",
+            fallback_folder=runtime.options.fallback_folder,
+            quarantine_folder=runtime.options.quarantine_folder,
         )
+
+    @app.post("/mapping/note/dismiss")
+    @login_required
+    def dismiss_migration_note():
+        require_csrf()
+        settings.set(SETTING_RULES_NOTE, "")
+        return redirect(url_for("mapping_page"))
+
+    @app.get("/mapping/export")
+    @login_required
+    def export_rules():
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        body = (
+            f"# mail2nas - Zuordnungen, exportiert am {stamp}\n"
+            "# Import: Weboberflaeche -> Zuordnungen -> Sichern und uebertragen\n"
+            + dump_rules(_rules())
+        )
+        return body, 200, {
+            "Content-Type": "application/x-yaml; charset=utf-8",
+            "Content-Disposition": f'attachment; filename="mail2nas-mapping-{stamp}.yaml"',
+        }
+
+    @app.post("/mapping/import")
+    @login_required
+    def import_rules():
+        require_csrf()
+        upload = request.files.get("rules_file")
+        try:
+            if upload is None or not upload.filename:
+                raise MappingError("Bitte eine Datei auswaehlen.")
+            try:
+                text = upload.read().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise MappingError("Die Datei ist kein UTF-8-Text.") from None
+            imported = rules_from_yaml(text)
+            replace_all = request.form.get("mode") == "replace"
+            rules = [] if replace_all else _rules()
+            added = skipped = 0
+            for rule in imported:
+                try:
+                    keyword = validate_keyword(rule.keyword, rules)
+                except MappingError:
+                    skipped += 1
+                    continue
+                folder = validate_folder(rule.folder)
+                known = {a.key for a in runtime.accounts.all()}
+                account = rule.account if rule.account in known else ALL_ACCOUNTS
+                printers = {p.key for p in (runtime.printers.all() if runtime.printers else [])}
+                archives = {a.key for a in _archives()}
+                rules.append(
+                    Rule.create(
+                        keyword,
+                        folder,
+                        account,
+                        rule.print_attachments,
+                        rule.printer if rule.printer in printers else "",
+                        rule.archive if rule.archive in archives else "",
+                    )
+                )
+                added += 1
+            _save(rules)
+        except MappingError as exc:
+            flash(f"Import abgebrochen: {exc}", "error")
+        else:
+            logger.info("Web UI: imported %d rule(s), skipped %d", added, skipped)
+            flash(
+                f"{added} Zuordnung(en) importiert"
+                + (f", {skipped} uebersprungen (Stichwort gab es schon)" if skipped else "")
+                + ". Postfaecher, Drucker und Archive, die es hier nicht gibt, wurden auf "
+                "den Standard gesetzt.",
+                "ok",
+            )
+        return redirect(url_for("mapping_page"))
 
     @app.post("/mapping/add")
     @login_required
@@ -1414,7 +1728,11 @@ def create_app(runtime) -> Flask:
             printing, printer = _print_choice(request.form.get("printer", ""))
             archive = _archive_choice(request.form.get("archive", ""))
             if new_folder:
-                _archive_storage(archive).create_folder(folder)
+                try:
+                    _archive_storage(archive).create_folder(folder)
+                except Exception as exc:  # noqa: BLE001 - the rule is still worth saving
+                    flash(f"Ordner konnte noch nicht angelegt werden ({exc}) - das passiert "
+                          "beim ersten Anhang.", "error")
             rules.append(Rule.create(keyword, folder, account, printing, printer, archive))
             _save(rules)
         except MappingError as exc:
@@ -1529,59 +1847,123 @@ def create_app(runtime) -> Flask:
             archives=_archives(),
             pickups=_pickup_rows(),
             pickup_interval=PICKUP_INTERVAL,
-            blocked_extensions=", ".join(sorted(runtime.blocked_extensions)),
-            pickup_min_age=runtime.pickup_min_age,
-            printing_enabled=config.printing_enabled,
-            mapping_path=runtime.mapping_path,
-            storage_description=storage().description,
-            storage_backend=config.storage_backend,
-            fallback_folder=config.fallback_folder,
-            quarantine_folder=config.quarantine_folder,
-            match_body=config.match_body,
-            filename_prefix=config.filename_prefix,
-            poll_interval=config.poll_interval,
-            dry_run=config.dry_run,
+            printing_enabled=runtime.options.printing_enabled,
         )
 
-    @app.post("/config/settings")
-    @login_required
-    def save_settings():
-        require_csrf()
-        extensions = runtime.set_blocked_extensions(request.form.get("blocked_extensions", ""))
-        try:
-            age = runtime.set_pickup_min_age(request.form.get("pickup_min_age", "20").strip() or 0)
-        except (TypeError, ValueError):
-            age = runtime.pickup_min_age
-            flash("Die Wartezeit muss eine Zahl sein - sie blieb unveraendert.", "error")
-        logger.info(
-            "Web UI: quarantine list set to %d extension(s), pickup age %ss",
-            len(extensions),
-            age,
-        )
-        if extensions:
-            flash("Einstellungen gespeichert.", "ok")
-        else:
-            flash(
-                "Einstellungen gespeichert. Achtung: ohne gesperrte Endungen wird "
-                "nichts mehr in die Quarantaene verschoben.",
-                "error",
-            )
-        return redirect(url_for("config_page"))
+    # --- general settings ----------------------------------------------------
 
-    @app.post("/config/mapping-path")
+    @app.route("/settings", methods=["GET", "POST"])
     @login_required
-    def move_mapping():
-        require_csrf()
-        try:
-            runtime.set_mapping_path(request.form.get("mapping_path", ""))
-        except MappingError as exc:
-            flash(str(exc), "error")
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Web UI: could not move the mapping file")
-            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
-        else:
-            flash(f"Mapping-Datei liegt jetzt unter {runtime.mapping_path}.", "ok")
-        return redirect(url_for("config_page"))
+    def settings_page():
+        options = runtime.options
+        if request.method == "POST":
+            require_csrf()
+            try:
+                new = validate_options(request.form, options)
+            except OptionsError as exc:
+                flash(str(exc), "error")
+            else:
+                runtime.set_options(new)
+                logger.info("Web UI: settings saved")
+                if not new.blocked_extensions:
+                    flash("Gespeichert. Achtung: ohne gesperrte Dateiendungen wird nichts mehr "
+                          "in die Quarantaene verschoben.", "error")
+                elif new.dry_run and not options.dry_run:
+                    flash("Gespeichert. Der Testmodus ist jetzt an - es wird nichts abgelegt.",
+                          "error")
+                else:
+                    flash("Einstellungen gespeichert.", "ok")
+                return redirect(url_for("settings_page"))
+        return render(
+            SETTINGS_BODY,
+            "Einstellungen",
+            o=options,
+            prefixes=FILENAME_PREFIXES,
+            limits=LIMITS,
+            blocked=", ".join(sorted(options.blocked_extensions)),
+            printable=", ".join(sorted(options.printable_extensions)),
+        )
+
+    # --- overview --------------------------------------------------------------
+
+    def _when(timestamp) -> str:
+        if not timestamp:
+            return ""
+        return datetime.fromtimestamp(timestamp).strftime("%d.%m. %H:%M:%S")
+
+    @app.get("/overview")
+    @login_required
+    def overview_page():
+        archives = _archives()
+        accounts = runtime.accounts.all()
+        rules = runtime.rule_store.count()
+        printers = runtime.printers.all() if runtime.printers else []
+        steps = [
+            SimpleNamespace(
+                title="Archiv einrichten",
+                hint="wohin abgelegt wird - SMB-Freigabe auf dem NAS, mit Verbindungstest",
+                url=url_for("new_archive") if not archives else url_for(
+                    "edit_archive", archive_id=archives[0].id),
+                done=bool(archives) and runtime.status.archive.ok is not False,
+            ),
+            SimpleNamespace(
+                title="Postfach anlegen",
+                hint="woher die Mails kommen (IMAP), mit Anmeldetest",
+                url=url_for("new_account"),
+                done=bool(accounts),
+            ),
+            SimpleNamespace(
+                title="Zuordnungen anlegen",
+                hint="welches Stichwort in welchen Ordner - oder eine alte mapping.yaml importieren",
+                url=url_for("mapping_page"),
+                done=rules > 0,
+            ),
+            SimpleNamespace(
+                title="Drucker (optional)",
+                hint="einmal anlegen, dann je Postfach, Zuordnung oder Adresse auswaehlen",
+                url=url_for("new_printer") if not printers else url_for("config_page"),
+                done=bool(printers),
+            ),
+        ]
+        board = runtime.status.workers()
+        names = {f"account:{a.id}": a.name for a in accounts}
+        workers = []
+        for key, row in sorted(board.items()):
+            if key.startswith("account:") and key not in names:
+                continue
+            workers.append(SimpleNamespace(
+                label=names.get(key, "Abholordner" if key == "pickups" else row.label),
+                state=row.state,
+                detail=row.detail,
+                processed=row.processed,
+                last_ok=_when(row.last_ok),
+                last_error=row.last_error,
+                last_error_at=_when(row.last_error_at),
+            ))
+        supervisor = getattr(runtime, "supervisor", None)
+        problems = list(supervisor.pickup_problems().values()) if supervisor else []
+        return render(
+            OVERVIEW_BODY,
+            "Uebersicht",
+            steps=steps,
+            steps_open=not all(step.done for step in steps[:3]),
+            archive_status=runtime.status.archive,
+            workers=workers,
+            pickup_problems=problems,
+            ready=runtime.status.archive.ok,
+            dry_run=runtime.options.dry_run,
+            initial_password=read_initial_password(config.data_dir) is not None,
+            now=_when(time.time()),
+            started=_when(runtime.status.started_at),
+            counts=SimpleNamespace(
+                accounts=len(accounts),
+                archives=len(archives),
+                rules=rules,
+                printers=len(printers),
+                addresses=len(runtime.addresses.all()) if runtime.addresses else 0,
+                pickups=len(runtime.pickups.all()) if runtime.pickups else 0,
+            ),
+        )
 
     def _account_form(account=None):
         """Read the account form, keeping the stored password if left empty."""
@@ -1642,6 +2024,7 @@ def create_app(runtime) -> Flask:
             except MappingError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
@@ -1662,6 +2045,7 @@ def create_app(runtime) -> Flask:
             except MappingError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: updated IMAP account %s", account_id)
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
@@ -1673,9 +2057,31 @@ def create_app(runtime) -> Flask:
     def delete_account(account_id: int):
         require_csrf()
         runtime.accounts.delete(account_id)
+        _changed()
         logger.info("Web UI: deleted IMAP account %s", account_id)
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
+
+    @app.post("/config/accounts/<int:account_id>/test")
+    @login_required
+    def test_account(account_id: int):
+        require_csrf()
+        account = runtime.accounts.get(account_id)
+        if account is None:
+            flash("Dieses Postfach gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            unseen = test_imap(account)
+        except Exception as exc:  # noqa: BLE001 - report every failure in the UI
+            logger.info("Web UI: IMAP test for %s failed: %s", account.host, exc)
+            flash(f"Anmeldung fehlgeschlagen: {exc}", "error")
+        else:
+            flash(
+                f"Angemeldet, Ordner {account.folder} geoeffnet - "
+                f"{unseen} ungelesene Mail(s) warten dort.",
+                "ok",
+            )
+        return redirect(url_for("edit_account", account_id=account_id))
 
     # --- archives -------------------------------------------------------------
 
@@ -1734,6 +2140,7 @@ def create_app(runtime) -> Flask:
             except ArchiveError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: added archive %r", request.form.get("name"))
                 flash("Archiv angelegt. Mit „Verbindung testen\" pruefen, ob es erreichbar ist.", "ok")
                 return redirect(url_for("config_page"))
@@ -1762,7 +2169,7 @@ def create_app(runtime) -> Flask:
             else:
                 logger.info("Web UI: updated archive %s", archive_id)
                 flash("Archiv gespeichert.", "ok")
-                runtime.mapping_path_changed.set()
+                _changed()
                 return redirect(url_for("config_page"))
             archive = archives.get(archive_id)
         return render(ARCHIVE_BODY, "Archiv", archive=archive)
@@ -1796,7 +2203,7 @@ def create_app(runtime) -> Flask:
             return redirect(url_for("config_page"))
         archives.delete(archive_id)
         logger.info("Web UI: deleted archive %s", archive_id)
-        runtime.mapping_path_changed.set()
+        _changed()
         flash(
             "Archiv geloescht. Zuordnungen, Zustelladressen und Abholordner, die darauf "
             "zeigten, nutzen jetzt das Standard-Archiv.",
@@ -2165,16 +2572,15 @@ def create_app(runtime) -> Flask:
             elif new == current:
                 flash("Das neue Passwort ist mit dem alten identisch.", "error")
             else:
-                settings.set(SETTING_PASSWORD_HASH, generate_password_hash(new))
-                # Invalidate every session, including this one, then log this
-                # browser back in - so a stolen cookie stops working.
-                settings.set(SETTING_SESSION_VERSION, str(int(session_version()) + 1))
+                # Invalidates every session, including this one; this browser
+                # is logged back in below - so a stolen cookie stops working.
+                set_password(settings, new, config.data_dir)
                 session.clear()
                 session.permanent = True
                 session["auth_version"] = session_version()
                 logger.info("Web UI: password changed")
                 flash("Passwort geaendert.", "ok")
-                return redirect(url_for("mapping_page"))
+                return redirect(url_for("overview_page"))
 
         return render(PASSWORD_BODY, "Passwort", min_length=MIN_PASSWORD_LENGTH)
 
@@ -2190,26 +2596,96 @@ def _secret_key(settings) -> str:
     return key
 
 
-def ensure_password(settings, initial_password: str) -> None:
-    """Take the initial password from the configuration, once.
+INITIAL_PASSWORD_FILE = "initial-password.txt"
+# No 0/O, 1/l/I: the password is read off a terminal and typed into a browser.
+_PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
-    Raises SystemExit if there is neither a stored password nor one in the
-    configuration - starting a password-protected UI without a password would
-    either lock the user out or, worse, not.
+
+def generate_password() -> str:
+    """A random password that survives being read aloud: 4 x 4 characters."""
+    chars = "".join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(16))
+    return "-".join(chars[i : i + 4] for i in range(0, 16, 4))
+
+
+def initial_password_path(data_dir: str | None) -> str | None:
+    return os.path.join(data_dir, INITIAL_PASSWORD_FILE) if data_dir else None
+
+
+def _write_initial_password(data_dir: str | None, password: str) -> None:
+    path = initial_password_path(data_dir)
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(password + "\n")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning("Could not write %s (%s) - the password is only in this log", path, exc)
+
+
+def read_initial_password(data_dir: str | None) -> str | None:
+    path = initial_password_path(data_dir)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def set_password(settings, new_password: str, data_dir: str | None = None) -> None:
+    """Store a new password and log every session out.
+
+    The generated first password is removed from disk at the same time: once
+    somebody chose their own, a readable copy of the old one has no purpose.
+    """
+    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(new_password))
+    version = settings.get(SETTING_SESSION_VERSION) or "1"
+    settings.set(SETTING_SESSION_VERSION, str(int(version) + 1))
+    path = initial_password_path(data_dir)
+    if path:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not remove %s (%s)", path, exc)
+
+
+def ensure_password(settings, initial_password: str = "", data_dir: str | None = None) -> str | None:
+    """Make sure the UI has a password. Returns it if one was generated.
+
+    Order of preference: a stored hash (the user's own choice, or the first
+    password from an earlier start), then WEB_PASSWORD from an older `.env`,
+    then a random one. The random one is written to `initial-password.txt`
+    next to the database (mode 0600) - that is where the installer reads it
+    from to show it - and logged once, so a plain `docker compose logs`
+    finds it too. Either way it is meant to be changed after the first login.
     """
     if settings.get(SETTING_PASSWORD_HASH):
-        return
-    if not initial_password:
-        raise SystemExit(
-            "WEB_ENABLED=true, but no password is set. Put an initial password in "
-            "WEB_PASSWORD (it is hashed on first start and can be changed in the UI)."
+        return None
+    if initial_password and len(initial_password) >= MIN_PASSWORD_LENGTH:
+        settings.set(SETTING_PASSWORD_HASH, generate_password_hash(initial_password))
+        logger.info("Web UI: initial password taken from WEB_PASSWORD")
+        return None
+    if initial_password:
+        logger.error(
+            "WEB_PASSWORD is shorter than %d characters - generating a random one instead",
+            MIN_PASSWORD_LENGTH,
         )
-    if len(initial_password) < MIN_PASSWORD_LENGTH:
-        raise SystemExit(
-            f"WEB_PASSWORD must be at least {MIN_PASSWORD_LENGTH} characters long."
-        )
-    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(initial_password))
-    logger.info("Web UI: initial password taken from WEB_PASSWORD")
+
+    password = generate_password()
+    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(password))
+    _write_initial_password(data_dir, password)
+    logger.warning(
+        "Web UI: no password was set, generated one: %s  (also in %s - "
+        "please change it after the first login)",
+        password,
+        initial_password_path(data_dir) or "nowhere else",
+    )
+    return password
 
 
 def serve(runtime) -> threading.Thread:
@@ -2222,7 +2698,7 @@ def serve(runtime) -> threading.Thread:
     from waitress import create_server
 
     config = runtime.config
-    ensure_password(runtime.settings, config.web_password)
+    ensure_password(runtime.settings, config.web_password, config.data_dir)
     app = create_app(runtime)
     try:
         server = create_server(app, host=config.web_host, port=config.web_port, threads=4)

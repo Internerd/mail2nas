@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
 #
-# mail2nas - Proxmox VE Helper-Skript
+# mail2nas - Proxmox VE Helper-Skript: installieren UND aktualisieren
 #
 # Auf der Proxmox-VE-Host-Shell ausfuehren (Datacenter -> <Node> -> Shell),
 # NICHT innerhalb einer Container-Konsole:
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/mail2nas.sh)"
 #
-# Legt eine neue, unprivilegierte LXC an, installiert darin Docker und
-# mail2nas und schreibt die .env anhand deiner Eingaben. Angelehnt an den
-# Stil der bekannten "Proxmox VE Helper-Scripts" (community-scripts.github.io) -
-# eigenstaendige Neuimplementierung fuer dieses Projekt, keine Codeuebernahme.
+# Neu installieren: legt eine unprivilegierte LXC an, installiert Docker und
+#   mail2nas darin. Es werden KEINE Mail- oder NAS-Zugangsdaten abgefragt -
+#   das passiert danach in der Weboberflaeche. Am Ende stehen Adresse und
+#   Startpasswort auf dem Bildschirm.
 #
-# Optional per Umgebungsvariable ueberschreibbar (z. B. fuer eigene Forks):
+# Aktualisieren: findet die LXCs, in denen mail2nas laeuft, und bringt die
+#   gewaehlte auf den neuesten Stand - egal, von welcher Version sie kommt
+#   (siehe scripts/proxmox/update.sh). Installationen aus der Zeit, als das
+#   Share auf dem Proxmox-Host gemountet wurde, koennen dabei auf direktes SMB
+#   umgestellt werden; Host-Mount, fstab-Eintrag und Zugangsdatei werden auf
+#   Wunsch entfernt.
+#
+# Ohne Menue:  ... mail2nas.sh install   bzw.   ... mail2nas.sh update [CTID]
+#
+# Angelehnt an den Stil der "Proxmox VE Helper-Scripts"
+# (community-scripts.github.io) - eigenstaendige Implementierung.
+#
+# Optional per Umgebungsvariable (z. B. fuer eigene Forks):
 #   MAIL2NAS_REPO_URL, MAIL2NAS_REPO_BRANCH
 
 set -euo pipefail
@@ -20,6 +32,7 @@ set -euo pipefail
 REPO_URL="${MAIL2NAS_REPO_URL:-https://github.com/Internerd/mail2nas.git}"
 REPO_BRANCH="${MAIL2NAS_REPO_BRANCH:-main}"
 RAW_BASE="${MAIL2NAS_RAW_BASE:-https://raw.githubusercontent.com/Internerd/mail2nas/${REPO_BRANCH}}"
+APP_DIR="/opt/mail2nas"
 
 # --- Vorbedingungen ----------------------------------------------------------
 
@@ -30,7 +43,7 @@ fi
 
 if ! command -v pct >/dev/null 2>&1 || ! command -v pveam >/dev/null 2>&1; then
   echo "Dieses Skript muss auf einem Proxmox-VE-Host laufen (pct/pveam nicht gefunden)." >&2
-  echo "Fuer eine bestehende Debian/Ubuntu-LXC/VM stattdessen scripts/proxmox/install.sh verwenden." >&2
+  echo "In einer bestehenden Debian/Ubuntu-LXC/VM stattdessen scripts/proxmox/install.sh verwenden." >&2
   exit 1
 fi
 
@@ -39,240 +52,297 @@ if ! command -v whiptail >/dev/null 2>&1; then
   apt-get install -y whiptail
 fi
 
-# Render a value as a single-quoted shell/dotenv literal. Passwords and other
-# free-text input must never land unquoted in a file that gets `source`d or
-# parsed by docker compose - otherwise characters like ` or $( ) are executed
-# instead of being taken literally.
-sq() {
-  local v=${1-}
-  local q="'"
-  local esc="'\\''"
-  printf "%s%s%s" "$q" "${v//$q/$esc}" "$q"
+msg() { whiptail --title "mail2nas" --msgbox "$1" 22 78; }
+yesno() { whiptail --title "mail2nas" --yesno "$1" 18 78; }
+input() { whiptail --title "mail2nas" --inputbox "$1" 10 76 "$2" 3>&1 1>&2 2>&3; }
+
+# Befehl im mail2nas-Container einer LXC ausfuehren.
+in_app() {
+  local ctid="$1"
+  shift
+  pct exec "$ctid" -- bash -c "cd $APP_DIR && $*"
 }
 
-msg() { whiptail --title "mail2nas" --msgbox "$1" 18 76; }
-yesno() { whiptail --title "mail2nas" --yesno "$1" 14 76; }
-input() { whiptail --title "mail2nas" --inputbox "$1" 10 76 "$2" 3>&1 1>&2 2>&3; }
-password() { whiptail --title "mail2nas" --passwordbox "$1" 10 76 3>&1 1>&2 2>&3; }
-menu2() { whiptail --title "mail2nas" --menu "$1" 14 76 2 "$2" "$3" "$4" "$5" 3>&1 1>&2 2>&3; }
+download() {
+  local target
+  target="$(mktemp)"
+  curl -fsSL "${RAW_BASE}/$1" -o "$target"
+  echo "$target"
+}
 
-msg "mail2nas Proxmox-Installer
+# =============================================================================
+# Aktualisieren
+# =============================================================================
 
-Legt eine neue LXC an, installiert Docker darin und deployt mail2nas (IMAP -> SMB Anhang-Archivierung mit Stichwort-Mapping).
+find_installations() {
+  # "<ctid> <name>" fuer jede laufende LXC mit mail2nas darin.
+  local id status name
+  while read -r id status name; do
+    [ "$status" = "running" ] || continue
+    if pct exec "$id" -- test -f "$APP_DIR/docker-compose.yml" 2>/dev/null; then
+      echo "$id ${name:-ct$id}"
+    fi
+  done < <(pct list | awk 'NR>1 {print $1, $2, $NF}')
+}
 
-Du wirst zuerst nach den Container-Ressourcen gefragt, danach nach IMAP- und SMB-Zugangsdaten sowie der optionalen Weboberflaeche zum Pflegen der Zuordnungen. Alle Passwoerter landen ausschliesslich in der .env der Ziel-LXC, niemals im Bash-Verlauf des Proxmox-Hosts."
+convert_host_mount() {
+  # Installationen von frueher: das Share ist auf dem Host gemountet und per
+  # Bind-Mount durchgereicht. Die Zugangsdaten liegen auf dem Host - damit
+  # kann mail2nas selbst per SMB schreiben, und der Mount wird ueberfluessig.
+  local ctid="$1"
+  local cred="/etc/mail2nas-smb-credentials-${ctid}"
+  local host_mount="/mnt/mail2nas-${ctid}"
+  [ -f "$cred" ] || return 0
 
-# --- Container-Einstellungen --------------------------------------------------
+  local unc smb_host smb_share smb_user smb_password smb_domain
+  unc="$(awk -v m="$host_mount" '$2 == m && $3 == "cifs" {print $1; exit}' /etc/fstab)"
+  if [ -z "$unc" ]; then
+    echo "Zugangsdatei $cred gefunden, aber kein fstab-Eintrag fuer $host_mount - uebersprungen."
+    return 0
+  fi
+  smb_host="${unc#//}"; smb_host="${smb_host%%/*}"
+  smb_share="${unc#//*/}"
+  smb_user="$(sed -n 's/^username=//p' "$cred" | head -1)"
+  smb_password="$(sed -n 's/^password=//p' "$cred" | head -1)"
+  smb_domain="$(sed -n 's/^domain=//p' "$cred" | head -1)"
 
-DEFAULT_CTID="$(pvesh get /cluster/nextid)"
+  yesno "Diese Installation schreibt noch ueber einen Mount auf dem Proxmox-Host:
 
-if yesno "Standard-Einstellungen fuer den Container verwenden?
+  $unc  ->  $host_mount  ->  /mnt/nas in CT $ctid
 
-CTID: ${DEFAULT_CTID} (naechste freie ID)
+mail2nas kann die Freigabe inzwischen selbst per SMB ansprechen - dann braucht
+es weder den Mount noch die Zugangsdatei auf dem Host.
+
+Jetzt auf direktes SMB umstellen? Vorher wird ein Schreibtest gemacht; schlaegt
+er fehl, bleibt alles wie es ist." || return 0
+
+  local payload
+  payload="$(SMB_HOST="$smb_host" SMB_SHARE="$smb_share" SMB_USER="$smb_user" \
+    SMB_PASSWORD="$smb_password" SMB_DOMAIN="$smb_domain" python3 -c '
+import json, os
+print(json.dumps({
+    "host": os.environ["SMB_HOST"], "share": os.environ["SMB_SHARE"],
+    "user": os.environ["SMB_USER"], "password": os.environ["SMB_PASSWORD"],
+    "domain": os.environ.get("SMB_DOMAIN", ""), "mount_path": "/mnt/nas",
+}))')"
+
+  local rc=0
+  printf '%s' "$payload" | pct exec "$ctid" -- bash -c \
+    "cd $APP_DIR && docker compose exec -T mail2nas python -m mail2nas.cli archive-to-smb" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "Kein Archiv auf /mnt/nas gefunden - nichts umzustellen."
+    return 0
+  elif [ "$rc" -ne 0 ]; then
+    msg "Die Umstellung hat nicht geklappt (siehe Ausgabe auf der Shell). Es bleibt beim Host-Mount - mail2nas laeuft unveraendert weiter."
+    return 0
+  fi
+
+  yesno "mail2nas schreibt jetzt direkt per SMB auf $unc.
+
+Soll der alte Host-Mount jetzt entfernt werden?
+  - Bind-Mount aus CT $ctid (der Container wird dafuer neu gestartet)
+  - Eintrag fuer $host_mount aus /etc/fstab (Sicherung wird angelegt)
+  - Zugangsdatei $cred
+
+'Nein' laesst alles stehen; es wird nur nicht mehr benutzt." || return 0
+
+  echo "==> Bind-Mount aus der .env und dem Container entfernen ..."
+  in_app "$ctid" "grep -v -e '^NAS_PATH=' -e '^# Das Share ist vom Betriebssystem' -e '^# durchgereicht (docker-compose.local.yml)' -e '^# der Weboberflaeche auf SMB umgestellt' .env > .env.tmp && chmod 600 .env.tmp && mv .env.tmp .env && docker compose up -d --remove-orphans"
+  local mp
+  mp="$(pct config "$ctid" | awk -v m="$host_mount" -F': ' '/^mp[0-9]+: / { if (index($2, m) == 1) print $1 }' | head -1)"
+  if [ -n "$mp" ]; then
+    pct set "$ctid" --delete "$mp"
+    echo "==> Container $ctid neu starten, damit der Mount-Punkt wegfaellt ..."
+    pct reboot "$ctid"
+  fi
+  echo "==> Host-Mount abbauen ..."
+  umount "$host_mount" 2>/dev/null || umount -l "$host_mount" 2>/dev/null || true
+  cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)"
+  awk -v m="$host_mount" '!($2 == m && $3 == "cifs")' /etc/fstab > /etc/fstab.mail2nas.tmp
+  cat /etc/fstab.mail2nas.tmp > /etc/fstab
+  rm -f /etc/fstab.mail2nas.tmp
+  rmdir "$host_mount" 2>/dev/null || true
+  shred -u "$cred" 2>/dev/null || rm -f "$cred"
+  echo "    Host-Mount entfernt (fstab-Sicherung unter /etc/fstab.bak.*)."
+}
+
+do_update() {
+  local ctid="${1:-}"
+  if [ -z "$ctid" ]; then
+    echo "==> Suche LXCs mit mail2nas ..."
+    local found=() line
+    while read -r line; do
+      [ -n "$line" ] && found+=("${line%% *}" "${line#* }")
+    done < <(find_installations)
+    if [ "${#found[@]}" -eq 0 ]; then
+      msg "In keiner laufenden LXC wurde mail2nas gefunden ($APP_DIR).
+
+Gestoppte Container bitte vorher starten. Fuer eine Neuinstallation das Skript erneut aufrufen und 'Neu installieren' waehlen."
+      exit 1
+    fi
+    if [ "${#found[@]}" -eq 2 ]; then
+      ctid="${found[0]}"
+    else
+      ctid="$(whiptail --title "mail2nas" --menu "Welche Installation aktualisieren?" 16 70 6 \
+        "${found[@]}" 3>&1 1>&2 2>&3)"
+    fi
+  fi
+
+  echo "==> Aktualisiere mail2nas in CT $ctid ..."
+  local script
+  script="$(download scripts/proxmox/update.sh)"
+  pct push "$ctid" "$script" /root/mail2nas-update.sh
+  rm -f "$script"
+  pct exec "$ctid" -- env MAIL2NAS_REPO_URL="$REPO_URL" MAIL2NAS_REPO_BRANCH="$REPO_BRANCH" \
+    bash /root/mail2nas-update.sh
+  pct exec "$ctid" -- rm -f /root/mail2nas-update.sh
+
+  convert_host_mount "$ctid"
+
+  local ip port
+  ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
+  port="$(pct exec "$ctid" -- sed -n 's/^WEB_PORT=//p' "$APP_DIR/.env" 2>/dev/null | tr -d "\"'" | tail -1)"
+  msg "Update von CT $ctid abgeschlossen.
+
+Weboberflaeche: http://${ip:-<container-ip>}:${port:-8080}/
+
+Alles, was frueher in der .env stand (Postfach, NAS, Einstellungen) und die
+mapping.yaml vom Share sind jetzt in der Weboberflaeche - dort bitte kurz
+pruefen. Die alte .env liegt als .env.bak.* in $APP_DIR (enthaelt Passwoerter -
+nach erfolgreicher Pruefung loeschen).
+
+Naechstes Mal geht es auch in der LXC mit:  mail2nas-update"
+}
+
+# =============================================================================
+# Neu installieren
+# =============================================================================
+
+do_install() {
+  msg "mail2nas - neue Installation
+
+Legt eine neue LXC an, installiert Docker und mail2nas darin.
+
+Es werden nur die Container-Ressourcen abgefragt. Postfaecher, NAS-Freigaben,
+Zuordnungen und Drucker richtest du danach in der Weboberflaeche ein - die
+Adresse und das Startpasswort stehen am Ende hier auf dem Bildschirm."
+
+  local default_ctid ctid ct_hostname cores ram_mb disk_gb bridge unprivileged web_port
+  default_ctid="$(pvesh get /cluster/nextid)"
+  web_port=8080
+
+  if yesno "Standard-Einstellungen fuer den Container verwenden?
+
+CTID: ${default_ctid} (naechste freie ID)
 Hostname: mail2nas
 CPU: 1 Kern, RAM: 512 MB, Disk: 4 GB
 Netzwerk: vmbr0, DHCP, unprivilegiert
+Weboberflaeche auf Port 8080
 
 'Nein' fuehrt durch erweiterte Einstellungen."; then
-  CTID="$DEFAULT_CTID"
-  CT_HOSTNAME="mail2nas"
-  CORES=1
-  RAM_MB=512
-  DISK_GB=4
-  BRIDGE="vmbr0"
-  UNPRIVILEGED=1
-else
-  CTID="$(input 'Container-ID (CTID)' "$DEFAULT_CTID")"
-  CT_HOSTNAME="$(input 'Hostname' 'mail2nas')"
-  CORES="$(input 'CPU-Kerne' '1')"
-  RAM_MB="$(input 'RAM in MB' '512')"
-  DISK_GB="$(input 'Disk in GB' '4')"
-  BRIDGE="$(input 'Netzwerk-Bridge' 'vmbr0')"
-  if yesno "Unprivilegierten Container erstellen? (empfohlen)"; then
-    UNPRIVILEGED=1
+    ctid="$default_ctid"; ct_hostname="mail2nas"; cores=1; ram_mb=512; disk_gb=4
+    bridge="vmbr0"; unprivileged=1
   else
-    UNPRIVILEGED=0
+    ctid="$(input 'Container-ID (CTID)' "$default_ctid")"
+    ct_hostname="$(input 'Hostname' 'mail2nas')"
+    cores="$(input 'CPU-Kerne' '1')"
+    ram_mb="$(input 'RAM in MB' '512')"
+    disk_gb="$(input 'Disk in GB' '4')"
+    bridge="$(input 'Netzwerk-Bridge' 'vmbr0')"
+    web_port="$(input 'Port der Weboberflaeche' '8080')"
+    if yesno "Unprivilegierten Container erstellen? (empfohlen)"; then
+      unprivileged=1
+    else
+      unprivileged=0
+    fi
   fi
-fi
 
-# --- Storage & Template ermitteln ---------------------------------------------
+  local ct_storage template_storage template tz
+  ct_storage="$(pvesm status -content rootdir | awk 'NR>1{print $1; exit}')"
+  template_storage="$(pvesm status -content vztmpl | awk 'NR>1{print $1; exit}')"
+  [ -n "$ct_storage" ] || { echo "Kein Storage mit rootdir-Unterstuetzung gefunden." >&2; exit 1; }
+  [ -n "$template_storage" ] || { echo "Kein Storage fuer Container-Templates gefunden." >&2; exit 1; }
 
-CT_STORAGE="$(pvesm status -content rootdir | awk 'NR>1{print $1; exit}')"
-TEMPLATE_STORAGE="$(pvesm status -content vztmpl | awk 'NR>1{print $1; exit}')"
+  pveam update >/dev/null 2>&1 || true
+  template="$(pveam available | awk '/debian-12-standard/{print $2}' | sort -V | tail -1)"
+  [ -n "$template" ] || { echo "Kein Debian-12-Template in 'pveam available' gefunden." >&2; exit 1; }
+  if ! pveam list "$template_storage" 2>/dev/null | grep -q "$template"; then
+    echo "Lade Container-Template $template herunter ..."
+    pveam download "$template_storage" "$template"
+  fi
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo Europe/Berlin)"
 
-if [ -z "$CT_STORAGE" ]; then
-  echo "Kein Storage mit rootdir-Unterstuetzung gefunden (pvesm status -content rootdir)." >&2
-  exit 1
-fi
-if [ -z "$TEMPLATE_STORAGE" ]; then
-  echo "Kein Storage mit Container-Template-Unterstuetzung gefunden (pvesm status -content vztmpl)." >&2
-  exit 1
-fi
+  echo "==> Erstelle Container $ctid ..."
+  pct create "$ctid" "${template_storage}:vztmpl/${template}" \
+    --hostname "$ct_hostname" \
+    --cores "$cores" \
+    --memory "$ram_mb" \
+    --swap 0 \
+    --rootfs "${ct_storage}:${disk_gb}" \
+    --net0 "name=eth0,bridge=${bridge},ip=dhcp" \
+    --unprivileged "$unprivileged" \
+    --features "nesting=1,keyctl=1" \
+    --onboot 1 \
+    --start 1
 
-pveam update >/dev/null 2>&1 || true
-TEMPLATE="$(pveam available | awk '/debian-12-standard/{print $2}' | sort -V | tail -1)"
-if [ -z "$TEMPLATE" ]; then
-  echo "Kein Debian-12-Template in 'pveam available' gefunden." >&2
-  exit 1
-fi
-if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE"; then
-  echo "Lade Container-Template $TEMPLATE herunter ..."
-  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
-fi
-
-# --- App-Konfiguration: IMAP --------------------------------------------------
-
-IMAP_HOST="$(input 'IMAP-Server (Host)' 'imap.example.com')"
-IMAP_PORT="$(input 'IMAP-Port' '993')"
-IMAP_USER="$(input 'IMAP-Benutzer (am besten ein dediziertes Konto)' 'archiv@example.com')"
-IMAP_PASSWORD="$(password 'IMAP-Passwort (App-Passwort empfohlen)')"
-IMAP_FOLDER="$(input 'Zu ueberwachender IMAP-Ordner' 'INBOX')"
-IMAP_MODE="$(menu2 'IMAP-Abrufmodus' idle 'IDLE (Push, empfohlen falls Server es unterstuetzt)' poll 'Polling (regelmaessig pruefen)')"
-POLL_INTERVAL_SECONDS="$(input 'Poll-/IDLE-Refresh-Intervall in Sekunden' '300')"
-
-# --- App-Konfiguration: SMB ----------------------------------------------------
-
-SMB_HOST="$(input 'SMB-Server (Host/IP des NAS)' 'nas.local')"
-SMB_SHARE="$(input 'SMB-Freigabename' 'Belege')"
-SMB_USER="$(input 'SMB-Benutzer (mit Schreibrechten auf die Zielordner)' 'mail2nas')"
-SMB_PASSWORD="$(password 'SMB-Passwort')"
-SMB_DOMAIN="$(input 'SMB-Domain/Workgroup (leer lassen falls keine)' 'WORKGROUP')"
-SMB_ROOT="$(input 'Unterordner innerhalb der Freigabe (leer = Wurzel der Freigabe)' '')"
-
-MAPPING_PATH="$(input 'Pfad zur mapping.yaml relativ zur Archiv-Wurzel' 'mapping.yaml')"
-FALLBACK_FOLDER="$(input 'Fallback-Ordner ohne Mapping-Treffer' 'unsorted')"
-
-# --- App-Konfiguration: Weboberflaeche ------------------------------------------
-
-if yesno "Weboberflaeche zum Pflegen der Stichwort-Zuordnungen aktivieren?
-
-Kleine, passwortgeschuetzte Seite im Container, auf der Stichwoerter den
-Zielordnern zugeordnet werden - dann muss die mapping.yaml nicht von Hand
-bearbeitet werden. Erreichbar ueber http://<container-ip>:<port>/"; then
-  WEB_ENABLED=true
-  WEB_PORT="$(input 'Port der Weboberflaeche' '8080')"
-  while :; do
-    WEB_PASSWORD="$(password 'Startpasswort fuer die Weboberflaeche (mind. 8 Zeichen, spaeter dort aenderbar)')"
-    [ "${#WEB_PASSWORD}" -ge 8 ] && break
-    msg "Das Passwort braucht mindestens 8 Zeichen."
+  echo "==> Warte auf Netzwerk in Container $ctid ..."
+  local up=0
+  for _ in $(seq 1 30); do
+    if pct exec "$ctid" -- getent hosts github.com >/dev/null 2>&1; then up=1; break; fi
+    sleep 2
   done
-else
-  WEB_ENABLED=false
-  WEB_PORT=8080
-  WEB_PASSWORD=""
-fi
+  [ "$up" -eq 1 ] || echo "Warnung: nach 60s noch keine Internetverbindung im Container - fahre fort." >&2
 
-# --- Hinweis: kein Mount, weder auf dem Host noch im Container -------------
-#
-# mail2nas spricht SMB direkt aus der Anwendung heraus. Damit entfaellt der
-# frueher noetige Umweg ueber /etc/fstab auf dem Proxmox-Host:
-#
-#   - In einer unprivilegierten LXC verweigert der Kernel CIFS-Mounts
-#     grundsaetzlich (CIFS ist nicht als FS_USERNS_MOUNT markiert), egal ob
-#     per mount.cifs oder per Docker-Volume-Treiber.
-#   - Ein Host-Mount waere dagegen fuer jeden mit Root-Shell auf dem Node
-#     sichtbar gewesen, und die SMB-Zugangsdaten haetten in einer Datei auf
-#     dem Host liegen muessen.
-#
-# Die Zugangsdaten landen jetzt ausschliesslich in der .env der Ziel-LXC.
-
-msg "Alle Eingaben erfasst.
-
-Container $CTID ($CT_HOSTNAME) wird jetzt erstellt und eingerichtet - das kann je nach Verbindung ein paar Minuten dauern. Dieses Fenster schliesst sich, der Fortschritt laeuft danach im Klartext auf der Shell."
-
-# --- Container erstellen --------------------------------------------------------
-
-echo "==> Erstelle Container $CTID ..."
-pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
-  --hostname "$CT_HOSTNAME" \
-  --cores "$CORES" \
-  --memory "$RAM_MB" \
-  --swap 0 \
-  --rootfs "${CT_STORAGE}:${DISK_GB}" \
-  --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
-  --unprivileged "$UNPRIVILEGED" \
-  --features "nesting=1,keyctl=1" \
-  --onboot 1 \
-  --start 1
-
-echo "==> Warte auf Netzwerk in Container $CTID ..."
-NETWORK_UP=0
-for _ in $(seq 1 30); do
-  if pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1; then
-    NETWORK_UP=1
-    break
-  fi
-  sleep 2
-done
-if [ "$NETWORK_UP" -ne 1 ]; then
-  echo "Warnung: Container hat nach 60s noch keine funktionierende DNS-Aufloesung/Internetverbindung. Fahre trotzdem fort." >&2
-fi
-
-# --- Konfiguration + Installer in den Container schieben -------------------------
-
-ENV_FILE="$(mktemp)"
-chmod 600 "$ENV_FILE"
-cat > "$ENV_FILE" <<ENVEOF
-IMAP_HOST=$(sq "$IMAP_HOST")
-IMAP_PORT=$(sq "$IMAP_PORT")
-IMAP_SSL='true'
-IMAP_USER=$(sq "$IMAP_USER")
-IMAP_PASSWORD=$(sq "$IMAP_PASSWORD")
-IMAP_FOLDER=$(sq "$IMAP_FOLDER")
-IMAP_MODE=$(sq "$IMAP_MODE")
-POLL_INTERVAL_SECONDS=$(sq "$POLL_INTERVAL_SECONDS")
-WEB_ENABLED=$(sq "$WEB_ENABLED")
-WEB_HOST='0.0.0.0'
-WEB_PORT=$(sq "$WEB_PORT")
-WEB_PASSWORD=$(sq "$WEB_PASSWORD")
-STORAGE_BACKEND='smb'
-SMB_HOST=$(sq "$SMB_HOST")
-SMB_SHARE=$(sq "$SMB_SHARE")
-SMB_USER=$(sq "$SMB_USER")
-SMB_PASSWORD=$(sq "$SMB_PASSWORD")
-SMB_DOMAIN=$(sq "$SMB_DOMAIN")
-SMB_ROOT=$(sq "$SMB_ROOT")
-MAPPING_PATH=$(sq "$MAPPING_PATH")
-FALLBACK_FOLDER=$(sq "$FALLBACK_FOLDER")
-MAIL2NAS_REPO_URL=$(sq "$REPO_URL")
-MAIL2NAS_REPO_BRANCH=$(sq "$REPO_BRANCH")
+  local env_file install_script
+  env_file="$(mktemp)"
+  cat > "$env_file" <<ENVEOF
+MAIL2NAS_REPO_URL='${REPO_URL}'
+MAIL2NAS_REPO_BRANCH='${REPO_BRANCH}'
+WEB_PORT='${web_port}'
+TZ='${tz}'
 ENVEOF
+  install_script="$(download scripts/proxmox/install.sh)"
+  pct push "$ctid" "$env_file" /root/mail2nas-install.env
+  pct push "$ctid" "$install_script" /root/mail2nas-install.sh
+  rm -f "$env_file" "$install_script"
 
-INSTALL_SCRIPT="$(mktemp)"
-curl -fsSL "${RAW_BASE}/scripts/proxmox/install.sh" -o "$INSTALL_SCRIPT"
+  echo "==> Installiere mail2nas im Container $ctid ..."
+  pct exec "$ctid" -- bash /root/mail2nas-install.sh
+  pct exec "$ctid" -- rm -f /root/mail2nas-install.sh
 
-pct push "$CTID" "$ENV_FILE" /root/mail2nas-install.env
-pct push "$CTID" "$INSTALL_SCRIPT" /root/mail2nas-install.sh
+  local ip password
+  ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
+  password="$(in_app "$ctid" "docker compose exec -T mail2nas python -m mail2nas.cli password" 2>/dev/null || true)"
 
-shred -u "$ENV_FILE" 2>/dev/null || rm -f "$ENV_FILE"
-rm -f "$INSTALL_SCRIPT"
+  local final="Fertig! Container $ctid ($ct_hostname) laeuft.
 
-echo "==> Installiere mail2nas im Container $CTID (Docker, git, Deploy) ..."
-pct exec "$CTID" -- bash -c "chmod +x /root/mail2nas-install.sh && /root/mail2nas-install.sh"
+  Weboberflaeche:  http://${ip:-<container-ip>}:${web_port}/
+  Startpasswort:   ${password:-<noch nicht bereit - spaeter: pct exec $ctid -- bash -c 'cd $APP_DIR && docker compose exec mail2nas python -m mail2nas.cli password'>}
 
-CT_IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
+Dort der Reihe nach:
+  1. Unter 'Passwort' ein eigenes setzen.
+  2. Archiv einrichten - die NAS-Freigabe per SMB, mit Verbindungstest.
+     Gemountet werden muss nichts, weder hier noch im Container.
+  3. Postfach anlegen, mit Anmeldetest.
+  4. Zuordnungen anlegen (oder eine alte mapping.yaml importieren).
 
-if [ "$WEB_ENABLED" = "true" ]; then
-  WEB_HINT="Naechster Schritt - Weboberflaeche oeffnen und die Stichwoerter den Zielordnern zuordnen:
-  http://${CT_IP:-<container-ip>}:${WEB_PORT}/
-Anmeldung mit dem eingegebenen Startpasswort; bitte dort gleich aendern. Die Oberflaeche schreibt die mapping.yaml auf der Freigabe."
-else
-  WEB_HINT="Naechster Schritt - Mapping-Datei auf der Freigabe anlegen (vom NAS oder einem Windows-Rechner aus): config/mapping.example.yaml aus dem Repo als mapping.yaml in die Wurzel der Freigabe kopieren und an die eigenen Stichwoerter anpassen. Ohne diese Datei landet alles im Fallback-Ordner '${FALLBACK_FOLDER}'."
-fi
+Update spaeter: dieses Skript erneut starten und 'Aktualisieren' waehlen,
+oder in der LXC:  mail2nas-update"
+  msg "$final"
+  echo "$final"
+}
 
-FINAL_MSG="Fertig!
+# =============================================================================
 
-Container $CTID ($CT_HOSTNAME) laeuft unter ${CT_IP:-<unbekannt>}.
-
-mail2nas schreibt direkt per SMB auf //${SMB_HOST}/${SMB_SHARE} - es ist nichts gemountet, weder auf dem Proxmox-Host noch im Container. Die SMB-Zugangsdaten stehen ausschliesslich in /opt/mail2nas/.env innerhalb der LXC (chmod 600).
-
-${WEB_HINT}
-
-Logs pruefen:
-  pct exec $CTID -- bash -c 'cd /opt/mail2nas && docker compose logs -f'
-
-Testlauf ohne Nebenwirkungen (DRY_RUN):
-  pct exec $CTID -- bash -c 'cd /opt/mail2nas && sed -i \"s/^DRY_RUN=.*/DRY_RUN=true/\" .env && docker compose up -d && docker compose logs -f'"
-
-msg "$FINAL_MSG"
-echo "$FINAL_MSG"
+MODE="${1:-}"
+case "$MODE" in
+  install) do_install ;;
+  update) do_update "${2:-}" ;;
+  "")
+    choice="$(whiptail --title "mail2nas" --menu "Was moechtest du tun?" 14 72 2 \
+      install "Neu installieren (neue LXC anlegen)" \
+      update "Bestehende Installation aktualisieren" 3>&1 1>&2 2>&3)"
+    if [ "$choice" = "update" ]; then do_update; else do_install; fi
+    ;;
+  *) echo "Aufruf: $0 [install|update [CTID]]" >&2; exit 1 ;;
+esac

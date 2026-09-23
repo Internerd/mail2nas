@@ -11,7 +11,7 @@ from mail2nas.archives import (
 )
 from mail2nas.state import SettingsStore
 from mail2nas.storage import LocalStorage, SmbStorage
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 def _store(tmp_path) -> ArchiveStore:
@@ -125,7 +125,7 @@ def test_by_key_survives_nonsense(tmp_path):
 
 
 def test_seeding_takes_the_smb_settings_from_the_env(tmp_path):
-    config = _make_config(
+    config = _seed_config(
         tmp_path, storage_backend="smb", smb_host="nas.lan", smb_share="Belege",
         smb_user="archiv", smb_password="geheim",
     )
@@ -139,7 +139,7 @@ def test_seeding_takes_the_smb_settings_from_the_env(tmp_path):
 
 
 def test_seeding_takes_the_mounted_directory_from_the_env(tmp_path):
-    config = _make_config(tmp_path, storage_backend="local")
+    config = _seed_config(tmp_path, storage_backend="local")
     store = _store(tmp_path)
 
     seed_from_config(store, SettingsStore(config.state_db_path), config)
@@ -150,7 +150,7 @@ def test_seeding_takes_the_mounted_directory_from_the_env(tmp_path):
 
 def test_seeding_happens_only_once(tmp_path):
     """Deleting the last archive in the UI must not resurrect it on restart."""
-    config = _make_config(tmp_path, storage_backend="local")
+    config = _seed_config(tmp_path, storage_backend="local")
     store = _store(tmp_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -158,6 +158,25 @@ def test_seeding_happens_only_once(tmp_path):
     for archive in store.all():
         store.delete(archive.id)
     seed_from_config(store, settings, config)
+
+    assert store.all() == []
+
+
+def test_a_fresh_installation_gets_no_archive_from_the_env(tmp_path):
+    config = _seed_config(tmp_path, storage_backend="")
+    store = _store(tmp_path)
+
+    seed_from_config(store, SettingsStore(config.state_db_path), config)
+
+    assert store.all() == []
+
+
+def test_an_incomplete_smb_archive_is_not_taken_over(tmp_path):
+    """Better no archive (the UI says so) than one that can never connect."""
+    config = _seed_config(tmp_path, storage_backend="smb", smb_host="nas", smb_share="x")
+    store = _store(tmp_path)
+
+    seed_from_config(store, SettingsStore(config.state_db_path), config)
 
     assert store.all() == []
 

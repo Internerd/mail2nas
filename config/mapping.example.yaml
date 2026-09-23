@@ -1,51 +1,60 @@
-# Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
-# (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
+# Beispiel fuer Zuordnungen (Stichwort -> Zielordner) zum IMPORT in mail2nas.
 #
-# Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
-# Aenderungen wirken also ohne Neustart/Redeploy.
+# Die Zuordnungen liegen in der Datenbank des Containers, nicht als Datei auf
+# dem NAS. Gepflegt werden sie in der Weboberflaeche unter "Zuordnungen".
+# Diese Datei ist nur ein Startpunkt: dort unter "Sichern und uebertragen"
+# importieren ("behalten, neue anhaengen" oder "ersetzen"). Derselbe Knopf
+# "Als mapping.yaml herunterladen" erzeugt eine Datei in genau diesem Format -
+# als Sicherung oder zum Uebertragen in eine andere Installation.
 #
-# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
-#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
-#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
-#                 als Fallback, falls der Dateiname selbst nichts hergibt
-#              Gross-/Kleinschreibung ist egal.
-# Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+# keyword  Stichwort; geprueft gegen
+#            1. den Dateinamen jedes einzelnen Anhangs (zuerst),
+#            2. den Betreff (und, falls in den Einstellungen aktiviert, den
+#               Mailtext) als Rueckfall, wenn der Dateiname nichts hergibt.
+#          Gross-/Kleinschreibung ist egal; * und ? sind Platzhalter.
+# folder   Zielordner relativ zur Wurzel des Archivs.
 #
-# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
-# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
-# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
-# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
-# nicht beide im selben).
+# Die Reihenfolge ist die Prioritaet: die erste passende Regel gewinnt.
+# Spezielle Stichwoerter gehoeren deshalb VOR allgemeine
+# ("Rechnungskorrektur" vor "RE").
 #
-# Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
-# "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
+# Optional je Regel (IDs stehen in der Weboberflaeche bei Postfaechern,
+# Druckern und Archiven; unbekannte IDs werden beim Import auf den Standard
+# gesetzt):
+#   account  nur fuer dieses Postfach   (weglassen = alle Postfaecher)
+#   print    true = zusaetzlich drucken (nach der Ablage)
+#   printer  dieser Drucker             (weglassen = Drucker des Postfachs)
+#   archive  dieses Archiv              (weglassen = Standard-Archiv)
+#
+# Ohne Treffer landet ein Anhang im Fallback-Ordner, gesperrte Dateitypen
+# immer in der Quarantaene - beides unter "Einstellungen". Gesperrte Anhaenge
+# werden nie gedruckt.
+#
+# Das alte flache Format (eine Zeile "Stichwort: ordner" je Regel) wird beim
+# Import ebenfalls gelesen; laengere Stichwoerter kommen dabei zuerst.
 
-# Sobald die Weboberflaeche einmal speichert, wird die Datei ins ausfuehrliche
-# Format ueberfuehrt. Dort ist die Reihenfolge die Prioritaet (die erste
-# passende Regel gewinnt), und dort stehen auch die Postfach- und
-# Druckeinstellungen je Regel:
-#
-#   version: 2
-#   rules:
-#     - keyword: Rechnungskorrektur   # steht VOR "RE", sonst greift "RE" zuerst
-#       folder: korrekturen
-#     - keyword: "Rechnung*"
-#       folder: rechnungen
-#       account: "2"                  # nur fuer dieses Postfach (id aus der UI)
-#       print: true                   # zusaetzlich ausdrucken, nach der Ablage
-#       printer: "1"                  # id eines in der UI angelegten Druckers;
-#                                     # weglassen = Drucker des Postfachs
-#
-# print/printer fehlen = es wird nichts gedruckt. Anhaenge mit gesperrter
-# Dateiendung landen immer in der Quarantaene und werden nie gedruckt.
-
-RE: rechnungen
-Rechnung: rechnungen
-Invoice: rechnungen
-LS: lieferscheine
-Lieferschein: lieferscheine
-Lieferung: lieferscheine
-AB: auftragsbestaetigungen
-Auftragsbestaetigung: auftragsbestaetigungen
-Mahnung: mahnungen
-Gutschrift: gutschriften
+version: 2
+rules:
+  - keyword: Rechnungskorrektur
+    folder: korrekturen
+  - keyword: "Rechnung*"
+    folder: rechnungen
+    print: true
+  - keyword: Invoice
+    folder: rechnungen
+  - keyword: RE
+    folder: rechnungen
+  - keyword: Lieferschein
+    folder: lieferscheine
+  - keyword: Lieferung
+    folder: lieferscheine
+  - keyword: LS
+    folder: lieferscheine
+  - keyword: Auftragsbestaetigung
+    folder: auftragsbestaetigungen
+  - keyword: AB
+    folder: auftragsbestaetigungen
+  - keyword: Mahnung
+    folder: mahnungen
+  - keyword: Gutschrift
+    folder: gutschriften

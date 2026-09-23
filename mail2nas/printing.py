@@ -77,18 +77,35 @@ class Spooler:
         timeout: int = 120,
         printable_extensions: frozenset[str] = frozenset(),
         dry_run: bool = False,
+        options=None,
     ):
         self._lp_binary = lp_binary
-        self._timeout = timeout
-        self._printable = printable_extensions or parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS)
-        self._dry_run = dry_run
+        self._timeout_value = timeout
+        self._printable_value = printable_extensions
+        self._dry_run_value = dry_run
+        # A callable returning the current Options. When given, timeout,
+        # printable formats and the test mode follow the settings page live
+        # instead of what was passed in here.
+        self._options = options
+
+    @property
+    def _timeout(self) -> int:
+        return self._options().print_timeout if self._options else self._timeout_value
+
+    @property
+    def _dry_run(self) -> bool:
+        return self._options().dry_run if self._options else self._dry_run_value
 
     @property
     def printable_extensions(self) -> frozenset[str]:
-        return self._printable
+        chosen = self._options().printable_extensions if self._options else self._printable_value
+        # Empty means "the standard list", not "nothing": a printer that
+        # silently never prints anything is not what anyone clearing the
+        # field meant.
+        return chosen or parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS)
 
     def can_print(self, filename: str) -> bool:
-        return extension_of(sanitize_filename(filename)) in self._printable
+        return extension_of(sanitize_filename(filename)) in self.printable_extensions
 
     def print_bytes(self, printer: Printer, data: bytes, filename: str, title: str = "") -> str:
         """Spool `data` to `printer`. Returns what `lp` reported, for the log.
@@ -217,14 +234,6 @@ class PrintService:
         return True
 
 
-def from_config(config, printers: PrinterStore) -> PrintService:
-    """Build the print service described by the configuration."""
-    return PrintService(
-        printers,
-        Spooler(
-            lp_binary=config.lp_binary,
-            timeout=config.print_timeout,
-            printable_extensions=config.printable_extensions,
-            dry_run=config.dry_run,
-        ),
-    )
+def from_config(config, printers: PrinterStore, options=None) -> PrintService:
+    """Build the print service: binaries from the config, the rest live from `options`."""
+    return PrintService(printers, Spooler(lp_binary=config.lp_binary, options=options))

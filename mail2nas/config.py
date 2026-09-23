@@ -4,7 +4,6 @@ import os
 import re
 from dataclasses import dataclass
 
-from .filenames import safe_relative_parts
 
 # Executable/script types that are quarantined instead of filed normally,
 # even if their filename happens to match a mapping keyword. This is a
@@ -42,8 +41,6 @@ def parse_extension_list(raw: str) -> frozenset[str]:
     )
 
 
-def _extension_set(name: str, default: str) -> frozenset[str]:
-    return parse_extension_list(os.environ.get(name, default))
 
 
 def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:
@@ -59,30 +56,10 @@ def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) 
     return value
 
 
-def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
-    value = os.environ.get(name, default).strip().lower()
-    if value not in allowed:
-        raise SystemExit(f"{name} must be one of {', '.join(allowed)}, got {value!r}")
-    return value
 
 
-def _relative(name: str, default: str, allow_empty: bool = False) -> str:
-    """Read a setting that must stay inside the archive root."""
-    value = os.environ.get(name, default).strip()
-    if allow_empty and value in ("", "."):
-        return ""
-    try:
-        safe_relative_parts(value)
-    except ValueError as exc:
-        raise SystemExit(f"{name} must be a path relative to the archive root: {exc}") from None
-    return value
 
 
-def _required(name: str, because: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise SystemExit(f"{name} is required {because}")
-    return value
 
 
 def _lpstat_binary() -> str:
@@ -96,129 +73,44 @@ def _lpstat_binary() -> str:
 
 @dataclass(frozen=True)
 class Config:
-    imap_host: str
-    imap_port: int
-    imap_user: str
-    imap_password: str
-    imap_ssl: bool
-    imap_folder: str
-    imap_processed_folder: str | None
-    imap_oversized_folder: str | None
-    imap_mode: str  # "idle" or "poll"
-    poll_interval: int
+    """What the container itself needs before anything else can run.
 
-    # "smb" talks to the NAS directly (nothing mounted anywhere), "local"
-    # archives into an already-mounted directory at storage_root.
-    storage_backend: str
-    storage_root: str
-    smb_host: str
-    smb_share: str
-    smb_user: str
-    smb_password: str
-    smb_domain: str
-    smb_port: int
-    smb_root: str
-    smb_encrypt: bool
+    Everything about *what* mail2nas does - mailboxes, archives, rules,
+    printers, limits - lives in the local database and is edited in the web
+    UI. What is left here is infrastructure: where the database is, which port
+    the UI listens on, which binaries to call. None of it is secret and none of
+    it is required, so a container starts with an empty `.env` and the rest is
+    set up in the browser.
 
-    mapping_path: str
-    fallback_folder: str
-    match_body: bool
-    filename_prefix: str  # "none" | "date" | "sender" | "date_sender"
+    Older `.env` files still work: their values are read once by `legacy.py`
+    and carried into the database on the first start of this version.
+    """
 
-    # Attack-surface limits for untrusted mail/attachment content.
-    max_attachment_size_mb: int
-    max_message_size_mb: int
-    max_attachments_per_message: int
-    blocked_extensions: frozenset[str]
-    quarantine_folder: str
-
-    state_db_path: str
-    dry_run: bool
-
-    # Printing. Which attachments get printed, and on which printer, is
-    # configured per mailbox and per mapping rule in the UI - these are the
-    # infrastructure bits behind it plus the optional first printer, so an
-    # install that is driven purely from the .env can set one up too.
-    printing_enabled: bool
-    lp_binary: str
+    state_db_path: str = "/data/state.db"
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    # Initial password only, and optional: without one, a random password is
+    # generated on first start. The stored hash wins as soon as there is one.
+    web_password: str = ""
+    web_cookie_secure: bool = False
+    lp_binary: str = "lp"
     # `lpstat` is only used to list a CUPS server's queues for the printer
     # search; it sits next to `lp`, so it is derived from it unless overridden.
-    lpstat_binary: str
-    print_timeout: int
-    printable_extensions: frozenset[str]
-    printer_name: str
-    printer_destination: str
-    printer_server: str
-    printer_options: str
-    printer_copies: int
-
-    # Optional web UI for editing the keyword -> folder mapping.
-    web_enabled: bool
-    web_host: str
-    web_port: int
-    web_password: str  # initial password only; the stored hash wins once set
-    web_cookie_secure: bool
+    lpstat_binary: str = "lpstat"
 
     @classmethod
     def from_env(cls) -> "Config":
-        # Defaults to "local" so an existing install whose .env predates this
-        # setting keeps working against its mounted share after an update;
-        # every install path writes the value explicitly.
-        backend = _choice("STORAGE_BACKEND", "local", ("smb", "local"))
-        smb = backend == "smb"
-        because = "when STORAGE_BACKEND=smb"
-        try:
-            return cls(
-                imap_host=os.environ["IMAP_HOST"],
-                imap_port=_int("IMAP_PORT", "993", minimum=1, maximum=65535),
-                imap_user=os.environ["IMAP_USER"],
-                imap_password=os.environ["IMAP_PASSWORD"],
-                imap_ssl=_bool("IMAP_SSL", True),
-                imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
-                imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
-                imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
-                imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
-                poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
-                storage_backend=backend,
-                storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
-                smb_host=_required("SMB_HOST", because) if smb else "",
-                smb_share=_required("SMB_SHARE", because) if smb else "",
-                smb_user=_required("SMB_USER", because) if smb else "",
-                smb_password=_required("SMB_PASSWORD", because) if smb else "",
-                smb_domain=os.environ.get("SMB_DOMAIN", "").strip(),
-                smb_port=_int("SMB_PORT", "445", minimum=1, maximum=65535),
-                smb_root=_relative("SMB_ROOT", "", allow_empty=True),
-                smb_encrypt=_bool("SMB_ENCRYPT", True),
-                mapping_path=_relative("MAPPING_PATH", "mapping.yaml"),
-                fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
-                match_body=_bool("MATCH_BODY", False),
-                filename_prefix=_choice(
-                    "FILENAME_PREFIX", "date_sender", ("none", "date", "sender", "date_sender")
-                ),
-                max_attachment_size_mb=_int("MAX_ATTACHMENT_SIZE_MB", "25"),
-                max_message_size_mb=_int("MAX_MESSAGE_SIZE_MB", "50"),
-                max_attachments_per_message=_int("MAX_ATTACHMENTS_PER_MESSAGE", "20"),
-                blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
-                quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
-                state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
-                dry_run=_bool("DRY_RUN", False),
-                printing_enabled=_bool("PRINTING_ENABLED", True),
-                lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
-                lpstat_binary=_lpstat_binary(),
-                print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
-                printable_extensions=_extension_set(
-                    "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS
-                ),
-                printer_name=os.environ.get("PRINTER_NAME", "").strip(),
-                printer_destination=os.environ.get("PRINTER_DESTINATION", "").strip(),
-                printer_server=os.environ.get("PRINTER_SERVER", "").strip(),
-                printer_options=os.environ.get("PRINTER_OPTIONS", "").strip(),
-                printer_copies=_int("PRINTER_COPIES", "1", minimum=1, maximum=20),
-                web_enabled=_bool("WEB_ENABLED", False),
-                web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip(),
-                web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
-                web_password=os.environ.get("WEB_PASSWORD", ""),
-                web_cookie_secure=_bool("WEB_COOKIE_SECURE", False),
-            )
-        except KeyError as exc:
-            raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
+        return cls(
+            state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db").strip() or "/data/state.db",
+            web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
+            web_password=os.environ.get("WEB_PASSWORD", ""),
+            web_cookie_secure=_bool("WEB_COOKIE_SECURE", False),
+            lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+            lpstat_binary=_lpstat_binary(),
+        )
+
+    @property
+    def data_dir(self) -> str:
+        """The directory next to the database - for files the UI hands out."""
+        return os.path.dirname(os.path.abspath(self.state_db_path))

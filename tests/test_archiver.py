@@ -2,19 +2,17 @@ from __future__ import annotations
 
 import email
 import textwrap
+from dataclasses import replace
 from email.message import EmailMessage
 
+from mail2nas.accounts import Account
 from mail2nas.addresses import AddressStore
 from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
-from mail2nas.config import (
-    DEFAULT_BLOCKED_EXTENSIONS,
-    DEFAULT_PRINTABLE_EXTENSIONS,
-    Config,
-)
-from mail2nas.mapping import Mapping
-from mail2nas.state import ProcessedStore
-from mail2nas.accounts import Account
+from mail2nas.config import DEFAULT_PRINTABLE_EXTENSIONS, Config
+from mail2nas.legacy import LegacyEnv
+from mail2nas.mapping import Mapping, RuleStore, rules_from_yaml
+from mail2nas.options import Options
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import (
     PrintError,
@@ -22,6 +20,7 @@ from mail2nas.printing import (
     Spooler,
     parse_extensions,
 )
+from mail2nas.state import ProcessedStore
 from mail2nas.storage import LocalStorage
 
 TEST_ACCOUNT = Account(
@@ -32,69 +31,68 @@ TEST_ACCOUNT = Account(
 
 
 def _account(**overrides) -> Account:
-    from dataclasses import replace
     return replace(TEST_ACCOUNT, **overrides)
 
 
+def _make_options(**overrides) -> Options:
+    """The settings as they would be stored, with test-friendly overrides."""
+    return replace(Options(), **overrides)
+
+
 def _make_config(tmp_path, **overrides) -> Config:
-    defaults = dict(
-        imap_host="imap.example.com",
-        imap_port=993,
-        imap_user="u",
-        imap_password="p",
-        imap_ssl=True,
-        imap_folder="INBOX",
-        imap_processed_folder=None,
-        imap_oversized_folder=None,
-        imap_mode="poll",
-        poll_interval=60,
-        storage_backend="local",
-        storage_root=str(tmp_path),
-        smb_host="",
-        smb_share="",
-        smb_user="",
-        smb_password="",
-        smb_domain="",
-        smb_port=445,
-        smb_root="",
-        smb_encrypt=True,
-        mapping_path="mapping.yaml",
-        fallback_folder="unsorted",
-        match_body=False,
-        filename_prefix="date_sender",
-        max_attachment_size_mb=25,
-        max_message_size_mb=50,
-        max_attachments_per_message=20,
-        blocked_extensions=frozenset(
-            e.strip() for e in DEFAULT_BLOCKED_EXTENSIONS.split(",")
-        ),
-        quarantine_folder="quarantaene",
-        state_db_path=str(tmp_path / "state.db"),
-        dry_run=False,
-        printing_enabled=True,
-        lp_binary="lp",
-        lpstat_binary="lpstat",
-        print_timeout=120,
-        printable_extensions=frozenset(
-            e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
-        ),
-        printer_name="",
-        printer_destination="",
-        printer_server="",
-        printer_options="",
-        printer_copies=1,
-        web_enabled=False,
-        web_host="127.0.0.1",
-        web_port=8080,
-        web_password="",
-        web_cookie_secure=False,
-    )
+    """The (infrastructure-only) container configuration for a test."""
+    defaults = dict(state_db_path=str(tmp_path / "state.db"), web_host="127.0.0.1")
     defaults.update(overrides)
     return Config(**defaults)
 
 
+def _make_legacy(**overrides) -> LegacyEnv:
+    """An old-style .env, as `legacy.py` reads it."""
+    return replace(LegacyEnv(), **overrides)
+
+
+def _seed_config(tmp_path, **overrides):
+    """An old .env plus where the database lives - what the seeding tests need.
+
+    The seed functions read the old variable names as attributes, exactly as
+    they come out of `LegacyEnv`.
+    """
+    from dataclasses import fields
+    from types import SimpleNamespace
+
+    defaults = dict(
+        imap_host="imap.example.com", imap_user="u", imap_password="p", storage_root=str(tmp_path)
+    )
+    defaults.update(overrides)
+    legacy = _make_legacy(**defaults)
+    values = {spec.name: getattr(legacy, spec.name) for spec in fields(legacy)}
+    return SimpleNamespace(**values, state_db_path=str(tmp_path / "state.db"))
+
+
+def _make_runtime(tmp_path, with_archive: bool = True, environ=None, **config_overrides):
+    """A wired-up service as `main` builds it - with a local archive in tmp_path.
+
+    `environ` is the (old) .env to take over; empty by default, i.e. a fresh
+    installation.
+    """
+    from mail2nas.main import build_runtime
+
+    runtime = build_runtime(_make_config(tmp_path, **config_overrides), environ or {})
+    if with_archive:
+        runtime.archives.add(name="Test", backend="local", path=str(tmp_path))
+    return runtime
+
+
 def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+
+def _make_mapping(tmp_path, mapping_content: str | None = None, fallback="unsorted") -> Mapping:
+    """Rules as the database holds them, written from a YAML snippet."""
+    store = RuleStore(str(tmp_path / "state.db"))
+    if mapping_content is not None:
+        store.save(rules_from_yaml(textwrap.dedent(mapping_content)))
+    return Mapping(store, fallback)
 
 
 def _make_archiver(
@@ -105,25 +103,23 @@ def _make_archiver(
     addresses=None,
     storages=None,
     blocked_extensions=None,
-    **config_overrides,
+    **option_overrides,
 ) -> Archiver:
-    config = _make_config(tmp_path, **config_overrides)
-    mapping_path = tmp_path / "mapping.yaml"
-    if mapping_content is not None:
-        _write_mapping(mapping_path, mapping_content)
-    storage = LocalStorage(config.storage_root)
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
-    store = ProcessedStore(config.state_db_path)
+    options = _make_options(**option_overrides)
+    mapping = _make_mapping(tmp_path, mapping_content, options.fallback_folder)
+    if blocked_extensions is not None:
+        # A callable, so a test can change the list between two messages -
+        # the way the settings page does while the service runs.
+        base = options
+        options = lambda: replace(base, blocked_extensions=blocked_extensions())  # noqa: E731
     return Archiver(
-        config,
+        options,
         mapping,
-        store,
-        storage,
+        ProcessedStore(str(tmp_path / "state.db")),
+        storages if storages is not None else LocalStorage(str(tmp_path)),
         account or TEST_ACCOUNT,
         printing,
         addresses,
-        storages,
-        blocked_extensions,
     )
 
 
@@ -903,15 +899,13 @@ def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
     printer_id = printers.add(
         name="Buero", destination="Buero_MFP", server="cups.lan:631", options="media=A4"
     )
-    config = _make_config(tmp_path, lp_binary=str(fake_lp))
     printing = PrintService(printers, Spooler(lp_binary=str(fake_lp), timeout=30))
 
-    storage = LocalStorage(config.storage_root)
     archiver = Archiver(
-        config,
-        Mapping(storage, config.mapping_path, config.fallback_folder),
-        ProcessedStore(config.state_db_path),
-        storage,
+        _make_options(),
+        _make_mapping(tmp_path),
+        ProcessedStore(str(tmp_path / "state.db")),
+        LocalStorage(str(tmp_path)),
         TEST_ACCOUNT,
         printing,
         _addresses(tmp_path, printer=str(printer_id)),
@@ -1060,3 +1054,79 @@ def test_the_blocked_extension_list_is_read_per_message(tmp_path):
     )
 
     assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+# --- "print only" never loses an attachment ----------------------------------
+
+
+def test_print_only_files_the_attachment_when_the_printer_fails(tmp_path):
+    class BrokenSpooler(RecordingSpooler):
+        def print_bytes(self, printer, data, filename, title=""):
+            raise PrintError("Drucker offline")
+
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = str(store.add(name="Kaputt", destination="drucker_a"))
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=PrintService(store, BrokenSpooler()),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=11, raw=_build_message("RE-1", [("beleg.pdf", b"DATA")])), 11
+    )
+
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_print_only_without_any_printer_files_the_attachment(tmp_path):
+    printing, spooler, _ = _make_printing(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, archive_attachments=False),
+        printing=printing,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=12, raw=_build_message("RE-1", [("beleg.pdf", b"DATA")])), 12
+    )
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_print_only_with_an_unprintable_format_files_it(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=13, raw=_build_message("RE-1", [("tabelle.xlsx", b"PK")])), 13
+    )
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*tabelle.xlsx"))
+
+
+def test_settings_changed_in_the_ui_apply_to_the_next_message(tmp_path):
+    current = {"options": _make_options()}
+    archiver = Archiver(
+        lambda: current["options"],
+        _make_mapping(tmp_path),
+        ProcessedStore(str(tmp_path / "state.db")),
+        LocalStorage(str(tmp_path)),
+        TEST_ACCOUNT,
+    )
+
+    current["options"] = _make_options(fallback_folder="sonstiges")
+    archiver._process_message(
+        FakeIMAPClient(uid=14, raw=_build_message("Hallo", [("a.pdf", b"x")])), 14
+    )
+
+    assert any((tmp_path / "sonstiges").glob("*"))

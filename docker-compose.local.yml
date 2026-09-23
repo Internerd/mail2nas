@@ -1,7 +1,11 @@
-# Override for STORAGE_BACKEND=local: bind an already-mounted share into the
-# container. Use it only if the share is mounted by the OS anyway (host fstab,
-# or a Proxmox bind mount into the LXC) - with the default SMB backend no
-# mount, and therefore no override, is needed.
+# Override for an archive that is a directory mounted by the operating system
+# (host fstab, or a Proxmox bind mount into the LXC): passes it into the
+# container as /mnt/nas. In the web UI the archive is then of the kind
+# "Gemountetes Verzeichnis" with the path /mnt/nas.
+#
+# Not needed at all for the default - an SMB share that mail2nas talks to
+# directly. update.sh picks this file automatically when NAS_PATH is set in
+# the .env.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 #
@@ -10,8 +14,5 @@
 # which the kernel refuses from inside an unprivileged LXC.
 services:
   mail2nas:
-    environment:
-      STORAGE_BACKEND: local
-      STORAGE_ROOT: /mnt/nas
     volumes:
       - ${NAS_PATH:-/mnt/nas}:/mnt/nas

@@ -19,7 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DELIMITER = "MAIL2NAS_EOF"
 
-DIRECTORIES = ("mail2nas", "config", "tests")
+DIRECTORIES = ("mail2nas", "config", "tests", "scripts/proxmox")
 
 # Empty marker files - written with `touch` rather than an empty heredoc.
 TOUCH_FILES = ("mail2nas/__init__.py", "tests/__init__.py")
@@ -33,7 +33,12 @@ EMBEDDED_FILES = (
     "docker-compose.yml",
     "docker-compose.local.yml",
     "config/mapping.example.yaml",
+    "scripts/proxmox/update.sh",
     "mail2nas/config.py",
+    "mail2nas/options.py",
+    "mail2nas/legacy.py",
+    "mail2nas/migrate.py",
+    "mail2nas/cli.py",
     "mail2nas/accounts.py",
     "mail2nas/addresses.py",
     "mail2nas/archives.py",
@@ -65,6 +70,7 @@ EMBEDDED_FILES = (
     "tests/test_printing.py",
     "tests/test_discovery.py",
     "tests/test_main.py",
+    "tests/test_migrate.py",
 )
 
 HEADER = """\
@@ -98,9 +104,10 @@ echo "Schreibe Projektdateien nach $TARGET ..."
 FOOTER = """
 echo "Fertig: $TARGET enthaelt jetzt das komplette mail2nas-Projekt."
 echo "Naechste Schritte:"
-echo "  cd $TARGET"
-echo "  cp .env.example .env && \\$EDITOR .env"
-echo "  # siehe README.md (Abschnitt 'Installation, Variante 2') fuer den Rest"
+echo "  Neuinstallation:  cd $TARGET && cp .env.example .env && docker compose up -d --build"
+echo "                    Startpasswort: docker compose exec mail2nas python -m mail2nas.cli password"
+echo "  Update:           MAIL2NAS_OFFLINE=1 bash $TARGET/scripts/proxmox/update.sh"
+echo "  Danach alles Weitere in der Weboberflaeche (http://<ip>:8080/)."
 """
 
 

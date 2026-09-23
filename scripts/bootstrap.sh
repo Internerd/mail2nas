@@ -19,7 +19,7 @@
 set -euo pipefail
 
 TARGET="${1:-/opt/mail2nas}"
-mkdir -p "$TARGET"/mail2nas "$TARGET"/config "$TARGET"/tests
+mkdir -p "$TARGET"/mail2nas "$TARGET"/config "$TARGET"/tests "$TARGET"/scripts/proxmox
 cd "$TARGET"
 
 echo "Schreibe Projektdateien nach $TARGET ..."
@@ -41,157 +41,42 @@ MAIL2NAS_EOF
 
 # --- .env.example ---
 cat > .env.example <<'MAIL2NAS_EOF'
-# Copy to .env and fill in real values. Never commit the real .env file.
+# mail2nas - Infrastruktur des Containers. Mehr steht hier nicht mehr.
 #
-# QUOTING: Wenn ein Wert (typisch: ein Passwort) Sonderzeichen wie
-# Leerzeichen, #, $, ", ' oder ` enthaelt, den Wert in doppelte
-# Anfuehrungszeichen setzen und darin \ als \\ , " als \" und $ als $$
-# schreiben, z. B.:
-#     IMAP_PASSWORD="ab\$\$(x)c\"d'e`f #g"
-# Sonst interpretiert docker compose Teile des Werts (oder bricht ab).
-# Die Installer-Skripte in scripts/ erledigen das automatisch.
-
-# --- IMAP source mailbox -----------------------------------------------
-# STARTWERTE. Beim ersten Start wird daraus das erste Postfach angelegt;
-# danach werden Postfaecher in der Weboberflaeche gepflegt (auch mehrere) und
-# diese Variablen werden ignoriert. Siehe README, Abschnitt Weboberflaeche.
-IMAP_HOST=imap.example.com
-IMAP_PORT=993
-IMAP_SSL=true
-IMAP_USER=archiv@example.com
-IMAP_PASSWORD=changeme
-IMAP_FOLDER=INBOX
-# Optional: move processed mails into this IMAP folder instead of just
-# marking them \Seen. Leave empty to just mark as read.
-IMAP_PROCESSED_FOLDER=Processed
-# Optional: oversized messages (see MAX_MESSAGE_SIZE_MB) are marked \Seen and,
-# if set, moved here instead of being touched for attachment extraction.
-IMAP_OVERSIZED_FOLDER=
-# idle = push via IMAP IDLE (recommended if the server supports it)
-# poll = check every POLL_INTERVAL_SECONDS
-IMAP_MODE=idle
-POLL_INTERVAL_SECONDS=300
-
-# --- Target SMB share ----------------------------------------------------
-# smb   = mail2nas spricht SMB direkt (empfohlen). Nichts wird gemountet,
-#         weder im Container noch auf dem Host - deshalb funktioniert es in
-#         einer unprivilegierten LXC, in der der Kernel CIFS-Mounts verweigert,
-#         und die Zugangsdaten bleiben in dieser .env statt auf dem Host.
-# local  = in ein bereits gemountetes Verzeichnis schreiben (STORAGE_ROOT).
-#         Nur noetig, wenn das Share ohnehin schon vom Betriebssystem
-#         eingebunden ist. Siehe docker-compose.local.yml.
-STORAGE_BACKEND=smb
-
-# Nur bei STORAGE_BACKEND=smb:
-SMB_HOST=nas.local
-SMB_SHARE=Belege
-SMB_USER=mail2nas
-SMB_PASSWORD=changeme
-# Domain/Workgroup - leer lassen, wenn der Server keine braucht.
-SMB_DOMAIN=
-SMB_PORT=445
-# Optionaler Unterordner innerhalb der Freigabe, unterhalb dessen alles
-# abgelegt wird. Leer = Wurzel der Freigabe.
-SMB_ROOT=
-# SMB3-Verschluesselung erzwingen. Auf false setzen, wenn der Server sie
-# ablehnt (aeltere NAS-Firmware, SMB 2.x).
-SMB_ENCRYPT=true
-
-# Nur bei STORAGE_BACKEND=local: Pfad des bereits gemounteten Shares im
-# Container. NAS_PATH sagt docker-compose.local.yml, welches Verzeichnis des
-# Docker-Hosts dorthin gebunden wird.
-STORAGE_ROOT=/mnt/nas
-NAS_PATH=/mnt/nas
-
-# --- Mapping & filing behaviour -------------------------------------------
-# Pfad zur Mapping-Datei, relativ zur Wurzel des Archivs (Freigabe bzw.
-# SMB_ROOT, oder STORAGE_ROOT beim local-Backend). Ebenfalls nur ein
-# Startwert: in der Weboberflaeche laesst sich die Datei spaeter verschieben.
-# See config/mapping.example.yaml - copy it onto the share as mapping.yaml.
-# It is reloaded on every processing cycle, so edits apply without a restart.
-MAPPING_PATH=mapping.yaml
-# Unterordner, der genutzt wird, wenn kein Stichwort aus mapping.yaml passt.
-FALLBACK_FOLDER=unsorted
-# Also search the mail body for keywords, not just the subject.
-MATCH_BODY=false
-# How saved attachment filenames are prefixed: none | date | sender | date_sender
-FILENAME_PREFIX=date_sender
-
-# --- Angriffsflaeche eindaemmen (Mail/Anhaenge sind nicht vertrauenswuerdig) --
-# Einzelne Anhaenge groesser als dieses Limit werden uebersprungen (geloggt),
-# der Rest der Mail wird trotzdem normal verarbeitet.
-MAX_ATTACHMENT_SIZE_MB=25
-# Ist die GESAMTE Mail groesser als dieses Limit, wird sie nicht mal geladen
-# (Schutz vor Memory-/Disk-Exhaustion durch riesige Mails) - nur \Seen markiert
-# und optional nach IMAP_OVERSIZED_FOLDER verschoben, zur manuellen Pruefung.
-MAX_MESSAGE_SIZE_MB=50
-# Mehr Anhaenge als dieses Limit werden nicht mehr verarbeitet (Schutz vor
-# Mails mit tausenden Mini-Anhaengen).
-MAX_ATTACHMENTS_PER_MESSAGE=20
-# Anhaenge mit einer dieser Dateiendungen werden IMMER nach QUARANTINE_FOLDER
-# verschoben, auch wenn der Dateiname sonst auf ein Mapping-Stichwort passt
-# (verhindert z. B. "Rechnung.exe" im Rechnungsordner). Komma-getrennt, ohne
-# Punkt. Leer lassen, um die Pruefung zu deaktivieren.
-# NUR VORBELEGUNG: ab dem ersten Speichern in der Weboberflaeche
-# (Konfiguration -> Quarantaene und Abholen) gilt die dort gepflegte Liste.
-BLOCKED_EXTENSIONS=exe,com,scr,bat,cmd,ps1,psm1,vbs,vbe,js,jse,wsf,wsh,msi,msp,msc,jar,cpl,dll,sys,gadget,application,pif,reg,hta,lnk,sh,apk
-QUARANTINE_FOLDER=quarantaene
-
-# --- Drucken ----------------------------------------------------------------
-# Anhaenge koennen zusaetzlich ausgedruckt werden. WAS gedruckt wird, wird in
-# der Weboberflaeche festgelegt:
-#   * je Postfach: "alle Anhaenge drucken" (optional ohne Ablage im Archiv)
-#   * je Zuordnung: nur was die Regel trifft, z. B. nur Rechnungen
-# Drucker werden dort einmal angelegt und danach ueberall per Auswahlfeld
-# verwendet. Gedruckt wird ueber CUPS (`lp`); im Container steckt nur der
-# Client, kein Druckerdienst.
+# Postfaecher, Archive (NAS-Freigaben), Zuordnungen, Drucker, Zustelladressen,
+# Abholordner und alle Einstellungen werden in der Weboberflaeche gepflegt und
+# in der Datenbank im Docker-Volume "state" gespeichert - nicht hier, und nicht
+# auf dem NAS. Keine dieser Zeilen ist Pflicht; ohne .env gelten die Defaults.
 #
-# Notausschalter: false schaltet jedes Drucken ab, egal was konfiguriert ist.
-PRINTING_ENABLED=true
-# Pfad zum lp-Binary, falls es nicht im PATH liegt.
-LP_BINARY=lp
-# Nur fuer die Druckersuche im Webinterface ("Im Netzwerk suchen"). Ohne
-# Eintrag wird lpstat neben LP_BINARY erwartet.
-# LPSTAT_BINARY=lpstat
-# Nach so vielen Sekunden gilt ein Druckauftrag als gescheitert (der Anhang
-# ist zu dem Zeitpunkt bereits abgelegt).
-PRINT_TIMEOUT_SECONDS=120
-# Nur diese Dateiendungen werden an den Drucker gegeben. Alles andere kaeme
-# als Zeichensalat heraus. Office-Formate fehlen bewusst: dafuer muesste im
-# Container ein Konverter installiert sein.
-PRINTABLE_EXTENSIONS=pdf,ps,txt,text,log,csv,png,jpg,jpeg,gif,bmp,tif,tiff
-# Optional: EIN Drucker, der beim ersten Start automatisch angelegt wird -
-# fuer Installationen, die alles ueber die .env konfigurieren. Danach ist die
-# Weboberflaeche die Quelle der Wahrheit. Leer lassen = kein Drucker.
-# PRINTER_DESTINATION ist der Name der Warteschlange in CUPS (`lpstat -p`).
-PRINTER_DESTINATION=
-PRINTER_NAME=
-# Leer = lokaler cupsd, sonst z. B. cups.lan:631
-PRINTER_SERVER=
-# Optionen wie fuer `lp -o`, jeweils ohne -o, durch Leerzeichen getrennt.
-PRINTER_OPTIONS=
-PRINTER_COPIES=1
+# Aeltere .env-Dateien mit IMAP_*, SMB_*, MAPPING_PATH usw. funktionieren
+# weiter: ihre Werte werden beim ersten Start einmalig in die Datenbank
+# uebernommen, danach ignoriert. scripts/proxmox/update.sh raeumt sie auf.
 
-# --- Weboberflaeche fuer das Mapping ---------------------------------------
-# Kleine Oberflaeche zum Zuordnen von Stichwoertern zu Ordnern, damit die
-# mapping.yaml nicht von Hand bearbeitet werden muss. Sie schreibt genau diese
-# Datei weiter - sie bleibt also im Notfall auch von Hand editierbar.
-WEB_ENABLED=true
-WEB_HOST=0.0.0.0
+# Port der Weboberflaeche (auf dem Host und im Container).
 WEB_PORT=8080
-# STARTPASSWORT. Wird beim ersten Start gehasht in der State-Datenbank
-# abgelegt; danach kann es in der Oberflaeche geaendert werden und dieser
-# Wert wird ignoriert. Mindestens 8 Zeichen.
-WEB_PASSWORD=changeme-bitte-aendern
-# Auf true setzen, wenn die Oberflaeche hinter einem HTTPS-Reverse-Proxy
-# laeuft: das Session-Cookie wird dann nur noch ueber TLS gesendet.
+# Adresse, auf der sie im Container lauscht - normalerweise so lassen.
+WEB_HOST=0.0.0.0
+# Auf true setzen, wenn die Oberflaeche hinter einem HTTPS-Reverse-Proxy laeuft:
+# das Session-Cookie wird dann nur noch ueber TLS gesendet.
 WEB_COOKIE_SECURE=false
 
-# --- Misc ------------------------------------------------------------------
-STATE_DB_PATH=/data/state.db
+# Zeitzone - bestimmt das Datum im Dateinamen und die Zeiten im Log.
+TZ=Europe/Berlin
 LOG_LEVEL=INFO
-# Set to true to log what would happen without writing files or touching IMAP flags.
-DRY_RUN=false
+
+# Optional: Startpasswort der Weboberflaeche (mind. 8 Zeichen). Ohne Eintrag
+# erzeugt mail2nas beim ersten Start ein zufaelliges und zeigt es an
+# (Log, sowie: docker compose exec mail2nas python -m mail2nas.cli password).
+# WEB_PASSWORD=
+
+# Nur fuer ein Archiv, das vom Betriebssystem gemountet ist (statt direkt per
+# SMB): Pfad auf dem Docker-Host, der als /mnt/nas in den Container kommt.
+# Mit gesetztem NAS_PATH verwendet update.sh docker-compose.local.yml.
+# NAS_PATH=/mnt/nas
+
+# Nur falls die CUPS-Werkzeuge woanders liegen als im Image.
+# LP_BINARY=lp
+# LPSTAT_BINARY=lpstat
 MAIL2NAS_EOF
 
 # --- .dockerignore ---
@@ -236,7 +121,7 @@ RUN useradd --create-home --uid 1000 mail2nas \
 USER mail2nas
 
 ENV PYTHONUNBUFFERED=1
-# Only listened on when WEB_ENABLED=true (mapping web UI).
+# The web UI - where everything is configured.
 EXPOSE 8080
 ENTRYPOINT ["python", "-m", "mail2nas.main"]
 MAIL2NAS_EOF
@@ -249,34 +134,50 @@ services:
     image: mail2nas:latest
     container_name: mail2nas
     restart: unless-stopped
+    # Only infrastructure lives here (port, time zone, log level). Mailboxes,
+    # archives, rules, printers and every setting are configured in the web UI
+    # and stored in the "state" volume below.
     env_file:
       - .env
     environment:
       STATE_DB_PATH: /data/state.db
     ports:
-      # Web UI for the keyword -> folder mapping. Host and container port are
-      # kept identical so WEB_PORT alone decides where it answers. Nothing
-      # listens here unless WEB_ENABLED=true - drop these two lines if you do
-      # not want the port published at all.
+      # The web UI. Host and container port are kept identical so WEB_PORT
+      # alone decides where it answers. LAN only - see the README.
       - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
-      # Only local state (processed-message tracking) - the archive itself is
-      # reached over SMB by the application, so there is nothing to mount here.
-      # For STORAGE_BACKEND=local, add docker-compose.local.yml:
+      # The database: configuration, passwords, processed-message tracking.
+      # The archive itself is reached over SMB by the application, so nothing
+      # else is mounted. For an archive that is a directory mounted by the OS,
+      # add docker-compose.local.yml:
       #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
       - state:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('WEB_PORT', '8080'), timeout=5)"
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
 volumes:
-  # Local state, no need for this to live on the share.
+  # Local state - never on the share: it holds the IMAP and SMB passwords.
   state:
 MAIL2NAS_EOF
 
 # --- docker-compose.local.yml ---
 cat > docker-compose.local.yml <<'MAIL2NAS_EOF'
-# Override for STORAGE_BACKEND=local: bind an already-mounted share into the
-# container. Use it only if the share is mounted by the OS anyway (host fstab,
-# or a Proxmox bind mount into the LXC) - with the default SMB backend no
-# mount, and therefore no override, is needed.
+# Override for an archive that is a directory mounted by the operating system
+# (host fstab, or a Proxmox bind mount into the LXC): passes it into the
+# container as /mnt/nas. In the web UI the archive is then of the kind
+# "Gemountetes Verzeichnis" with the path /mnt/nas.
+#
+# Not needed at all for the default - an SMB share that mail2nas talks to
+# directly. update.sh picks this file automatically when NAS_PATH is set in
+# the .env.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 #
@@ -285,66 +186,387 @@ cat > docker-compose.local.yml <<'MAIL2NAS_EOF'
 # which the kernel refuses from inside an unprivileged LXC.
 services:
   mail2nas:
-    environment:
-      STORAGE_BACKEND: local
-      STORAGE_ROOT: /mnt/nas
     volumes:
       - ${NAS_PATH:-/mnt/nas}:/mnt/nas
 MAIL2NAS_EOF
 
 # --- config/mapping.example.yaml ---
 cat > config/mapping.example.yaml <<'MAIL2NAS_EOF'
-# Kopiere diese Datei als "mapping.yaml" auf die Wurzel des SMB-Shares
-# (bzw. an den Pfad, der in MAPPING_PATH konfiguriert ist).
+# Beispiel fuer Zuordnungen (Stichwort -> Zielordner) zum IMPORT in mail2nas.
 #
-# Der Container laedt die Datei bei jedem Verarbeitungszyklus neu ein -
-# Aenderungen wirken also ohne Neustart/Redeploy.
+# Die Zuordnungen liegen in der Datenbank des Containers, nicht als Datei auf
+# dem NAS. Gepflegt werden sie in der Weboberflaeche unter "Zuordnungen".
+# Diese Datei ist nur ein Startpunkt: dort unter "Sichern und uebertragen"
+# importieren ("behalten, neue anhaengen" oder "ersetzen"). Derselbe Knopf
+# "Als mapping.yaml herunterladen" erzeugt eine Datei in genau diesem Format -
+# als Sicherung oder zum Uebertragen in eine andere Installation.
 #
-# Schluessel = Stichwort, das GEPRUEFT WIRD GEGEN:
-#              1. den Dateinamen jedes einzelnen Anhangs (zuerst)
-#              2. den Betreff (und optional den Mailtext, siehe MATCH_BODY)
-#                 als Fallback, falls der Dateiname selbst nichts hergibt
-#              Gross-/Kleinschreibung ist egal.
-# Wert       = Zielordner relativ zur Wurzel des SMB-Shares.
+# keyword  Stichwort; geprueft gegen
+#            1. den Dateinamen jedes einzelnen Anhangs (zuerst),
+#            2. den Betreff (und, falls in den Einstellungen aktiviert, den
+#               Mailtext) als Rueckfall, wenn der Dateiname nichts hergibt.
+#          Gross-/Kleinschreibung ist egal; * und ? sind Platzhalter.
+# folder   Zielordner relativ zur Wurzel des Archivs.
 #
-# Weil zuerst der Dateiname jedes Anhangs geprueft wird, koennen mehrere
-# unterschiedlich benannte Anhaenge derselben Mail auch in unterschiedliche
-# Ordner einsortiert werden (z. B. eine Mail mit "Rechnung_1.pdf" UND
-# "Lieferschein_1.pdf" im Anhang -> beide landen jeweils im richtigen Ordner,
-# nicht beide im selben).
+# Die Reihenfolge ist die Prioritaet: die erste passende Regel gewinnt.
+# Spezielle Stichwoerter gehoeren deshalb VOR allgemeine
+# ("Rechnungskorrektur" vor "RE").
 #
-# Laengere Schluessel werden vor kuerzeren geprueft, damit z. B.
-# "Rechnungskorrektur" nicht bereits durch "RE" gematcht wird.
+# Optional je Regel (IDs stehen in der Weboberflaeche bei Postfaechern,
+# Druckern und Archiven; unbekannte IDs werden beim Import auf den Standard
+# gesetzt):
+#   account  nur fuer dieses Postfach   (weglassen = alle Postfaecher)
+#   print    true = zusaetzlich drucken (nach der Ablage)
+#   printer  dieser Drucker             (weglassen = Drucker des Postfachs)
+#   archive  dieses Archiv              (weglassen = Standard-Archiv)
+#
+# Ohne Treffer landet ein Anhang im Fallback-Ordner, gesperrte Dateitypen
+# immer in der Quarantaene - beides unter "Einstellungen". Gesperrte Anhaenge
+# werden nie gedruckt.
+#
+# Das alte flache Format (eine Zeile "Stichwort: ordner" je Regel) wird beim
+# Import ebenfalls gelesen; laengere Stichwoerter kommen dabei zuerst.
 
-# Sobald die Weboberflaeche einmal speichert, wird die Datei ins ausfuehrliche
-# Format ueberfuehrt. Dort ist die Reihenfolge die Prioritaet (die erste
-# passende Regel gewinnt), und dort stehen auch die Postfach- und
-# Druckeinstellungen je Regel:
-#
-#   version: 2
-#   rules:
-#     - keyword: Rechnungskorrektur   # steht VOR "RE", sonst greift "RE" zuerst
-#       folder: korrekturen
-#     - keyword: "Rechnung*"
-#       folder: rechnungen
-#       account: "2"                  # nur fuer dieses Postfach (id aus der UI)
-#       print: true                   # zusaetzlich ausdrucken, nach der Ablage
-#       printer: "1"                  # id eines in der UI angelegten Druckers;
-#                                     # weglassen = Drucker des Postfachs
-#
-# print/printer fehlen = es wird nichts gedruckt. Anhaenge mit gesperrter
-# Dateiendung landen immer in der Quarantaene und werden nie gedruckt.
+version: 2
+rules:
+  - keyword: Rechnungskorrektur
+    folder: korrekturen
+  - keyword: "Rechnung*"
+    folder: rechnungen
+    print: true
+  - keyword: Invoice
+    folder: rechnungen
+  - keyword: RE
+    folder: rechnungen
+  - keyword: Lieferschein
+    folder: lieferscheine
+  - keyword: Lieferung
+    folder: lieferscheine
+  - keyword: LS
+    folder: lieferscheine
+  - keyword: Auftragsbestaetigung
+    folder: auftragsbestaetigungen
+  - keyword: AB
+    folder: auftragsbestaetigungen
+  - keyword: Mahnung
+    folder: mahnungen
+  - keyword: Gutschrift
+    folder: gutschriften
+MAIL2NAS_EOF
 
-RE: rechnungen
-Rechnung: rechnungen
-Invoice: rechnungen
-LS: lieferscheine
-Lieferschein: lieferscheine
-Lieferung: lieferscheine
-AB: auftragsbestaetigungen
-Auftragsbestaetigung: auftragsbestaetigungen
-Mahnung: mahnungen
-Gutschrift: gutschriften
+# --- scripts/proxmox/update.sh ---
+cat > scripts/proxmox/update.sh <<'MAIL2NAS_EOF'
+#!/usr/bin/env bash
+#
+# mail2nas - Update auf den aktuellen Stand, egal von welcher Version.
+#
+# INNERHALB der LXC/VM ausfuehren, in der mail2nas laeuft:
+#
+#   mail2nas-update
+#
+# (den Befehl legt die Installation bzw. das erste Update an), oder direkt:
+#
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Internerd/mail2nas/main/scripts/proxmox/update.sh)"
+#
+# Vom Proxmox-Host aus geht es bequemer mit dem Helper-Skript
+# (scripts/proxmox/mail2nas.sh -> "Bestehende Installation aktualisieren").
+#
+# Was passiert:
+#   1. Sicherung: .env -> .env.bak.<Zeitstempel>, Datenbank -> /data/state.db.bak-<Zeitstempel>
+#      (im Docker-Volume, per SQLite-Backup-API - konsistent auch im Betrieb).
+#   2. Code holen. Ein Ordner ohne git (Offline-Installation per bootstrap.sh
+#      oder scp) wird dabei in einen git-Checkout umgewandelt. Ohne Zugriff auf
+#      GitHub: neue Dateien per bootstrap.sh einspielen und dieses Skript mit
+#      MAIL2NAS_OFFLINE=1 starten - dann wird nur neu gebaut und migriert.
+#   3. Neu bauen (--pull) und starten. Beim ersten Start der neuen Version
+#      uebernimmt mail2nas alles, was bisher in der .env stand (Postfach, Archiv,
+#      Drucker, Einstellungen) sowie die mapping.yaml vom Share in seine
+#      Datenbank - die Datei auf dem Share heisst danach mapping.yaml.migriert.
+#   4. Sobald das bestaetigt ist, wird die .env auf die Infrastruktur
+#      reduziert (Port, Zeitzone, Log-Level). Zugangsdaten stehen dann nur noch
+#      in der Datenbank - und in der Sicherung aus Schritt 1.
+#
+# Alle bisherigen Generationen werden erkannt:
+#   - Docker-cifs-Volume (erste Versionen): SMB-Zugangsdaten in der .env ->
+#     mail2nas spricht jetzt direkt SMB, das alte Volume wird entfernt.
+#   - Share auf dem Proxmox-Host gemountet (Bind-Mount nach /mnt/nas): bleibt
+#     so, bis es im Helper-Skript auf direktes SMB umgestellt wird.
+#   - Direktes SMB (STORAGE_BACKEND=smb): nichts zu mounten.
+#
+# Optional per Umgebungsvariable:
+#   MAIL2NAS_TARGET_DIR   (Default: /opt/mail2nas)
+#   MAIL2NAS_REPO_URL     (Default: https://github.com/Internerd/mail2nas.git)
+#   MAIL2NAS_REPO_BRANCH  (Default: der ausgecheckte Branch, sonst main)
+#   MAIL2NAS_OFFLINE=1    (nichts herunterladen, vorhandene Dateien verwenden)
+#   MAIL2NAS_KEEP_ENV=1   (die .env nicht aufraeumen)
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Bitte als root ausfuehren." >&2
+  exit 1
+fi
+
+TARGET_DIR="${MAIL2NAS_TARGET_DIR:-/opt/mail2nas}"
+REPO_URL="${MAIL2NAS_REPO_URL:-https://github.com/Internerd/mail2nas.git}"
+WAIT_SECONDS="${MAIL2NAS_WAIT_SECONDS:-180}"
+BIN_DIR="${MAIL2NAS_BIN_DIR:-/usr/local/bin}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+say() { echo "==> $*"; }
+warn() { echo "WARNUNG: $*" >&2; }
+fail() { echo "FEHLER: $*" >&2; exit 1; }
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "Verzeichnis $TARGET_DIR existiert nicht - ist mail2nas hier installiert?" >&2
+  echo "Fuer eine Erstinstallation: scripts/proxmox/install.sh" >&2
+  exit 1
+fi
+if [ ! -f "$TARGET_DIR/docker-compose.yml" ]; then
+  echo "In $TARGET_DIR liegt keine mail2nas-Installation (docker-compose.yml fehlt)." >&2
+  echo "Fuer eine Erstinstallation: scripts/proxmox/install.sh" >&2
+  exit 1
+fi
+cd "$TARGET_DIR"
+
+# --- Werkzeuge -----------------------------------------------------------------
+
+if docker compose version >/dev/null 2>&1; then
+  DC=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  DC=(docker-compose)
+else
+  fail "Weder 'docker compose' noch 'docker-compose' gefunden."
+fi
+
+# Wert einer Variable aus der .env, ohne Anfuehrungszeichen.
+env_get() {
+  [ -f .env ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+# --- 1. Sicherung ------------------------------------------------------------------
+
+if [ -f .env ]; then
+  say "Sicherung der Konfiguration: .env.bak.$STAMP"
+  (umask 077 && cp -a .env ".env.bak.$STAMP")
+  chmod 600 ".env.bak.$STAMP"
+else
+  say "Keine .env vorhanden - es wird eine minimale angelegt."
+  umask 077
+  printf 'WEB_PORT=8080\nTZ=Europe/Berlin\nLOG_LEVEL=INFO\n' > .env
+  chmod 600 .env
+fi
+
+if "${DC[@]}" ps -q mail2nas 2>/dev/null | grep -q .; then
+  say "Sicherung der Datenbank: /data/state.db.bak-$STAMP (im Docker-Volume)"
+  "${DC[@]}" exec -T mail2nas python -c "
+import sqlite3, sys
+source = sqlite3.connect('/data/state.db')
+target = sqlite3.connect('/data/state.db.bak-$STAMP')
+source.backup(target)
+target.close()
+" || warn "Datenbank-Sicherung nicht moeglich - weiter ohne."
+fi
+
+# --- 2. Code ----------------------------------------------------------------------
+
+BEFORE="$(git rev-parse --short HEAD 2>/dev/null || echo 'ohne git')"
+BRANCH="${MAIL2NAS_REPO_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}"
+[ "$BRANCH" = "HEAD" ] && BRANCH=main
+
+if [ "${MAIL2NAS_OFFLINE:-0}" = "1" ]; then
+  say "Offline-Modus: es wird nichts heruntergeladen, die vorhandenen Dateien werden gebaut."
+else
+  if ! command -v git >/dev/null 2>&1; then
+    say "git installieren ..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git >/dev/null \
+      || fail "git fehlt und liess sich nicht installieren. Alternativ: bootstrap.sh + MAIL2NAS_OFFLINE=1."
+  fi
+  if [ ! -d .git ]; then
+    say "Kein git-Checkout (Installation per bootstrap.sh/scp) - wird umgewandelt."
+    git init -q
+    git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL"
+  fi
+  say "Code aktualisieren (Branch: $BRANCH, aktuell: $BEFORE) ..."
+  if ! git fetch --depth 1 origin "$BRANCH"; then
+    echo "GitHub ist nicht erreichbar. Ohne Internetzugang: scripts/bootstrap.sh der neuen" >&2
+    echo "Version hier ausfuehren und danach 'MAIL2NAS_OFFLINE=1 $0' starten." >&2
+    exit 1
+  fi
+  # reset --hard statt merge: lokale Aenderungen am Code duerfen ein
+  # Sicherheitsupdate nicht blockieren. .env und Sicherungen sind ignoriert
+  # (.gitignore) und bleiben unangetastet.
+  git reset -q --hard FETCH_HEAD
+  git branch -q -M "$BRANCH" 2>/dev/null || true
+fi
+AFTER="$(git rev-parse --short HEAD 2>/dev/null || echo 'ohne git')"
+if [ "$BEFORE" = "$AFTER" ]; then
+  say "Bereits auf dem aktuellen Stand ($AFTER) - baue trotzdem neu, damit Basis-Image"
+  echo "    und Abhaengigkeiten aktuelle Sicherheitsupdates bekommen."
+else
+  say "Aktualisiert: $BEFORE -> $AFTER"
+fi
+
+# --- 3. Welche Compose-Dateien? ---------------------------------------------------
+#
+# Den Bind-Mount (docker-compose.local.yml) braucht nur, wer das Share vom
+# Betriebssystem einbinden laesst. Entscheidend ist, was die .env sagt - und
+# fehlt dort der Eintrag, welche Generation das ist:
+#   STORAGE_BACKEND=local                -> Mount
+#   STORAGE_BACKEND=smb                  -> kein Mount
+#   ohne Backend, aber NAS_PATH          -> Mount (aufgeraeumte .env, oder Host-Mount)
+#   ohne Backend, IMAP_* aber kein SMB_* -> Mount (Host-Mount-Generation)
+#   ohne Backend, mit SMB_*              -> kein Mount (Docker-cifs-Generation -> jetzt SMB direkt)
+BACKEND="$(env_get STORAGE_BACKEND | tr 'A-Z' 'a-z')"
+NAS_PATH_VALUE="$(env_get NAS_PATH)"
+NEED_MOUNT=0
+case "$BACKEND" in
+  local) NEED_MOUNT=1 ;;
+  smb) NEED_MOUNT=0 ;;
+  *)
+    if [ -n "$NAS_PATH_VALUE" ]; then
+      NEED_MOUNT=1
+    elif [ -n "$(env_get IMAP_HOST)" ] && [ -z "$(env_get SMB_HOST)" ]; then
+      NEED_MOUNT=1
+    fi
+    ;;
+esac
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ "$NEED_MOUNT" -eq 1 ]; then
+  COMPOSE_FILES+=(-f docker-compose.local.yml)
+  MOUNT_DIR="${NAS_PATH_VALUE:-/mnt/nas}"
+  say "Ablage: gemountetes Share unter $MOUNT_DIR (Bind-Mount in den Container)"
+  if command -v mountpoint >/dev/null 2>&1 && ! mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
+    warn "$MOUNT_DIR ist kein Mountpoint - ist das Share eingebunden?"
+    warn "mail2nas startet trotzdem, nimmt aber keine Mail an, bis das Archiv in der"
+    warn "Weboberflaeche als bereit gemeldet wird."
+  fi
+else
+  say "Ablage: direkt per SMB bzw. wie in der Weboberflaeche eingerichtet (kein Mount)"
+fi
+dc() { "${DC[@]}" "${COMPOSE_FILES[@]}" "$@"; }
+
+# --- 4. Bauen, starten, Uebernahme abwarten ----------------------------------------
+
+say "Neu bauen (--pull) und starten ..."
+dc build --pull
+dc up -d --remove-orphans
+
+say "Warte, bis mail2nas laeuft und die alte Konfiguration uebernommen hat ..."
+STATUS=""
+READY=0
+for _ in $(seq 1 $(( WAIT_SECONDS / 2 ))); do
+  if STATUS="$(dc exec -T mail2nas python -m mail2nas.cli status 2>/dev/null)" \
+     && grep -q '"options_seeded": true' <<<"$STATUS"; then
+    READY=1
+    break
+  fi
+  sleep 2
+done
+if [ "$READY" -ne 1 ]; then
+  warn "mail2nas hat sich nach ${WAIT_SECONDS}s nicht gemeldet - die .env bleibt unveraendert."
+  warn "Logs: cd $TARGET_DIR && ${DC[*]} logs --tail 100"
+fi
+
+# --- 5. .env aufraeumen ---------------------------------------------------------------
+#
+# Alles, was frueher in der .env konfiguriert wurde, steht jetzt in der
+# Datenbank. Die Variablen wuerden ignoriert - aber Passwoerter in einer Datei
+# liegen zu lassen, die niemand mehr braucht, ist unnoetig.
+LEGACY_KEYS="IMAP_HOST IMAP_PORT IMAP_SSL IMAP_USER IMAP_PASSWORD IMAP_FOLDER
+IMAP_PROCESSED_FOLDER IMAP_OVERSIZED_FOLDER IMAP_MODE POLL_INTERVAL_SECONDS STORAGE_BACKEND
+STORAGE_ROOT SMB_HOST SMB_SHARE SMB_USER SMB_PASSWORD SMB_DOMAIN SMB_PORT SMB_ROOT SMB_ENCRYPT
+MAPPING_PATH FALLBACK_FOLDER MATCH_BODY FILENAME_PREFIX MAX_ATTACHMENT_SIZE_MB MAX_MESSAGE_SIZE_MB
+MAX_ATTACHMENTS_PER_MESSAGE BLOCKED_EXTENSIONS QUARANTINE_FOLDER DRY_RUN PRINTING_ENABLED
+PRINT_TIMEOUT_SECONDS PRINTABLE_EXTENSIONS PRINTER_NAME PRINTER_DESTINATION PRINTER_SERVER
+PRINTER_OPTIONS PRINTER_COPIES WEB_ENABLED WEB_PASSWORD NAS_PATH MAIL2NAS_REPO_URL MAIL2NAS_REPO_BRANCH"
+
+is_legacy() {
+  local key="$1" k
+  for k in $LEGACY_KEYS; do [ "$k" = "$key" ] && return 0; done
+  return 1
+}
+
+HAS_LEGACY=0
+while IFS= read -r line; do
+  key="${line%%=*}"
+  key="${key#"${key%%[![:space:]]*}"}"
+  case "$line" in \#*|"") continue ;; esac
+  if is_legacy "$key" && [ "$key" != "NAS_PATH" ]; then HAS_LEGACY=1; fi
+done < .env
+
+if [ "$READY" -eq 1 ] && [ "$HAS_LEGACY" -eq 1 ] && [ "${MAIL2NAS_KEEP_ENV:-0}" != "1" ]; then
+  say "Konfiguration ist in der Datenbank - .env auf die Infrastruktur reduzieren ..."
+  NEW_ENV="$(mktemp "$TARGET_DIR/.env.new.XXXXXX")"
+  {
+    echo "# mail2nas - nur noch Infrastruktur. Postfaecher, Archive, Zuordnungen,"
+    echo "# Drucker und alle Einstellungen werden in der Weboberflaeche gepflegt."
+    echo "# Die vorherige Fassung liegt unter .env.bak.$STAMP (enthaelt Passwoerter -"
+    echo "# nach einem erfolgreichen Update loeschen)."
+    while IFS= read -r line; do
+      case "$line" in \#*|"") continue ;; esac
+      key="${line%%=*}"
+      key="${key#"${key%%[![:space:]]*}"}"
+      is_legacy "$key" && continue
+      echo "$line"
+    done < .env
+    grep -q '^[[:space:]]*TZ=' .env || echo "TZ=Europe/Berlin"
+    if [ "$NEED_MOUNT" -eq 1 ]; then
+      echo "# Das Share ist vom Betriebssystem eingebunden und wird in den Container"
+      echo "# durchgereicht (docker-compose.local.yml). Entfernen, wenn das Archiv in"
+      echo "# der Weboberflaeche auf SMB umgestellt ist."
+      echo "NAS_PATH=${NAS_PATH_VALUE:-/mnt/nas}"
+    fi
+  } > "$NEW_ENV"
+  chmod 600 "$NEW_ENV"
+  mv "$NEW_ENV" .env
+  # Container mit der bereinigten Umgebung neu erzeugen.
+  dc up -d --remove-orphans
+fi
+
+# --- 6. Aufraeumen ---------------------------------------------------------------------
+
+# Das Docker-cifs-Volume der ersten Versionen: nur eine Mount-Beschreibung
+# (mit SMB-Passwort in den Volume-Metadaten), keine Daten.
+PROJECT="${COMPOSE_PROJECT_NAME:-$(basename "$TARGET_DIR")}"
+if docker volume inspect "${PROJECT}_nas" >/dev/null 2>&1; then
+  say "Altes cifs-Volume ${PROJECT}_nas entfernen (enthielt nur die Mount-Zugangsdaten) ..."
+  docker volume rm "${PROJECT}_nas" >/dev/null 2>&1 || warn "Konnte ${PROJECT}_nas nicht entfernen."
+fi
+
+say "Alte, nicht mehr verwendete Images aufraeumen ..."
+docker image prune -f >/dev/null 2>&1 || true
+
+# Kurzer Befehl fuer das naechste Mal.
+if [ -d "$BIN_DIR" ] && [ -f "$TARGET_DIR/scripts/proxmox/update.sh" ]; then
+  cat > "$BIN_DIR/mail2nas-update" <<EOF
+#!/bin/sh
+# mail2nas auf den neuesten Stand bringen (angelegt von update.sh/install.sh).
+MAIL2NAS_TARGET_DIR="$TARGET_DIR" exec bash "$TARGET_DIR/scripts/proxmox/update.sh" "\$@"
+EOF
+  chmod 755 "$BIN_DIR/mail2nas-update"
+fi
+
+# --- Ergebnis ---------------------------------------------------------------------------
+
+WEB_PORT_VALUE="$(env_get WEB_PORT)"
+CT_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+echo
+echo "Update abgeschlossen ($BEFORE -> $AFTER)."
+echo "Weboberflaeche: http://${CT_IP:-<container-ip>}:${WEB_PORT_VALUE:-8080}/"
+if [ "$READY" -eq 1 ]; then
+  if grep -q '"initial_password_pending": true' <<<"$STATUS"; then
+    PASSWORD="$(dc exec -T mail2nas python -m mail2nas.cli password 2>/dev/null || true)"
+    [ -n "$PASSWORD" ] && echo "Startpasswort:  $PASSWORD   (nach der Anmeldung bitte aendern)"
+  fi
+  if grep -q '"archives": 0' <<<"$STATUS"; then
+    echo "Noch kein Archiv eingerichtet - bitte in der Weboberflaeche nachholen."
+  fi
+fi
+echo "Status:  cd $TARGET_DIR && ${DC[*]} ps"
+echo "Logs:    cd $TARGET_DIR && ${DC[*]} logs -f"
+echo "Naechstes Update: mail2nas-update"
 MAIL2NAS_EOF
 
 # --- mail2nas/config.py ---
@@ -355,7 +577,6 @@ import os
 import re
 from dataclasses import dataclass
 
-from .filenames import safe_relative_parts
 
 # Executable/script types that are quarantined instead of filed normally,
 # even if their filename happens to match a mapping keyword. This is a
@@ -393,8 +614,6 @@ def parse_extension_list(raw: str) -> frozenset[str]:
     )
 
 
-def _extension_set(name: str, default: str) -> frozenset[str]:
-    return parse_extension_list(os.environ.get(name, default))
 
 
 def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) -> int:
@@ -410,30 +629,10 @@ def _int(name: str, default: str, minimum: int = 1, maximum: int | None = None) 
     return value
 
 
-def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
-    value = os.environ.get(name, default).strip().lower()
-    if value not in allowed:
-        raise SystemExit(f"{name} must be one of {', '.join(allowed)}, got {value!r}")
-    return value
 
 
-def _relative(name: str, default: str, allow_empty: bool = False) -> str:
-    """Read a setting that must stay inside the archive root."""
-    value = os.environ.get(name, default).strip()
-    if allow_empty and value in ("", "."):
-        return ""
-    try:
-        safe_relative_parts(value)
-    except ValueError as exc:
-        raise SystemExit(f"{name} must be a path relative to the archive root: {exc}") from None
-    return value
 
 
-def _required(name: str, because: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise SystemExit(f"{name} is required {because}")
-    return value
 
 
 def _lpstat_binary() -> str:
@@ -447,132 +646,857 @@ def _lpstat_binary() -> str:
 
 @dataclass(frozen=True)
 class Config:
-    imap_host: str
-    imap_port: int
-    imap_user: str
-    imap_password: str
-    imap_ssl: bool
-    imap_folder: str
-    imap_processed_folder: str | None
-    imap_oversized_folder: str | None
-    imap_mode: str  # "idle" or "poll"
-    poll_interval: int
+    """What the container itself needs before anything else can run.
 
-    # "smb" talks to the NAS directly (nothing mounted anywhere), "local"
-    # archives into an already-mounted directory at storage_root.
-    storage_backend: str
-    storage_root: str
-    smb_host: str
-    smb_share: str
-    smb_user: str
-    smb_password: str
-    smb_domain: str
-    smb_port: int
-    smb_root: str
-    smb_encrypt: bool
+    Everything about *what* mail2nas does - mailboxes, archives, rules,
+    printers, limits - lives in the local database and is edited in the web
+    UI. What is left here is infrastructure: where the database is, which port
+    the UI listens on, which binaries to call. None of it is secret and none of
+    it is required, so a container starts with an empty `.env` and the rest is
+    set up in the browser.
 
-    mapping_path: str
-    fallback_folder: str
-    match_body: bool
-    filename_prefix: str  # "none" | "date" | "sender" | "date_sender"
+    Older `.env` files still work: their values are read once by `legacy.py`
+    and carried into the database on the first start of this version.
+    """
 
-    # Attack-surface limits for untrusted mail/attachment content.
-    max_attachment_size_mb: int
-    max_message_size_mb: int
-    max_attachments_per_message: int
-    blocked_extensions: frozenset[str]
-    quarantine_folder: str
-
-    state_db_path: str
-    dry_run: bool
-
-    # Printing. Which attachments get printed, and on which printer, is
-    # configured per mailbox and per mapping rule in the UI - these are the
-    # infrastructure bits behind it plus the optional first printer, so an
-    # install that is driven purely from the .env can set one up too.
-    printing_enabled: bool
-    lp_binary: str
+    state_db_path: str = "/data/state.db"
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    # Initial password only, and optional: without one, a random password is
+    # generated on first start. The stored hash wins as soon as there is one.
+    web_password: str = ""
+    web_cookie_secure: bool = False
+    lp_binary: str = "lp"
     # `lpstat` is only used to list a CUPS server's queues for the printer
     # search; it sits next to `lp`, so it is derived from it unless overridden.
-    lpstat_binary: str
-    print_timeout: int
-    printable_extensions: frozenset[str]
-    printer_name: str
-    printer_destination: str
-    printer_server: str
-    printer_options: str
-    printer_copies: int
-
-    # Optional web UI for editing the keyword -> folder mapping.
-    web_enabled: bool
-    web_host: str
-    web_port: int
-    web_password: str  # initial password only; the stored hash wins once set
-    web_cookie_secure: bool
+    lpstat_binary: str = "lpstat"
 
     @classmethod
     def from_env(cls) -> "Config":
-        # Defaults to "local" so an existing install whose .env predates this
-        # setting keeps working against its mounted share after an update;
-        # every install path writes the value explicitly.
-        backend = _choice("STORAGE_BACKEND", "local", ("smb", "local"))
-        smb = backend == "smb"
-        because = "when STORAGE_BACKEND=smb"
-        try:
-            return cls(
-                imap_host=os.environ["IMAP_HOST"],
-                imap_port=_int("IMAP_PORT", "993", minimum=1, maximum=65535),
-                imap_user=os.environ["IMAP_USER"],
-                imap_password=os.environ["IMAP_PASSWORD"],
-                imap_ssl=_bool("IMAP_SSL", True),
-                imap_folder=os.environ.get("IMAP_FOLDER", "INBOX"),
-                imap_processed_folder=os.environ.get("IMAP_PROCESSED_FOLDER") or None,
-                imap_oversized_folder=os.environ.get("IMAP_OVERSIZED_FOLDER") or None,
-                imap_mode=_choice("IMAP_MODE", "poll", ("idle", "poll")),
-                poll_interval=_int("POLL_INTERVAL_SECONDS", "300", minimum=1),
-                storage_backend=backend,
-                storage_root=os.environ.get("STORAGE_ROOT", "/mnt/nas"),
-                smb_host=_required("SMB_HOST", because) if smb else "",
-                smb_share=_required("SMB_SHARE", because) if smb else "",
-                smb_user=_required("SMB_USER", because) if smb else "",
-                smb_password=_required("SMB_PASSWORD", because) if smb else "",
-                smb_domain=os.environ.get("SMB_DOMAIN", "").strip(),
-                smb_port=_int("SMB_PORT", "445", minimum=1, maximum=65535),
-                smb_root=_relative("SMB_ROOT", "", allow_empty=True),
-                smb_encrypt=_bool("SMB_ENCRYPT", True),
-                mapping_path=_relative("MAPPING_PATH", "mapping.yaml"),
-                fallback_folder=os.environ.get("FALLBACK_FOLDER", "unsorted"),
-                match_body=_bool("MATCH_BODY", False),
-                filename_prefix=_choice(
-                    "FILENAME_PREFIX", "date_sender", ("none", "date", "sender", "date_sender")
-                ),
-                max_attachment_size_mb=_int("MAX_ATTACHMENT_SIZE_MB", "25"),
-                max_message_size_mb=_int("MAX_MESSAGE_SIZE_MB", "50"),
-                max_attachments_per_message=_int("MAX_ATTACHMENTS_PER_MESSAGE", "20"),
-                blocked_extensions=_extension_set("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS),
-                quarantine_folder=os.environ.get("QUARANTINE_FOLDER", "quarantaene"),
-                state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db"),
-                dry_run=_bool("DRY_RUN", False),
-                printing_enabled=_bool("PRINTING_ENABLED", True),
-                lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
-                lpstat_binary=_lpstat_binary(),
-                print_timeout=_int("PRINT_TIMEOUT_SECONDS", "120", minimum=1),
-                printable_extensions=_extension_set(
-                    "PRINTABLE_EXTENSIONS", DEFAULT_PRINTABLE_EXTENSIONS
-                ),
-                printer_name=os.environ.get("PRINTER_NAME", "").strip(),
-                printer_destination=os.environ.get("PRINTER_DESTINATION", "").strip(),
-                printer_server=os.environ.get("PRINTER_SERVER", "").strip(),
-                printer_options=os.environ.get("PRINTER_OPTIONS", "").strip(),
-                printer_copies=_int("PRINTER_COPIES", "1", minimum=1, maximum=20),
-                web_enabled=_bool("WEB_ENABLED", False),
-                web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip(),
-                web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
-                web_password=os.environ.get("WEB_PASSWORD", ""),
-                web_cookie_secure=_bool("WEB_COOKIE_SECURE", False),
-            )
-        except KeyError as exc:
-            raise SystemExit(f"Missing required environment variable: {exc.args[0]}") from exc
+        return cls(
+            state_db_path=os.environ.get("STATE_DB_PATH", "/data/state.db").strip() or "/data/state.db",
+            web_host=os.environ.get("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            web_port=_int("WEB_PORT", "8080", minimum=1, maximum=65535),
+            web_password=os.environ.get("WEB_PASSWORD", ""),
+            web_cookie_secure=_bool("WEB_COOKIE_SECURE", False),
+            lp_binary=os.environ.get("LP_BINARY", "lp").strip() or "lp",
+            lpstat_binary=_lpstat_binary(),
+        )
+
+    @property
+    def data_dir(self) -> str:
+        """The directory next to the database - for files the UI hands out."""
+        return os.path.dirname(os.path.abspath(self.state_db_path))
+MAIL2NAS_EOF
+
+# --- mail2nas/options.py ---
+cat > mail2nas/options.py <<'MAIL2NAS_EOF'
+"""The general settings, stored in the database and edited in the web UI.
+
+Everything that used to be a line in the `.env` - folders, limits, the
+quarantine list, printing defaults - is an `Options` value now. It is read as
+one immutable snapshot, so a worker thread never sees half of a change, and
+it is swapped as a whole when the settings page is saved. No restart needed:
+the archiver asks for the current snapshot on every message.
+
+Stored as individual keys in the `settings` table rather than as a blob, so
+a value added in a later version simply falls back to its default on an
+older database instead of making the whole thing unreadable.
+"""
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, replace
+
+from .config import DEFAULT_BLOCKED_EXTENSIONS, DEFAULT_PRINTABLE_EXTENSIONS, parse_extension_list
+from .filenames import safe_relative_parts
+
+logger = logging.getLogger(__name__)
+
+SETTING_OPTIONS_SEEDED = "options_seeded"
+
+FILENAME_PREFIXES = {
+    "date_sender": "Datum und Absender",
+    "date": "nur Datum",
+    "sender": "nur Absender",
+    "none": "kein Praefix",
+}
+
+# (minimum, maximum) for every whole-number setting. Deliberately generous -
+# they exist to stop typos ("0", "30000000"), not to second-guess anyone.
+LIMITS = {
+    "poll_interval": (10, 86_400),
+    "max_attachment_size_mb": (1, 2_048),
+    "max_message_size_mb": (1, 4_096),
+    "max_attachments_per_message": (1, 1_000),
+    "pickup_min_age": (0, 86_400),
+    "print_timeout": (5, 3_600),
+}
+
+# Keys under which each value is stored. Two predate this module and keep
+# their names, so an installation that already edited them keeps its values.
+_KEYS = {
+    "blocked_extensions": "blocked_extensions",
+    "pickup_min_age": "pickup_min_age_seconds",
+}
+
+
+class OptionsError(ValueError):
+    """A setting the user tried to save is not usable."""
+
+
+@dataclass(frozen=True)
+class Options:
+    """One consistent view of every general setting."""
+
+    fallback_folder: str = "unsorted"
+    quarantine_folder: str = "quarantaene"
+    match_body: bool = False
+    filename_prefix: str = "date_sender"
+    poll_interval: int = 300
+    max_attachment_size_mb: int = 25
+    max_message_size_mb: int = 50
+    max_attachments_per_message: int = 20
+    blocked_extensions: frozenset[str] = field(
+        default_factory=lambda: parse_extension_list(DEFAULT_BLOCKED_EXTENSIONS)
+    )
+    pickup_min_age: int = 20
+    printing_enabled: bool = True
+    print_timeout: int = 120
+    printable_extensions: frozenset[str] = field(
+        default_factory=lambda: parse_extension_list(DEFAULT_PRINTABLE_EXTENSIONS)
+    )
+    dry_run: bool = False
+
+
+def _key(name: str) -> str:
+    return _KEYS.get(name, f"opt.{name}")
+
+
+def _encode(value) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, frozenset):
+        return ",".join(sorted(value))
+    return str(value)
+
+
+def _decode(name: str, raw: str, default):
+    if isinstance(default, bool):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(default, frozenset):
+        return parse_extension_list(raw)
+    if isinstance(default, int):
+        value = int(raw.strip())
+        low, high = LIMITS.get(name, (None, None))
+        if (low is not None and value < low) or (high is not None and value > high):
+            raise ValueError(f"{value} outside {low}..{high}")
+        return value
+    return raw
+
+
+class OptionsStore:
+    """Reads and writes `Options` in the key/value settings table."""
+
+    def __init__(self, settings):
+        self._settings = settings
+
+    def load(self) -> Options:
+        defaults = Options()
+        values = {}
+        for spec in fields(Options):
+            raw = self._settings.get(_key(spec.name))
+            if raw is None:
+                continue
+            try:
+                values[spec.name] = _decode(spec.name, raw, getattr(defaults, spec.name))
+            except (TypeError, ValueError) as exc:
+                # Only possible after hand-editing the database. The default
+                # is the safer reading than refusing to start.
+                logger.warning("Stored setting %s=%r is unusable (%s) - using the default",
+                               spec.name, raw, exc)
+        return replace(defaults, **values)
+
+    def save(self, options: Options) -> None:
+        for spec in fields(Options):
+            self._settings.set(_key(spec.name), _encode(getattr(options, spec.name)))
+
+    def seeded(self) -> bool:
+        return bool(self._settings.get(SETTING_OPTIONS_SEEDED))
+
+    def seed(self, legacy) -> bool:
+        """Carry the general settings of an older `.env` over, once.
+
+        Returns True if anything was taken over. Values already stored (the
+        quarantine list and pickup delay were editable before) win over the
+        `.env`: they are the newer statement.
+        """
+        if self.seeded():
+            return False
+        taken = False
+        if legacy is not None and legacy.has_options:
+            current = self.load()
+            stored = {
+                spec.name for spec in fields(Options)
+                if self._settings.get(_key(spec.name)) is not None
+            }
+            carried = {
+                name: getattr(legacy, name)
+                for name in (
+                    "fallback_folder", "quarantine_folder", "match_body", "filename_prefix",
+                    "poll_interval", "max_attachment_size_mb", "max_message_size_mb",
+                    "max_attachments_per_message", "blocked_extensions", "dry_run",
+                    "printing_enabled", "print_timeout", "printable_extensions",
+                )
+                if name not in stored
+            }
+            try:
+                self.save(validate(_as_form(replace(current, **carried)), current))
+                taken = True
+            except OptionsError as exc:
+                logger.error("Settings from the .env are not usable (%s) - keeping defaults", exc)
+        self._settings.set(SETTING_OPTIONS_SEEDED, "1")
+        return taken
+
+
+def _as_form(options: Options) -> dict[str, str]:
+    """An Options value as the settings form would submit it."""
+    form = {}
+    for spec in fields(Options):
+        value = getattr(options, spec.name)
+        if isinstance(value, bool):
+            if value:
+                form[spec.name] = "1"
+        elif isinstance(value, frozenset):
+            form[spec.name] = ", ".join(sorted(value))
+        else:
+            form[spec.name] = str(value)
+    return form
+
+
+def as_form(options: Options) -> dict[str, str]:
+    return _as_form(options)
+
+
+def _folder(form: Mapping[str, str], name: str, label: str) -> str:
+    value = (form.get(name) or "").strip().replace("\\", "/")
+    if not value:
+        raise OptionsError(f"Bitte einen {label} angeben.")
+    try:
+        return "/".join(safe_relative_parts(value))
+    except ValueError as exc:
+        raise OptionsError(f"{label}: {exc}") from None
+
+
+def _whole(form: Mapping[str, str], name: str, label: str) -> int:
+    raw = (form.get(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise OptionsError(f"{label} muss eine ganze Zahl sein.") from None
+    low, high = LIMITS[name]
+    if not low <= value <= high:
+        raise OptionsError(f"{label} muss zwischen {low} und {high} liegen.")
+    return value
+
+
+def validate(form: Mapping[str, str], current: Options | None = None) -> Options:
+    """Turn the submitted settings form into Options, or explain what is wrong.
+
+    Checkboxes are absent when unticked, so a missing flag means False. The
+    extension lists may be empty on purpose - the UI says what that means.
+    """
+    current = current or Options()
+    prefix = (form.get("filename_prefix") or current.filename_prefix).strip()
+    if prefix not in FILENAME_PREFIXES:
+        raise OptionsError("Unbekanntes Dateinamen-Praefix.")
+
+    fallback = _folder(form, "fallback_folder", "Ordner fuer Anhaenge ohne Treffer")
+    quarantine = _folder(form, "quarantine_folder", "Quarantaene-Ordner")
+    if fallback == quarantine:
+        raise OptionsError(
+            "Fallback- und Quarantaene-Ordner muessen verschieden sein - sonst liegen "
+            "gesperrte Dateien zwischen den normalen."
+        )
+
+    return Options(
+        fallback_folder=fallback,
+        quarantine_folder=quarantine,
+        match_body=bool(form.get("match_body")),
+        filename_prefix=prefix,
+        poll_interval=_whole(form, "poll_interval", "Das Abrufintervall"),
+        max_attachment_size_mb=_whole(form, "max_attachment_size_mb", "Die Groesse je Anhang"),
+        max_message_size_mb=_whole(form, "max_message_size_mb", "Die Groesse je Mail"),
+        max_attachments_per_message=_whole(
+            form, "max_attachments_per_message", "Die Zahl der Anhaenge je Mail"
+        ),
+        blocked_extensions=parse_extension_list(form.get("blocked_extensions", "")),
+        pickup_min_age=_whole(form, "pickup_min_age", "Die Wartezeit fuer Abholordner"),
+        printing_enabled=bool(form.get("printing_enabled")),
+        print_timeout=_whole(form, "print_timeout", "Die Zeitgrenze fuer Druckauftraege"),
+        printable_extensions=parse_extension_list(form.get("printable_extensions", "")),
+        dry_run=bool(form.get("dry_run")),
+    )
+MAIL2NAS_EOF
+
+# --- mail2nas/legacy.py ---
+cat > mail2nas/legacy.py <<'MAIL2NAS_EOF'
+"""Reading the configuration of an older installation, once.
+
+Up to this version mail2nas was configured through the `.env`: mailbox, NAS
+credentials, folders, limits, even the first printer. All of that now lives in
+the local database and is edited in the web UI - but an installation that is
+updated must come up exactly as it was, without anyone re-typing a password.
+
+So on the first start of this version the old variables are read one last
+time, here, and written into the database (see `migrate.py`). After that they
+are ignored, and the update script removes them from the `.env`.
+
+Three generations of `.env` exist in the wild, and they differ in the one
+thing that matters most - where attachments go:
+
+1. **Docker cifs volume** (the very first versions): `SMB_HOST`, `SMB_SHARE`,
+   `SMB_USER`, `SMB_PASSWORD` in the `.env`, no `STORAGE_BACKEND`. Docker
+   mounted the share itself. Current compose files no longer do that, so the
+   only way to keep filing onto that share is to talk SMB directly.
+2. **Mount on the Proxmox host**: no SMB credentials in the `.env` (they were
+   in a file on the host), `NAS_PATH`, no `STORAGE_BACKEND`. The share is a
+   bind mount at `/mnt/nas` inside the container.
+3. **Direct SMB**: `STORAGE_BACKEND=smb` or `local`, stated explicitly.
+
+Unlike the old parser this one never refuses to start: a value that does not
+parse falls back to its default and is logged. A typo in a variable that is
+about to be retired must not keep the service from coming up.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from .config import DEFAULT_BLOCKED_EXTENSIONS, DEFAULT_PRINTABLE_EXTENSIONS, parse_extension_list
+
+logger = logging.getLogger(__name__)
+
+# Every variable an older version read. `update.sh` keeps only what is not in
+# this list (plus NAS_PATH where a mount is still in use) when it tidies up.
+LEGACY_VARIABLES = (
+    "IMAP_HOST", "IMAP_PORT", "IMAP_SSL", "IMAP_USER", "IMAP_PASSWORD", "IMAP_FOLDER",
+    "IMAP_PROCESSED_FOLDER", "IMAP_OVERSIZED_FOLDER", "IMAP_MODE", "POLL_INTERVAL_SECONDS",
+    "STORAGE_BACKEND", "STORAGE_ROOT", "SMB_HOST", "SMB_SHARE", "SMB_USER", "SMB_PASSWORD",
+    "SMB_DOMAIN", "SMB_PORT", "SMB_ROOT", "SMB_ENCRYPT", "MAPPING_PATH", "FALLBACK_FOLDER",
+    "MATCH_BODY", "FILENAME_PREFIX", "MAX_ATTACHMENT_SIZE_MB", "MAX_MESSAGE_SIZE_MB",
+    "MAX_ATTACHMENTS_PER_MESSAGE", "BLOCKED_EXTENSIONS", "QUARANTINE_FOLDER", "DRY_RUN",
+    "PRINTING_ENABLED", "PRINT_TIMEOUT_SECONDS", "PRINTABLE_EXTENSIONS", "PRINTER_NAME",
+    "PRINTER_DESTINATION", "PRINTER_SERVER", "PRINTER_OPTIONS", "PRINTER_COPIES",
+    "WEB_ENABLED", "WEB_PASSWORD",
+)
+
+
+def _text(env: Mapping[str, str], name: str, default: str = "") -> str:
+    value = env.get(name)
+    return default if value is None else value.strip()
+
+
+def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
+    value = env.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on", "ja")
+
+
+def _number(env: Mapping[str, str], name: str, default: int, minimum: int = 1,
+            maximum: int | None = None) -> int:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("%s=%r is not a number - using %d", name, raw, default)
+        return default
+    if value < minimum or (maximum is not None and value > maximum):
+        logger.warning("%s=%d is out of range - using %d", name, value, default)
+        return default
+    return value
+
+
+def _choice(env: Mapping[str, str], name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = _text(env, name, default).lower() or default
+    if value not in allowed:
+        logger.warning("%s=%r is not one of %s - using %r", name, value, allowed, default)
+        return default
+    return value
+
+
+@dataclass(frozen=True)
+class LegacyEnv:
+    """The variables of an older `.env`, parsed leniently.
+
+    The attribute names are those of the old `Config`, so the seeding code
+    reads the same as it did when it was fed from there.
+    """
+
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_user: str = ""
+    imap_password: str = ""
+    imap_ssl: bool = True
+    imap_folder: str = "INBOX"
+    imap_processed_folder: str = ""
+    imap_oversized_folder: str = ""
+    imap_mode: str = "poll"
+    poll_interval: int = 300
+
+    # "smb", "local" or "" (= no archive described at all).
+    storage_backend: str = ""
+    storage_root: str = "/mnt/nas"
+    smb_host: str = ""
+    smb_share: str = ""
+    smb_user: str = ""
+    smb_password: str = ""
+    smb_domain: str = ""
+    smb_port: int = 445
+    smb_root: str = ""
+    smb_encrypt: bool = True
+
+    mapping_path: str = "mapping.yaml"
+    fallback_folder: str = "unsorted"
+    quarantine_folder: str = "quarantaene"
+    match_body: bool = False
+    filename_prefix: str = "date_sender"
+    max_attachment_size_mb: int = 25
+    max_message_size_mb: int = 50
+    max_attachments_per_message: int = 20
+    blocked_extensions: frozenset[str] = field(
+        default_factory=lambda: parse_extension_list(DEFAULT_BLOCKED_EXTENSIONS)
+    )
+    dry_run: bool = False
+
+    printing_enabled: bool = True
+    print_timeout: int = 120
+    printable_extensions: frozenset[str] = field(
+        default_factory=lambda: parse_extension_list(DEFAULT_PRINTABLE_EXTENSIONS)
+    )
+    printer_name: str = ""
+    printer_destination: str = ""
+    printer_server: str = ""
+    printer_options: str = ""
+    printer_copies: int = 1
+
+    # Which of the old variables were set at all - "the .env says nothing
+    # about it" and "the .env says the default" are different things when
+    # deciding whether there is anything to carry over.
+    present: frozenset[str] = frozenset()
+
+    @property
+    def has_mailbox(self) -> bool:
+        return bool(self.imap_host and self.imap_user)
+
+    @property
+    def has_archive(self) -> bool:
+        return self.storage_backend in ("smb", "local")
+
+    @property
+    def has_options(self) -> bool:
+        """True if any general setting was set in the `.env`."""
+        return bool(self.present - {"WEB_ENABLED", "WEB_PASSWORD"})
+
+    @classmethod
+    def from_environ(cls, env: Mapping[str, str] | None = None) -> "LegacyEnv":
+        env = os.environ if env is None else env
+        present = frozenset(
+            name for name in LEGACY_VARIABLES if (env.get(name) or "").strip()
+        )
+
+        smb = {
+            "smb_host": _text(env, "SMB_HOST"),
+            "smb_share": _text(env, "SMB_SHARE").strip("/\\"),
+            "smb_user": _text(env, "SMB_USER"),
+            "smb_password": env.get("SMB_PASSWORD") or "",
+        }
+        return cls(
+            imap_host=_text(env, "IMAP_HOST"),
+            imap_port=_number(env, "IMAP_PORT", 993, 1, 65535),
+            imap_user=_text(env, "IMAP_USER"),
+            imap_password=env.get("IMAP_PASSWORD") or "",
+            imap_ssl=_flag(env, "IMAP_SSL", True),
+            imap_folder=_text(env, "IMAP_FOLDER", "INBOX") or "INBOX",
+            imap_processed_folder=_text(env, "IMAP_PROCESSED_FOLDER"),
+            imap_oversized_folder=_text(env, "IMAP_OVERSIZED_FOLDER"),
+            imap_mode=_choice(env, "IMAP_MODE", "poll", ("idle", "poll")),
+            poll_interval=_number(env, "POLL_INTERVAL_SECONDS", 300, 1),
+            storage_backend=_storage_backend(env, smb),
+            storage_root=_text(env, "STORAGE_ROOT", "/mnt/nas") or "/mnt/nas",
+            smb_domain=_text(env, "SMB_DOMAIN"),
+            smb_port=_number(env, "SMB_PORT", 445, 1, 65535),
+            smb_root=_text(env, "SMB_ROOT").strip("/"),
+            smb_encrypt=_flag(env, "SMB_ENCRYPT", True),
+            mapping_path=_text(env, "MAPPING_PATH", "mapping.yaml") or "mapping.yaml",
+            fallback_folder=_text(env, "FALLBACK_FOLDER", "unsorted") or "unsorted",
+            quarantine_folder=_text(env, "QUARANTINE_FOLDER", "quarantaene") or "quarantaene",
+            match_body=_flag(env, "MATCH_BODY", False),
+            filename_prefix=_choice(
+                env, "FILENAME_PREFIX", "date_sender", ("none", "date", "sender", "date_sender")
+            ),
+            max_attachment_size_mb=_number(env, "MAX_ATTACHMENT_SIZE_MB", 25),
+            max_message_size_mb=_number(env, "MAX_MESSAGE_SIZE_MB", 50),
+            max_attachments_per_message=_number(env, "MAX_ATTACHMENTS_PER_MESSAGE", 20),
+            blocked_extensions=parse_extension_list(
+                env.get("BLOCKED_EXTENSIONS", DEFAULT_BLOCKED_EXTENSIONS)
+            ),
+            dry_run=_flag(env, "DRY_RUN", False),
+            printing_enabled=_flag(env, "PRINTING_ENABLED", True),
+            print_timeout=_number(env, "PRINT_TIMEOUT_SECONDS", 120),
+            printable_extensions=parse_extension_list(
+                env.get("PRINTABLE_EXTENSIONS") or DEFAULT_PRINTABLE_EXTENSIONS
+            ),
+            printer_name=_text(env, "PRINTER_NAME"),
+            printer_destination=_text(env, "PRINTER_DESTINATION"),
+            printer_server=_text(env, "PRINTER_SERVER"),
+            printer_options=_text(env, "PRINTER_OPTIONS"),
+            printer_copies=_number(env, "PRINTER_COPIES", 1, 1, 20),
+            present=present,
+            **smb,
+        )
+
+
+def _storage_backend(env: Mapping[str, str], smb: dict) -> str:
+    """Where the old installation filed to - see the module docstring.
+
+    Getting this wrong is the one mistake an update must not make: a
+    generation-1 install treated as "mounted at /mnt/nas" would write every
+    attachment into an empty directory inside the container, and lose it with
+    the next rebuild.
+    """
+    explicit = _text(env, "STORAGE_BACKEND").lower()
+    if explicit in ("smb", "local"):
+        if explicit == "smb" and not (smb["smb_host"] and smb["smb_share"]):
+            logger.warning("STORAGE_BACKEND=smb without SMB_HOST/SMB_SHARE - no archive taken over")
+            return ""
+        return explicit
+    if explicit:
+        logger.warning("STORAGE_BACKEND=%r is unknown - guessing from the other variables", explicit)
+
+    if all(smb.values()):
+        # Generation 1: Docker mounted //SMB_HOST/SMB_SHARE itself.
+        return "smb"
+    if _text(env, "NAS_PATH") or _text(env, "IMAP_HOST"):
+        # Generation 2: the share is bind-mounted into the container.
+        return "local"
+    # A fresh installation: nothing to take over, the UI sets it up.
+    return ""
+MAIL2NAS_EOF
+
+# --- mail2nas/migrate.py ---
+cat > mail2nas/migrate.py <<'MAIL2NAS_EOF'
+"""Bringing an installation of any older version up to this one.
+
+Two steps, both idempotent and both guarded by a flag in the database, so
+they run exactly once no matter how often the container restarts:
+
+1. **The `.env`** (`seed_from_legacy`): mailbox, archive, first printer and
+   the general settings are written into the database. Runs at startup,
+   before anything else; it needs nothing but the environment.
+
+2. **The rule file on the share** (`migrate_rule_file`): an older version kept
+   the keyword rules as `mapping.yaml` on the NAS. It is read once, stored in
+   the database and renamed on the share to `<name>.migriert`, so nobody keeps
+   editing a file that no longer does anything. This needs the archive to be
+   reachable, so it is retried until it has happened - and the archiver waits
+   for it: filing mail with an empty rule list would put every attachment of
+   the first minutes into the fallback folder.
+"""
+from __future__ import annotations
+
+import logging
+
+from . import accounts as accounts_module
+from . import archives as archives_module
+from . import printers as printers_module
+from .filenames import safe_relative_parts
+from .legacy import LegacyEnv
+from .mapping import MappingError, RuleStore, rules_from_yaml
+
+logger = logging.getLogger(__name__)
+
+SETTING_MAPPING_PATH = "mapping_path"
+SETTING_RULES_MIGRATED = "rules_migrated"
+SETTING_RULES_NOTE = "rules_migration_note"
+MIGRATED_SUFFIX = ".migriert"
+
+
+def seed_from_legacy(runtime, legacy: LegacyEnv) -> None:
+    """Step 1: carry every value of an older `.env` into the database."""
+    settings = runtime.settings
+    runtime.options_store.seed(legacy)
+    accounts_module.seed_from_config(runtime.accounts, settings, legacy)
+    if runtime.printers is not None:
+        printers_module.seed_from_config(runtime.printers, settings, legacy)
+    if runtime.archives is not None:
+        archives_module.seed_from_config(runtime.archives, settings, legacy)
+    # Where the old rule file was, for step 2. A path already stored (the old
+    # UI could move the file) is the newer statement and wins.
+    if not settings.get(SETTING_MAPPING_PATH):
+        settings.set(SETTING_MAPPING_PATH, legacy.mapping_path or "mapping.yaml")
+    runtime.invalidate_options()
+
+
+def rules_settled(settings) -> bool:
+    """True once there is nothing (left) to take over from the share."""
+    return bool(settings.get(SETTING_RULES_MIGRATED))
+
+
+def migrate_rule_file(settings, store: RuleStore, storage) -> bool:
+    """Step 2: take the rule file over from the share. True when settled.
+
+    `storage` is the default archive, or None while there is none. Returns
+    False if it should be tried again later (share unreachable), True once
+    it has happened or there turned out to be nothing to do.
+    """
+    if rules_settled(settings):
+        return True
+
+    if store.count():
+        # Rules already exist in the database (e.g. imported by hand before
+        # the share came back). They are the newer statement.
+        _settle(settings, "")
+        return True
+
+    if storage is None:
+        # No archive configured: then there is no share an old file could be
+        # on either - this is a fresh installation.
+        _settle(settings, "")
+        return True
+
+    relative = settings.get(SETTING_MAPPING_PATH) or "mapping.yaml"
+    try:
+        relative = "/".join(safe_relative_parts(relative))
+    except ValueError:
+        _settle(settings, f"Der gespeicherte Pfad {relative!r} der alten Mapping-Datei ist ungueltig.")
+        return True
+
+    try:
+        text = storage.read_text(relative)
+    except FileNotFoundError:
+        logger.info("No rule file %s on the archive - nothing to take over", relative)
+        _settle(settings, "")
+        return True
+    except Exception as exc:  # noqa: BLE001 - the share may simply be down right now
+        logger.warning("Rule file %s not readable yet (%s) - retrying", relative, exc)
+        return False
+
+    try:
+        rules = rules_from_yaml(text)
+    except MappingError as exc:
+        # Nothing is lost: the file stays where it is, and the UI says why it
+        # was not taken over and offers the import form.
+        logger.error("Rule file %s could not be taken over: %s", relative, exc)
+        _settle(
+            settings,
+            f"Die alte Mapping-Datei {relative} konnte nicht uebernommen werden ({exc}). "
+            "Sie liegt unveraendert auf der Freigabe - korrigieren und unter "
+            "Zuordnungen importieren.",
+        )
+        return True
+
+    store.save(rules)
+    target = relative + MIGRATED_SUFFIX
+    try:
+        storage.write_text(target, text)
+        storage.remove_file(relative)
+        where = f"umbenannt in {target}"
+    except Exception as exc:  # noqa: BLE001 - the rules are safe, the rename is cosmetics
+        logger.warning("Could not rename %s after taking it over (%s)", relative, exc)
+        where = "auf der Freigabe liegen geblieben (wird nicht mehr gelesen)"
+    logger.info("Took over %d rule(s) from %s", len(rules), relative)
+    _settle(
+        settings,
+        f"{len(rules)} Zuordnung(en) aus {relative} uebernommen. Die Datei wurde {where}; "
+        "Zuordnungen werden ab jetzt nur noch hier gepflegt.",
+    )
+    return True
+
+
+def _settle(settings, note: str) -> None:
+    settings.set(SETTING_RULES_MIGRATED, "1")
+    if note:
+        settings.set(SETTING_RULES_NOTE, note)
+
+
+def migration_status(runtime) -> dict:
+    """What the update script and the CLI want to know."""
+    settings = runtime.settings
+    return {
+        "options_seeded": runtime.options_store.seeded(),
+        "accounts_seeded": bool(settings.get(accounts_module.SETTING_ACCOUNTS_SEEDED)),
+        "archives_seeded": bool(settings.get(archives_module.SETTING_ARCHIVES_SEEDED)),
+        "printers_seeded": bool(settings.get(printers_module.SETTING_PRINTERS_SEEDED)),
+        "rules_migrated": rules_settled(settings),
+    }
+MAIL2NAS_EOF
+
+# --- mail2nas/cli.py ---
+cat > mail2nas/cli.py <<'MAIL2NAS_EOF'
+"""A few maintenance commands, for the install and update scripts.
+
+Run inside the container:
+
+    docker compose exec mail2nas python -m mail2nas.cli status
+    docker compose exec mail2nas python -m mail2nas.cli password
+    docker compose exec mail2nas python -m mail2nas.cli reset-password
+    echo '{"host": ...}' | docker compose exec -T mail2nas python -m mail2nas.cli archive-to-smb
+
+Everything else is configured in the web UI; these exist for the handful of
+things a script has to do without a browser: find out whether an update has
+taken the old configuration over, show the generated first password, get
+back in after a forgotten one, and move an installation off a host mount.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+
+from .archives import ArchiveError
+from .config import Config
+from .main import build_runtime
+from .migrate import migration_status
+
+
+def _status(runtime, config) -> int:
+    from .web import SETTING_PASSWORD_HASH, read_initial_password
+
+    status = migration_status(runtime)
+    default = runtime.default_archive()
+    status.update(
+        {
+            "password_set": bool(runtime.settings.get(SETTING_PASSWORD_HASH)),
+            "initial_password_pending": read_initial_password(config.data_dir) is not None,
+            "mailboxes": len(runtime.accounts.all()),
+            "archives": len(runtime.archives.all()),
+            "default_archive": default.location() if default else None,
+            "default_archive_backend": default.backend if default else None,
+            "rules": runtime.rule_store.count(),
+            "printers": len(runtime.printers.all()),
+        }
+    )
+    print(json.dumps(status, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _password(config) -> int:
+    from .web import read_initial_password
+
+    password = read_initial_password(config.data_dir)
+    if password is None:
+        print("Kein Startpasswort mehr hinterlegt - es wurde bereits geaendert.", file=sys.stderr)
+        print("Vergessen? python -m mail2nas.cli reset-password", file=sys.stderr)
+        return 1
+    print(password)
+    return 0
+
+
+def _reset_password(runtime, config) -> int:
+    from .web import _write_initial_password, generate_password, set_password
+
+    password = generate_password()
+    set_password(runtime.settings, password, config.data_dir)
+    _write_initial_password(config.data_dir, password)
+    print(password)
+    return 0
+
+
+def _archive_to_smb(runtime) -> int:
+    """Switch the mounted-directory archive over to direct SMB.
+
+    For installations from the time the share was mounted on the Proxmox
+    host: the host script knows the credentials (they are in a file there)
+    and pipes them in as JSON. Nothing changes unless a write test with the
+    new settings succeeds - a typo must not cut the archive off.
+    """
+    try:
+        data = json.load(sys.stdin)
+    except ValueError as exc:
+        print(f"Ungueltige Eingabe: {exc}", file=sys.stderr)
+        return 1
+
+    path = data.pop("mount_path", "/mnt/nas")
+    candidates = [a for a in runtime.archives.all() if a.backend == "local" and a.path == path]
+    if not candidates:
+        print(f"Kein Archiv mit gemountetem Verzeichnis {path} - nichts umzustellen.")
+        return 2
+    archive = candidates[0]
+
+    from .archives import validate
+
+    fields = {
+        "name": archive.name if archive.name != "Archiv" else (data.get("share") or archive.name),
+        "backend": "smb",
+        "host": data.get("host", ""),
+        "share": data.get("share", ""),
+        "user": data.get("user", ""),
+        "password": data.get("password", ""),
+        "domain": data.get("domain", ""),
+        "port": data.get("port", 445),
+        "root": data.get("root", ""),
+        "encrypt": data.get("encrypt", True),
+        "path": "",
+        "enabled": archive.enabled,
+    }
+    try:
+        values = validate(fields)
+    except ArchiveError as exc:
+        print(f"Zugangsdaten unvollstaendig: {exc}", file=sys.stderr)
+        return 1
+
+    from .storage import SmbStorage
+
+    probe = SmbStorage(
+        host=values["host"], share=values["share"], user=values["user"],
+        password=values["password"], domain=values["domain"] or None, port=values["port"],
+        root=values["root"], encrypt=bool(values["encrypt"]),
+    )
+    try:
+        probe.check_writable()
+    except BaseException as exc:  # noqa: BLE001 - check_writable reports via SystemExit
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        print(f"SMB-Test fehlgeschlagen, Archiv bleibt unveraendert: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        probe.close()
+
+    runtime.archives.update(archive.id, **fields)
+    print(f"Archiv {archive.name!r} schreibt jetzt direkt auf //{values['host']}/{values['share']}.")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m mail2nas.cli", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "command", choices=("status", "password", "reset-password", "archive-to-smb")
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+
+    config = Config.from_env()
+    if args.command == "password":
+        return _password(config)
+    runtime = build_runtime(config)
+    if args.command == "status":
+        return _status(runtime, config)
+    if args.command == "reset-password":
+        return _reset_password(runtime, config)
+    return _archive_to_smb(runtime)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 MAIL2NAS_EOF
 
 # --- mail2nas/accounts.py ---
@@ -584,13 +1508,12 @@ Editing it in the UI - and having more than one - means the configuration has
 to live somewhere writable, so it goes into the same SQLite file as the rest
 of the local state.
 
-The environment still seeds the first account on a fresh install, so an
-existing `.env` keeps working and nothing has to be re-entered. After that the
-database wins: changes made in the UI survive restarts and updates, and the
-IMAP_* variables are ignored.
+Mailboxes are created in the web UI. An installation updated from a version
+that configured its mailbox in the `.env` gets that one carried over once (see
+`migrate.py`); after that the `.env` is not read for it any more.
 
 Note this means the state database now holds IMAP passwords in clear text.
-It needs the same protection as the `.env` file - see the README.
+It is kept at mode 0600 in a Docker volume, never on the share - see the README.
 """
 from __future__ import annotations
 
@@ -819,7 +1742,10 @@ def _defaults(fields: dict) -> dict:
 
 
 def seed_from_config(store: AccountStore, settings, config) -> None:
-    """Create the first account from the environment, once.
+    """Carry the mailbox of an older `.env` over, once.
+
+    `config` is a `LegacyEnv`. A fresh installation has no mailbox in its
+    `.env` - it is set up in the web UI - so nothing is created then.
 
     Guarded by a flag rather than by "is the table empty", so deleting the
     last account in the UI does not resurrect it from the .env on the next
@@ -827,7 +1753,7 @@ def seed_from_config(store: AccountStore, settings, config) -> None:
     """
     if settings.get(SETTING_ACCOUNTS_SEEDED):
         return
-    if store.all():
+    if store.all() or not (config.imap_host and config.imap_user):
         settings.set(SETTING_ACCOUNTS_SEEDED, "1")
         return
 
@@ -1210,6 +2136,10 @@ class ArchiveError(ValueError):
     """An archive the user tried to save is not usable."""
 
 
+class NoArchiveError(RuntimeError):
+    """Nothing to file into yet - no archive is configured (or all are paused)."""
+
+
 @dataclass(frozen=True)
 class Archive:
     """One place to file into: an SMB share, or a directory on this machine."""
@@ -1463,7 +2393,11 @@ def validate(fields: dict) -> dict:
 
 
 def seed_from_config(store: ArchiveStore, settings, config) -> None:
-    """Create the first archive from the environment, once.
+    """Carry the archive of an older `.env` over, once.
+
+    `config` is a `LegacyEnv`, which has already worked out which generation
+    of installation this is (see `legacy.py`). A fresh installation describes
+    no archive at all - it is set up in the web UI - so nothing is created.
 
     Guarded by a flag rather than by "is the table empty", so deleting the
     last archive in the UI does not resurrect it from the .env on the next
@@ -1471,27 +2405,32 @@ def seed_from_config(store: ArchiveStore, settings, config) -> None:
     """
     if settings.get(SETTING_ARCHIVES_SEEDED):
         return
-    if store.all():
+    if store.all() or config.storage_backend not in BACKENDS:
         settings.set(SETTING_ARCHIVES_SEEDED, "1")
         return
 
-    if config.storage_backend == "smb":
-        store.add(
-            name=config.smb_share or config.smb_host,
-            backend="smb",
-            host=config.smb_host,
-            share=config.smb_share,
-            user=config.smb_user,
-            password=config.smb_password,
-            domain=config.smb_domain,
-            port=config.smb_port,
-            root=config.smb_root,
-            encrypt=config.smb_encrypt,
-        )
-    else:
-        store.add(name="Archiv", backend="local", path=config.storage_root)
+    try:
+        if config.storage_backend == "smb":
+            store.add(
+                name=config.smb_share or config.smb_host,
+                backend="smb",
+                host=config.smb_host,
+                share=config.smb_share,
+                user=config.smb_user,
+                password=config.smb_password,
+                domain=config.smb_domain,
+                port=config.smb_port,
+                root=config.smb_root,
+                encrypt=config.smb_encrypt,
+            )
+        else:
+            store.add(name="Archiv", backend="local", path=config.storage_root)
+    except ArchiveError as exc:
+        # E.g. an SMB password that was never filled in. The UI shows that no
+        # archive exists; better than a half-configured one.
+        logger.error("The archive from the .env is not usable (%s) - set it up in the web UI", exc)
     settings.set(SETTING_ARCHIVES_SEEDED, "1")
-    logger.info("Created the first archive from the configuration")
+    logger.info("Took the archive over from the .env")
 
 
 class StorageSet:
@@ -1503,15 +2442,15 @@ class StorageSet:
     restart.
     """
 
-    def __init__(self, archives: ArchiveStore | None, fallback: Storage):
+    def __init__(self, archives: ArchiveStore | None, fallback: Storage | None = None):
         self._archives = archives
         self._fallback = fallback
         self._cache: dict[str, tuple[tuple, Storage]] = {}
         self._lock = threading.Lock()
 
     @property
-    def fallback(self) -> Storage:
-        """The archive from the .env - used when nothing is configured yet."""
+    def fallback(self) -> Storage | None:
+        """A fixed storage used when no archive store is attached (tests)."""
         return self._fallback
 
     def archive_for(self, key: str) -> Archive | None:
@@ -1532,6 +2471,8 @@ class StorageSet:
         """The storage behind `key`, falling back to the default archive."""
         archive = self.archive_for(key)
         if archive is None:
+            if self._fallback is None:
+                raise NoArchiveError("Es ist noch kein (aktives) Archiv eingerichtet.")
             return self._fallback
         with self._lock:
             cached = self._cache.get(archive.key)
@@ -1549,7 +2490,9 @@ class StorageSet:
 
     def label_for(self, key: str) -> str:
         archive = self.archive_for(key)
-        return archive.name if archive is not None else self._fallback.description
+        if archive is not None:
+            return archive.name
+        return self._fallback.description if self._fallback is not None else "-"
 
     def close(self) -> None:
         with self._lock:
@@ -2150,18 +3093,35 @@ class Spooler:
         timeout: int = 120,
         printable_extensions: frozenset[str] = frozenset(),
         dry_run: bool = False,
+        options=None,
     ):
         self._lp_binary = lp_binary
-        self._timeout = timeout
-        self._printable = printable_extensions or parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS)
-        self._dry_run = dry_run
+        self._timeout_value = timeout
+        self._printable_value = printable_extensions
+        self._dry_run_value = dry_run
+        # A callable returning the current Options. When given, timeout,
+        # printable formats and the test mode follow the settings page live
+        # instead of what was passed in here.
+        self._options = options
+
+    @property
+    def _timeout(self) -> int:
+        return self._options().print_timeout if self._options else self._timeout_value
+
+    @property
+    def _dry_run(self) -> bool:
+        return self._options().dry_run if self._options else self._dry_run_value
 
     @property
     def printable_extensions(self) -> frozenset[str]:
-        return self._printable
+        chosen = self._options().printable_extensions if self._options else self._printable_value
+        # Empty means "the standard list", not "nothing": a printer that
+        # silently never prints anything is not what anyone clearing the
+        # field meant.
+        return chosen or parse_extensions(DEFAULT_PRINTABLE_EXTENSIONS)
 
     def can_print(self, filename: str) -> bool:
-        return extension_of(sanitize_filename(filename)) in self._printable
+        return extension_of(sanitize_filename(filename)) in self.printable_extensions
 
     def print_bytes(self, printer: Printer, data: bytes, filename: str, title: str = "") -> str:
         """Spool `data` to `printer`. Returns what `lp` reported, for the log.
@@ -2290,17 +3250,9 @@ class PrintService:
         return True
 
 
-def from_config(config, printers: PrinterStore) -> PrintService:
-    """Build the print service described by the configuration."""
-    return PrintService(
-        printers,
-        Spooler(
-            lp_binary=config.lp_binary,
-            timeout=config.print_timeout,
-            printable_extensions=config.printable_extensions,
-            dry_run=config.dry_run,
-        ),
-    )
+def from_config(config, printers: PrinterStore, options=None) -> PrintService:
+    """Build the print service: binaries from the config, the rest live from `options`."""
+    return PrintService(printers, Spooler(lp_binary=config.lp_binary, options=options))
 MAIL2NAS_EOF
 
 # --- mail2nas/discovery.py ---
@@ -2657,163 +3609,183 @@ MAIL2NAS_EOF
 cat > mail2nas/runtime.py <<'MAIL2NAS_EOF'
 """The objects the archiver and the web UI both work on.
 
-Settings that used to be environment-only can now be changed at runtime, so
-something has to hold the live state and let one side tell the other that it
-moved. That is all this is: a small container plus the two operations that
-need coordinating.
+Everything is configured in the web UI while the service runs, so something
+has to hold the live state: the stores, the current settings snapshot, the
+open archive connections, and what each worker is doing right now. That is
+this module - a container plus the few operations that need coordinating
+between the UI thread and the workers.
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
+from dataclasses import dataclass, field, replace
 
-from .archives import StorageSet
-from .config import parse_extension_list
-from .filenames import safe_relative_parts
-from .mapping import Mapping, MappingError
+from .archives import NoArchiveError, StorageSet
+from .mapping import Mapping, RuleStore
+from .options import Options, OptionsStore
+from .printing import PrintService, Spooler
 
 logger = logging.getLogger(__name__)
 
-SETTING_MAPPING_PATH = "mapping_path"
-SETTING_BLOCKED_EXTENSIONS = "blocked_extensions"
-SETTING_PICKUP_MIN_AGE = "pickup_min_age_seconds"
 
-# How long a file in a pickup folder has to have been untouched before it is
-# treated as finished. Long enough for a slow scan over SMB, short enough that
-# nobody waits for their document.
-DEFAULT_PICKUP_MIN_AGE = 20
+@dataclass
+class WorkerStatus:
+    """What the overview page shows for one mailbox (or the pickup folders)."""
+
+    label: str
+    state: str = "startet"  # startet | verbunden | wartet | Fehler | gestoppt
+    detail: str = ""
+    last_ok: float | None = None
+    last_error: str = ""
+    last_error_at: float | None = None
+    processed: int = 0
+
+
+@dataclass
+class ArchiveStatus:
+    ok: bool | None = None  # None = not checked yet
+    detail: str = ""
+    checked_at: float | None = None
+    fingerprint: tuple = field(default_factory=tuple)
+
+
+class StatusBoard:
+    """Thread-safe notes from the workers, read by the web UI.
+
+    Without it the only way to see whether a mailbox works would be the
+    container log - and the whole point of configuring everything in the
+    browser is not having to open a shell.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._workers: dict[str, WorkerStatus] = {}
+        self.archive = ArchiveStatus()
+        self.started_at = time.time()
+
+    def worker(self, key: str, label: str) -> None:
+        with self._lock:
+            self._workers.setdefault(key, WorkerStatus(label=label))
+            self._workers[key].label = label
+
+    def set(self, key: str, state: str, detail: str = "") -> None:
+        with self._lock:
+            status = self._workers.setdefault(key, WorkerStatus(label=key))
+            status.state = state
+            status.detail = detail
+            if state in ("verbunden", "wartet"):
+                status.last_ok = time.time()
+
+    def error(self, key: str, message: str) -> None:
+        with self._lock:
+            status = self._workers.setdefault(key, WorkerStatus(label=key))
+            status.state = "Fehler"
+            status.last_error = message
+            status.last_error_at = time.time()
+
+    def processed(self, key: str, count: int) -> None:
+        with self._lock:
+            status = self._workers.setdefault(key, WorkerStatus(label=key))
+            status.processed += count
+            status.last_ok = time.time()
+
+    def forget(self, key: str) -> None:
+        with self._lock:
+            self._workers.pop(key, None)
+
+    def workers(self) -> dict[str, WorkerStatus]:
+        with self._lock:
+            return {key: replace(value) for key, value in self._workers.items()}
 
 
 class Runtime:
-    """Shared handles, plus the mapping-file location that can move."""
+    """Shared handles, plus the current settings snapshot."""
 
     def __init__(
         self,
         config,
-        storage,
-        mapping,
-        store,
         settings,
         accounts,
+        store,
+        rules: RuleStore,
+        *,
         printers=None,
-        printing=None,
+        printing: PrintService | None = None,
         addresses=None,
         archives=None,
         pickups=None,
     ):
         self.config = config
-        # The archive described by the .env. It stays the fallback for an
-        # installation that has not (yet) configured any archive of its own.
-        self.env_storage = storage
-        self.mapping = mapping
-        self.store = store
-        self.settings = settings
+        self.settings = settings  # the key/value store
+        self.options_store = OptionsStore(settings)
+        self._options: Options | None = None
+        self._options_lock = threading.Lock()
+
         self.accounts = accounts
-        # Optional so a caller that does not care about printing (tests, and
-        # the archiver before printers existed) can leave them out.
+        self.store = store
+        self.rule_store = rules
+        self.mapping = Mapping(rules, lambda: self.options.fallback_folder)
         self.printers = printers
-        self.printing = printing
         self.addresses = addresses
         self.archives = archives
         self.pickups = pickups
-        self.storages = StorageSet(archives, storage)
-        # Set by the web UI, consumed by the supervisor loop: the archiver
-        # threads must not read a half-changed path.
-        self.mapping_path_changed = threading.Event()
+        self.storages = StorageSet(archives, None)
+        if printing is None and printers is not None:
+            printing = PrintService(
+                printers, Spooler(lp_binary=config.lp_binary, options=lambda: self.options)
+            )
+        self.printing = printing
+        self.status = StatusBoard()
+        # Set by the web UI after a change the supervisor should act on right
+        # away (an archive was added, the settings were saved) instead of at
+        # its next regular pass.
+        self.changed = threading.Event()
+        # The running Supervisor, if any - the overview page asks it about
+        # pickup folders with problems.
+        self.supervisor = None
 
-    def attach_mapping(self, relative_path: str) -> Mapping:
-        """Create the rule-file view, once the default archive is known.
-
-        The mapping lives on the default archive, which only exists after the
-        archive store has been read - so it is set here rather than passed in.
-        """
-        self.mapping = Mapping(self.storage, relative_path, self.config.fallback_folder)
-        return self.mapping
+    # --- settings -------------------------------------------------------------
 
     @property
-    def storage(self):
-        """The default archive - where the mapping file and anything without
-        its own archive lives."""
-        return self.storages.default()
+    def options(self) -> Options:
+        """The current settings - one immutable snapshot, cheap to ask for."""
+        with self._options_lock:
+            if self._options is None:
+                self._options = self.options_store.load()
+            return self._options
+
+    def set_options(self, options: Options) -> None:
+        self.options_store.save(options)
+        with self._options_lock:
+            self._options = options
+        self.changed.set()
+
+    def invalidate_options(self) -> None:
+        with self._options_lock:
+            self._options = None
 
     @property
     def blocked_extensions(self) -> frozenset[str]:
-        """The quarantined file extensions, as edited in the web UI.
-
-        The .env value is only the starting point: it seeds the stored list on
-        first start, and is used as long as nothing has been stored.
-        """
-        raw = self.settings.get(SETTING_BLOCKED_EXTENSIONS)
-        if raw is None:
-            return self.config.blocked_extensions
-        return parse_extension_list(raw)
-
-    def set_blocked_extensions(self, raw: str) -> frozenset[str]:
-        """Store a new list; takes effect on the next message, no restart."""
-        extensions = parse_extension_list(raw)
-        self.settings.set(SETTING_BLOCKED_EXTENSIONS, ",".join(sorted(extensions)))
-        return extensions
+        return self.options.blocked_extensions
 
     @property
     def pickup_min_age(self) -> int:
-        raw = self.settings.get(SETTING_PICKUP_MIN_AGE)
-        try:
-            return max(0, int(raw)) if raw is not None else DEFAULT_PICKUP_MIN_AGE
-        except (TypeError, ValueError):
-            return DEFAULT_PICKUP_MIN_AGE
+        return self.options.pickup_min_age
 
-    def set_pickup_min_age(self, seconds) -> int:
-        value = max(0, int(seconds))
-        self.settings.set(SETTING_PICKUP_MIN_AGE, str(value))
-        return value
+    # --- archives -------------------------------------------------------------
 
     @property
-    def mapping_path(self) -> str:
-        """Where the rules live - the stored value wins over the .env one."""
-        return self.settings.get(SETTING_MAPPING_PATH) or self.config.mapping_path
-
-    def set_mapping_path(self, new_path: str, move_existing: bool = True) -> None:
-        """Point the archiver at a different mapping file, optionally moving it.
-
-        Moving is a copy followed by a delete rather than a rename: the
-        storage backends deliberately expose no rename, and a copy that fails
-        halfway leaves the original in place, which is the safer direction.
-        """
-        new_path = (new_path or "").strip().replace("\\", "/")
+    def storage(self):
+        """The default archive, or None while none is configured."""
         try:
-            parts = safe_relative_parts(new_path)
-        except ValueError as exc:
-            raise MappingError(f"Ungueltiger Pfad: {exc}") from None
-        new_path = "/".join(parts)
+            return self.storages.default()
+        except NoArchiveError:
+            return None
 
-        old_path = self.mapping_path
-        if new_path == old_path:
-            return
-
-        if move_existing:
-            try:
-                content = self.storage.read_text(old_path)
-            except FileNotFoundError:
-                content = None
-            if content is not None:
-                self.storage.write_text(new_path, content)
-                self.storage.remove_file(old_path)
-                logger.info("Moved the mapping file from %s to %s", old_path, new_path)
-
-        self.settings.set(SETTING_MAPPING_PATH, new_path)
-        self.mapping.set_path(new_path)
-        self.mapping_path_changed.set()
-
-    def apply_mapping_path(self) -> None:
-        """Re-point the shared Mapping if the path or the default archive moved.
-
-        Both can change while the service runs: the path from the mapping
-        form, the archive from someone editing the first archive's password.
-        """
-        self.mapping.set_storage(self.storage)
-        wanted = self.mapping_path
-        if self.mapping.path != wanted:
-            self.mapping.set_path(wanted)
+    def default_archive(self):
+        return self.archives.default() if self.archives is not None else None
 MAIL2NAS_EOF
 
 # --- mail2nas/storage.py ---
@@ -3506,40 +4478,29 @@ class SmbStorage(Storage):
 
     def close(self) -> None:
         self._reset()
-
-
-def from_config(config) -> Storage:
-    """Build the storage backend described by the configuration."""
-    if config.storage_backend == "smb":
-        return SmbStorage(
-            host=config.smb_host,
-            share=config.smb_share,
-            user=config.smb_user,
-            password=config.smb_password,
-            domain=config.smb_domain,
-            port=config.smb_port,
-            root=config.smb_root,
-            encrypt=config.smb_encrypt,
-        )
-    return LocalStorage(config.storage_root)
 MAIL2NAS_EOF
 
 # --- mail2nas/mapping.py ---
 cat > mail2nas/mapping.py <<'MAIL2NAS_EOF'
-"""Keyword -> folder rules: file format, matching, and editing.
+"""Keyword -> folder rules: storage, matching, and editing.
 
-The rules live as YAML on the archive share, so they survive a broken web UI
-and stay editable by hand. Two things they have to express beyond the keyword
-and the target folder:
+The rules live in the local database, next to the mailboxes and archives,
+and are edited in the web UI. They used to be a `mapping.yaml` on the share;
+`migrate.py` carries such a file over once, and the YAML format lives on as
+the import/export format - a readable backup, and a way to move rules from one
+installation to another.
+
+Three things a rule expresses beyond keyword and target folder:
 
 * **Order.** The first matching rule wins, and the order is explicit rather
   than derived, so "Rechnungskorrektur" can be placed above "RE" instead of
   relying on it happening to be the longer word.
 * **Which mailbox a rule applies to**, once more than one IMAP account is
   configured.
-* **Whether the match is printed**, and on which of the configured printers.
+* **Whether the match is printed**, and on which of the configured printers,
+  and on which archive the folder is.
 
-Format (version 2)::
+Export format (version 2)::
 
     version: 2
     rules:
@@ -3551,21 +4512,22 @@ Format (version 2)::
         print: true
         printer: "1"
 
-The old flat `keyword: folder` format is still read: it is migrated in
-memory, longest keyword first, which is exactly the priority that version
-applied implicitly. Nothing is rewritten until the rules are saved.
+The old flat `keyword: folder` format is still read on import: longest
+keyword first, which is exactly the priority that version applied implicitly.
 """
 from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import threading
+from collections.abc import Callable
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 
 import yaml
 
 from .filenames import safe_relative_parts
-from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -3575,7 +4537,7 @@ MAX_KEYWORD_LENGTH = 100
 # A pattern is a chain of ".*?" separated by literals, so matching cost grows
 # with (wildcards x text length). Mail subjects and bodies are attacker-
 # supplied, so both factors are bounded rather than trusted: without this a
-# keyword like "a*a*a*a*a*..." plus a large body (MATCH_BODY=true) would tie
+# keyword like "a*a*a*a*a*..." plus a large body (body matching enabled) would tie
 # up an account worker for a very long time.
 MAX_WILDCARDS = 5
 MAX_MATCH_LENGTH = 100_000
@@ -3728,98 +4690,116 @@ def dump_rules(rules: list[Rule]) -> str:
     return yaml.safe_dump(document, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
-class Mapping:
-    """The rule list, reloaded from the share when the file changes.
+def rules_from_yaml(text: str) -> list[Rule]:
+    """Parse an exported (or old on-share) rule file."""
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise MappingError(f"Die Datei ist kein gueltiges YAML: {exc}") from None
+    return parse_rules(raw)
 
-    Shared by every account worker, so reloading is guarded by a lock: each
-    worker calls `reload()` at the start of its cycle.
+
+class RuleStore:
+    """The rule list in the database, in priority order.
+
+    Saved as a whole: the UI always edits the complete, ordered list (moving
+    one rule changes the position of two), and replacing it in one
+    transaction means a reader never sees a list that is half old, half new.
     """
 
-    def __init__(self, storage: Storage, relative_path: str, fallback_folder: str):
-        self._storage = storage
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mapping_rules ("
+                "position INTEGER PRIMARY KEY, "
+                "keyword TEXT NOT NULL, "
+                "folder TEXT NOT NULL, "
+                "account TEXT NOT NULL DEFAULT 'all', "
+                "print INTEGER NOT NULL DEFAULT 0, "
+                "printer TEXT NOT NULL DEFAULT '', "
+                "archive TEXT NOT NULL DEFAULT '')"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    def load(self) -> list[Rule]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT keyword, folder, account, print, printer, archive "
+                "FROM mapping_rules ORDER BY position"
+            ).fetchall()
+        return [
+            Rule.create(keyword, folder, account, bool(printing), printer, archive)
+            for keyword, folder, account, printing, printer, archive in rows
+        ]
+
+    def save(self, rules: list[Rule]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM mapping_rules")
+            conn.executemany(
+                "INSERT INTO mapping_rules (position, keyword, folder, account, print, "
+                "printer, archive) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        position,
+                        rule.keyword,
+                        rule.folder,
+                        rule.account or ALL_ACCOUNTS,
+                        1 if rule.print_attachments else 0,
+                        rule.printer,
+                        rule.archive,
+                    )
+                    for position, rule in enumerate(rules)
+                ],
+            )
+
+    def count(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM mapping_rules").fetchone()[0])
+
+
+class Mapping:
+    """The rule list as the archiver sees it.
+
+    Shared by every account worker and the pickup runner. `reload()` is called
+    at the start of each cycle and re-reads the table - a handful of rows from
+    a local file, cheaper than any cleverness about noticing changes.
+    """
+
+    def __init__(self, store: RuleStore, fallback_folder: str | Callable[[], str] = "unsorted"):
+        self._store = store
         self._fallback_folder = fallback_folder
         self._lock = threading.Lock()
         self._rules: list[Rule] = []
-        self._mtime: float | None = None
-        self.set_path(relative_path)
+        self.reload()
 
     @property
-    def path(self) -> str:
-        return self._relative_path
+    def store(self) -> RuleStore:
+        return self._store
 
-    def set_storage(self, storage: Storage) -> None:
-        """Point at a different archive (the default one was reconfigured)."""
+    @property
+    def rules(self) -> list[Rule]:
         with self._lock:
-            if storage is self._storage:
-                return
-            self._storage = storage
-            self._mtime = None
-        self.set_path(self._relative_path)
+            return list(self._rules)
 
-    def set_path(self, relative_path: str) -> None:
-        """Point at a different mapping file and load it immediately."""
-        with self._lock:
-            self._relative_path = relative_path
-            self._display_path = self._storage.display(safe_relative_parts(relative_path))
-            self._mtime = None
-        self.reload(force=True)
-
-    def reload(self, force: bool = False) -> None:
-        with self._lock:
-            relative_path, display_path = self._relative_path, self._display_path
-            known_mtime, rule_count = self._mtime, len(self._rules)
-
+    def reload(self) -> None:
         try:
-            mtime = self._storage.modified_time(relative_path)
-        except FileNotFoundError:
-            if force:
-                logger.warning(
-                    "Mapping file %s not found, all mail will go to the fallback folder",
-                    display_path,
-                )
-                with self._lock:
-                    self._rules = []
-                    self._mtime = None
+            rules = self._store.load()
+        except Exception as exc:  # noqa: BLE001 - keep the last good rules
+            logger.error("Could not read the mapping rules (%s) - keeping the previous %d",
+                         exc, len(self._rules))
             return
-        except Exception as exc:  # noqa: BLE001 - a dropped share must not kill the loop
-            # With the SMB backend this is a network call, so it can fail for
-            # reasons that have nothing to do with the file itself. Keep the
-            # rules we already have; the next cycle tries again.
-            logger.warning(
-                "Could not check mapping file %s (%s) - keeping the previous %d rule(s)",
-                display_path,
-                exc,
-                rule_count,
-            )
-            return
-
-        if not force and known_mtime == mtime:
-            return
-
-        # The file can also be edited by hand on a network share, so a
-        # malformed or half-written version is a matter of when, not if. Keep
-        # serving the last good rules instead of letting the exception escape:
-        # it would propagate out of the IMAP loop and leave the service
-        # reconnecting in a tight loop, archiving nothing until someone noticed.
-        try:
-            rules = parse_rules(yaml.safe_load(self._storage.read_text(relative_path)))
-        except Exception as exc:  # noqa: BLE001
-            # Remember the mtime anyway, so a persistently broken file is
-            # reported once rather than on every single cycle.
-            with self._lock:
-                self._mtime = mtime
-            logger.error(
-                "Could not load mapping file %s (%s) - keeping the previous %d rule(s)",
-                display_path,
-                exc,
-                rule_count,
-            )
-            return
-
         with self._lock:
             self._rules = rules
-            self._mtime = mtime
-        logger.info("Loaded %d mapping rule(s) from %s", len(rules), display_path)
+
+    def save(self, rules: list[Rule]) -> None:
+        self._store.save(rules)
+        with self._lock:
+            self._rules = list(rules)
 
     def match(self, *texts: str, account_id: str | None = None) -> Rule | None:
         """Return the first rule that matches, or None.
@@ -3836,29 +4816,17 @@ class Mapping:
                 return rule
         return None
 
+    def fallback_folder(self) -> str:
+        value = self._fallback_folder
+        return value() if callable(value) else value
+
     def resolve(self, *texts: str, account_id: str | None = None) -> tuple[str, str | None]:
         """Return (target_folder, matched_keyword) for the first matching rule."""
         rule = self.match(*texts, account_id=account_id)
-        return (rule.folder, rule.keyword) if rule else (self._fallback_folder, None)
+        return (rule.folder, rule.keyword) if rule else (self.fallback_folder(), None)
 
 
 # --- editing helpers (used by the web UI) ------------------------------------
-
-
-def load_rules(storage: Storage, relative_path: str) -> list[Rule]:
-    """Read the rule list for editing.
-
-    A missing file is an empty rule list, not an error: that is the state
-    right after installation, and the UI is where it gets fixed.
-    """
-    try:
-        return parse_rules(yaml.safe_load(storage.read_text(relative_path)))
-    except FileNotFoundError:
-        return []
-
-
-def save_rules(storage: Storage, relative_path: str, rules: list[Rule]) -> None:
-    storage.write_text(relative_path, dump_rules(rules))
 
 
 def validate_keyword(keyword: str, existing: list[Rule], replacing: int | None = None) -> str:
@@ -4207,13 +5175,13 @@ from imapclient import IMAPClient
 
 from .accounts import Account
 from .addresses import AddressRule, AddressStore
-from .config import Config
+from .archives import StorageSet
 from .filenames import extension_of, safe_relative_parts, sanitize_filename
 from .mapping import Mapping, Rule
+from .options import Options
 from .printers import Printer
 from .printing import PrintService, job_title
 from .state import ProcessedStore
-from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -4235,6 +5203,9 @@ RECIPIENT_HEADERS = (
 # A mail may legitimately carry a few dozen recipients; thousands are either a
 # mistake or an attempt to make matching expensive.
 MAX_RECIPIENTS = 50
+# Seconds a single IMAP command may take. Without a timeout a server that
+# stops answering mid-session blocks the worker forever - no error, no retry.
+IMAP_TIMEOUT = 60
 
 
 def _decode(value: str | None) -> str:
@@ -4296,46 +5267,47 @@ class AttachmentPlan:
 class Archiver:
     def __init__(
         self,
-        config: Config,
+        options,
         mapping: Mapping,
         store: ProcessedStore,
-        storage: Storage,
+        storages,
         account: Account,
         printing: PrintService | None = None,
         addresses: AddressStore | None = None,
-        storages=None,
-        blocked_extensions=None,
     ):
-        self.config = config
+        # `options` is an Options snapshot or a callable returning the current
+        # one. The callable is what the service uses: the settings page takes
+        # effect on the next message, without restarting the worker.
+        self._options = options
         self.mapping = mapping
         self.store = store
-        self.storage = storage
+        # A StorageSet (one storage per archive), or a single Storage for an
+        # installation - or a test - with exactly one place to file into.
+        self.storages = storages
         self.account = account
         self.printing = printing
         # Optional, like `printing`: an installation without address rules
         # behaves exactly as before.
         self.addresses = addresses
-        # A StorageSet once more than one archive can be configured; without
-        # it everything is filed into the one archive from the environment.
-        self.storages = storages
-        # Read through a callable rather than copied from the config: the list
-        # is editable in the web UI and has to take effect without a restart.
-        self._blocked_extensions = blocked_extensions
+
+    @property
+    def options(self) -> Options:
+        return self._options() if callable(self._options) else self._options
 
     @property
     def blocked_extensions(self) -> frozenset[str]:
-        if self._blocked_extensions is None:
-            return self.config.blocked_extensions
-        return self._blocked_extensions()
+        return self.options.blocked_extensions
 
     def storage_for(self, archive_key: str):
         """The archive a plan points at, or the only one there is."""
-        if self.storages is None:
-            return self.storage
-        return self.storages.get(archive_key)
+        if isinstance(self.storages, StorageSet):
+            return self.storages.get(archive_key)
+        return self.storages
 
     def connect(self) -> IMAPClient:
-        client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.ssl)
+        client = IMAPClient(
+            self.account.host, port=self.account.port, ssl=self.account.ssl, timeout=IMAP_TIMEOUT
+        )
         client.login(self.account.user, self.account.password)
         client.select_folder(self.account.folder)
         return client
@@ -4367,16 +5339,16 @@ class Archiver:
         # exhaust memory/disk on every poll cycle.
         size_reply = client.fetch([uid], ["RFC822.SIZE"])
         message_size = size_reply.get(uid, {}).get(b"RFC822.SIZE", 0)
-        max_message_bytes = self.config.max_message_size_mb * 1024 * 1024
+        max_message_bytes = self.options.max_message_size_mb * 1024 * 1024
         if message_size and message_size > max_message_bytes:
             logger.warning(
                 "UID %s is %.1f MB, exceeds MAX_MESSAGE_SIZE_MB=%d - skipping attachment "
                 "extraction and flagging for manual review",
                 uid,
                 message_size / (1024 * 1024),
-                self.config.max_message_size_mb,
+                self.options.max_message_size_mb,
             )
-            if not self.config.dry_run:
+            if not self.options.dry_run:
                 client.add_flags([uid], [b"\\Seen"])
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
@@ -4393,7 +5365,7 @@ class Archiver:
 
         subject = _decode(msg.get("Subject"))
         _, sender_addr = parseaddr(_decode(msg.get("From")))
-        body = self._extract_body(msg) if self.config.match_body else ""
+        body = self._extract_body(msg) if self.options.match_body else ""
         mail_rule = self._match(subject, body)
         address_rule = self._address_rule(msg, sender_addr)
         if address_rule is not None:
@@ -4406,23 +5378,23 @@ class Archiver:
             )
 
         attachments = list(self._iter_attachments(msg))
-        if len(attachments) > self.config.max_attachments_per_message:
+        if len(attachments) > self.options.max_attachments_per_message:
             logger.warning(
                 "UID %s '%s' has %d attachments, only processing the first %d "
                 "(MAX_ATTACHMENTS_PER_MESSAGE)",
                 uid,
                 subject,
                 len(attachments),
-                self.config.max_attachments_per_message,
+                self.options.max_attachments_per_message,
             )
-            attachments = attachments[: self.config.max_attachments_per_message]
+            attachments = attachments[: self.options.max_attachments_per_message]
 
         saved: list[str] = []
         if not attachments:
             logger.info("UID %s '%s' has no attachments, nothing to save", uid, subject)
         else:
             date_prefix = self._date_prefix(msg)
-            max_attachment_bytes = self.config.max_attachment_size_mb * 1024 * 1024
+            max_attachment_bytes = self.options.max_attachment_size_mb * 1024 * 1024
             for filename, payload in attachments:
                 if len(payload) > max_attachment_bytes:
                     logger.warning(
@@ -4432,7 +5404,7 @@ class Archiver:
                         subject,
                         filename,
                         len(payload) / (1024 * 1024),
-                        self.config.max_attachment_size_mb,
+                        self.options.max_attachment_size_mb,
                     )
                     continue
 
@@ -4440,72 +5412,75 @@ class Archiver:
                 out_name = self._build_filename(date_prefix, sender_addr, filename)
 
                 if plan.archive:
-                    target_parts = self._target_parts(plan.folder)
-                    storage = self.storage_for(plan.archive_key)
-                    if self.config.dry_run:
-                        logger.info(
-                            "[dry-run] would save %s -> %s",
-                            out_name,
-                            storage.display(target_parts),
-                        )
-                    else:
-                        out_path = storage.save_unique(target_parts, out_name, payload)
-                        saved.append(out_path)
-                        logger.info(
-                            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
-                            uid,
-                            subject,
-                            filename,
-                            plan.keyword or "<fallback>",
-                            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
-                            out_path,
-                        )
-                elif plan.printer is not None:
-                    logger.info(
-                        "UID %s '%s': attachment '%s' is printed only, not archived",
-                        uid,
-                        subject,
-                        filename,
-                    )
-                else:
-                    # Neither filed nor printed - that is a configuration
-                    # mistake rather than an intention, and the attachment is
-                    # gone once the mail is marked as read.
-                    logger.warning(
-                        "UID %s '%s': attachment '%s' was neither archived nor printed - "
-                        "%s is set to print only but nothing prints it",
-                        uid,
-                        subject,
-                        filename,
-                        f"the address rule {plan.address.name!r}"
-                        if plan.address is not None
-                        else "the mailbox",
-                    )
+                    self._file(plan, out_name, payload, uid, subject, filename, saved)
 
                 # Printing comes after filing, deliberately: the share is the
                 # archive and paper is the copy, so a printer that is offline
                 # or out of paper must never be the reason an attachment was
                 # not stored.
+                printed = False
                 if plan.printer is not None:
-                    self.printing.send(
+                    printed = self.printing.send(
                         plan.printer, payload, out_name, job_title(subject, filename)
                     )
 
-        if not self.config.dry_run:
+                if not plan.archive and not printed:
+                    # "Print only" and yet nothing came out - no printer, a
+                    # format it cannot print, CUPS down. The mail is marked as
+                    # read in a moment, so this is the last chance to keep the
+                    # attachment: file it after all rather than lose it.
+                    logger.warning(
+                        "UID %s '%s': attachment '%s' was meant to be printed only, but "
+                        "nothing was printed - filing it instead so it is not lost",
+                        uid,
+                        subject,
+                        filename,
+                    )
+                    self._file(plan, out_name, payload, uid, subject, filename, saved)
+                elif not plan.archive:
+                    logger.info(
+                        "UID %s '%s': attachment '%s' printed, not archived (%s)",
+                        uid,
+                        subject,
+                        filename,
+                        f"address rule {plan.address.name!r}"
+                        if plan.address is not None
+                        else "mailbox set to print only",
+                    )
+
+        if not self.options.dry_run:
             self.store.mark_processed(message_id)
             client.add_flags([uid], [b"\\Seen"])
             if self.account.processed_folder:
                 client.move([uid], self.account.processed_folder)
         return True
 
+    def _file(self, plan, out_name, payload, uid, subject, filename, saved) -> None:
+        target_parts = self._target_parts(plan.folder)
+        storage = self.storage_for(plan.archive_key)
+        if self.options.dry_run:
+            logger.info("[dry-run] would save %s -> %s", out_name, storage.display(target_parts))
+            return
+        out_path = storage.save_unique(target_parts, out_name, payload)
+        saved.append(out_path)
+        logger.info(
+            "UID %s '%s': attachment '%s' matched '%s'%s -> %s",
+            uid,
+            subject,
+            filename,
+            plan.keyword or "<fallback>",
+            " [QUARANTAENE: gesperrte Dateiendung]" if plan.quarantined else "",
+            out_path,
+        )
+
     def _target_parts(self, folder_name: str) -> tuple[str, ...]:
         """Map a configured folder name onto path components inside the archive root.
 
-        Folder names come from mapping.yaml on the share and are therefore
-        untrusted; anything that would escape the archive root is rejected and
+        Folder names come from rules and address entries - and a rule file
+        imported from somewhere else is not necessarily trustworthy; anything that would escape the archive root is rejected and
         replaced with the fallback folder rather than being written outside.
         """
-        for candidate, note in ((folder_name, None), (self.config.fallback_folder, "fallback"), ("unsorted", "built-in")):
+        for candidate, note in ((folder_name, None), (self.options.fallback_folder, "fallback"), ("unsorted", "built-in")):
             try:
                 target = safe_relative_parts(candidate)
             except ValueError as exc:
@@ -4557,7 +5532,7 @@ class Archiver:
         quarantined = bool(extensions & self.blocked_extensions)
 
         return AttachmentPlan(
-            folder=self.config.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
+            folder=self.options.quarantine_folder if quarantined else self._folder_of(rule, address_rule),
             keyword=rule.keyword if rule else None,
             quarantined=quarantined,
             archive_key=self._archive_of(rule, address_rule),
@@ -4577,7 +5552,7 @@ class Archiver:
     def _folder_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
         if address_rule is not None and address_rule.folder:
             return address_rule.folder
-        return rule.folder if rule else self.config.fallback_folder
+        return rule.folder if rule else self.options.fallback_folder
 
     def _archive_of(self, rule: Rule | None, address_rule: AddressRule | None = None) -> str:
         """Which archive the folder lives on.
@@ -4605,7 +5580,7 @@ class Archiver:
         Its whole purpose is to say what happens to mail sent there, so an
         address set to "only file" is not overruled by a keyword rule.
         """
-        if self.printing is None or not self.config.printing_enabled:
+        if self.printing is None or not self.options.printing_enabled:
             return None
         if quarantined:
             # A blocked attachment is a suspected executable. It is neither
@@ -4645,7 +5620,7 @@ class Archiver:
 
     def _build_filename(self, date_prefix: str, sender_addr: str, filename: str) -> str:
         filename = sanitize_filename(_decode(filename))
-        mode = self.config.filename_prefix
+        mode = self.options.filename_prefix
         if mode == "none":
             return filename
         if mode == "date":
@@ -4727,30 +5702,38 @@ class PickupRunner:
 
     def __init__(
         self,
-        config,
+        options,
         mapping,
         storages,
         pickups: PickupStore,
         printing=None,
-        blocked_extensions=None,
-        min_age_seconds: int = 20,
     ):
-        self.config = config
+        # Options snapshot or a callable returning the current one, like the
+        # archiver: quarantine list, folders and waiting time are all live.
+        self._options = options
         self.mapping = mapping
         self.storages = storages
         self.pickups = pickups
         self.printing = printing
-        self._blocked_extensions = blocked_extensions
-        self.min_age_seconds = min_age_seconds
         # Remembers the last problem reported per folder, so one that stays
         # unreachable is logged once instead of on every cycle.
         self._reported: dict[int, str] = {}
 
     @property
+    def options(self):
+        return self._options() if callable(self._options) else self._options
+
+    @property
     def blocked_extensions(self) -> frozenset[str]:
-        if self._blocked_extensions is None:
-            return self.config.blocked_extensions
-        return self._blocked_extensions()
+        return self.options.blocked_extensions
+
+    @property
+    def min_age_seconds(self) -> int:
+        return self.options.pickup_min_age
+
+    def problems(self) -> dict[int, str]:
+        """The folders that currently have a problem, for the overview page."""
+        return dict(self._reported)
 
     # --- one pass ------------------------------------------------------------
 
@@ -4834,18 +5817,18 @@ class PickupRunner:
             & self.blocked_extensions
         )
         if quarantined:
-            folder = self.config.quarantine_folder
+            folder = self.options.quarantine_folder
         elif pickup.has_fixed_target:
             folder = pickup.target_folder
         elif rule is not None:
             folder = rule.folder
         else:
-            folder = self.config.fallback_folder
+            folder = self.options.fallback_folder
 
         parts = self._target_parts(folder)
         out_name = self._build_filename(entry, pickup)
 
-        if self.config.dry_run:
+        if self.options.dry_run:
             logger.info(
                 "[dry-run] would move %s -> %s",
                 source.display(entry.parts),
@@ -4882,7 +5865,7 @@ class PickupRunner:
         return True
 
     def _printer_for(self, pickup: Pickup, quarantined: bool):
-        if self.printing is None or not self.config.printing_enabled:
+        if self.printing is None or not self.options.printing_enabled:
             return None
         if quarantined or not pickup.print_attachments:
             return None
@@ -4898,7 +5881,7 @@ class PickupRunner:
 
         for candidate, note in (
             (folder, None),
-            (self.config.fallback_folder, "fallback"),
+            (self.options.fallback_folder, "fallback"),
             ("unsorted", "built-in"),
         ):
             try:
@@ -4914,7 +5897,7 @@ class PickupRunner:
     def _build_filename(self, entry, pickup: Pickup) -> str:
         """Same naming as for mail, with the folder standing in for the sender."""
         filename = sanitize_filename(entry.name)
-        mode = self.config.filename_prefix
+        mode = self.options.filename_prefix
         if mode == "none":
             return filename
         date_prefix = datetime.fromtimestamp(entry.mtime).strftime("%Y-%m-%d")
@@ -4928,14 +5911,16 @@ MAIL2NAS_EOF
 
 # --- mail2nas/web.py ---
 cat > mail2nas/web.py <<'MAIL2NAS_EOF'
-"""Minimal web UI for editing the keyword -> folder mapping.
+"""The web UI - where mail2nas is configured, all of it.
 
-Deliberately small: one password, one page for the rules, one page for
-changing that password. No user accounts, no JavaScript, no external assets.
+Mailboxes, archives, keyword rules, printers, delivery addresses, pickup
+folders and the general settings are all edited here and stored in the local
+database; the `.env` only says which port this page listens on. A fresh
+installation starts with nothing but a password, and the overview page walks
+through what is still missing.
 
-It edits `mapping.yaml` on the share through the same storage backend the
-archiver uses, so the file stays the single source of truth and the archiver
-picks up changes on its next cycle without a restart.
+Deliberately plain: one password, no user accounts, no JavaScript, no external
+assets - so the Content-Security-Policy can forbid everything but inline CSS.
 
 This is a LAN tool. It authenticates with a single password over whatever
 transport it is put behind - see the README for why it should not be exposed
@@ -4944,10 +5929,11 @@ to the internet without a TLS-terminating reverse proxy in front.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 
@@ -4969,9 +5955,9 @@ from .mapping import (
     ALL_ACCOUNTS,
     MappingError,
     Rule,
-    load_rules,
+    dump_rules,
     move_rule,
-    save_rules,
+    rules_from_yaml,
     set_account,
     set_archive,
     set_printing,
@@ -4979,6 +5965,9 @@ from .mapping import (
     validate_keyword,
 )
 from .addresses import AddressError
+from .migrate import SETTING_RULES_NOTE
+from .options import FILENAME_PREFIXES, LIMITS, OptionsError
+from .options import validate as validate_options
 from .archives import ArchiveError
 from .pickups import PICKUP_INTERVAL, PickupError
 from .discovery import discover
@@ -5039,12 +6028,12 @@ BASE_TEMPLATE = """
   :root {
     color-scheme: light dark;
     --bg: #f6f7f9; --fg: #1b1d21; --muted: #5c6470; --line: #d7dbe0;
-    --card: #ffffff; --accent: #2f6feb; --danger: #b3261e; --ok: #1f7a3d;
+    --card: #ffffff; --accent: #2f6feb; --danger: #b3261e; --ok: #1f7a3d; --warn: #9a6700;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #16181c; --fg: #e6e8ea; --muted: #9aa2ad; --line: #2e333a;
-      --card: #1e2126; --accent: #6a9bff; --danger: #ef6a63; --ok: #63c98c;
+      --card: #1e2126; --accent: #6a9bff; --danger: #ef6a63; --ok: #63c98c; --warn: #e3b341;
     }
   }
   * { box-sizing: border-box; }
@@ -5085,6 +6074,15 @@ BASE_TEMPLATE = """
   .msg { border-radius: 8px; padding: .6rem .8rem; margin-bottom: .75rem; border: 1px solid; }
   .msg.error { color: var(--danger); border-color: var(--danger); }
   .msg.ok { color: var(--ok); border-color: var(--ok); }
+  .msg.warn { color: var(--warn); border-color: var(--warn); }
+  .state-ok { color: var(--ok); font-weight: 600; }
+  .state-bad { color: var(--danger); font-weight: 600; }
+  .state-wait { color: var(--warn); font-weight: 600; }
+  ol.steps li { margin-bottom: .45rem; }
+  ol.steps li.done { color: var(--muted); }
+  input[type=number] { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: .4rem .5rem; width: 8rem; }
+  textarea { font: inherit; }
   dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; margin: 0; font-size: .88rem; }
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-all; }
@@ -5104,8 +6102,10 @@ BASE_TEMPLATE = """
     <h1>mail2nas</h1>
     {% if logged_in %}
     <nav>
+      <a href="{{ url_for('overview_page') }}">Uebersicht</a> &middot;
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
       <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
+      <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -5114,6 +6114,10 @@ BASE_TEMPLATE = """
     </nav>
     {% endif %}
   </header>
+  {% if logged_in and setup_hint %}
+    <div class="msg warn">{{ setup_hint }}
+      <a href="{{ url_for('overview_page') }}">Zur Einrichtung</a></div>
+  {% endif %}
   {% for category, message in messages %}
     <div class="msg {{ category }}">{{ message }}</div>
   {% endfor %}
@@ -5139,6 +6143,19 @@ LOGIN_BODY = """
 """
 
 MAPPING_BODY = """
+{% if migration_note %}
+<div class="msg warn">{{ migration_note }}
+  <form class="inline" method="post" action="{{ url_for('dismiss_migration_note') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="link" type="submit">Ausblenden</button>
+  </form>
+</div>
+{% endif %}
+{% if not storage_ok %}
+<div class="msg warn">Das Standard-Archiv ist nicht erreichbar oder noch nicht eingerichtet -
+  die Ordnerliste bleibt leer. Neue Ordner lassen sich trotzdem eintragen; sie werden
+  beim ersten Anhang angelegt.</div>
+{% endif %}
 <div class="card">
   <h2 style="margin-top:0">Stichwort einem Ordner zuordnen</h2>
   <form method="post" action="{{ url_for('add_rule') }}">
@@ -5310,13 +6327,33 @@ MAPPING_BODY = """
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Ablage</h2>
-  <dl>
-    <dt>Archiv</dt><dd>{{ storage_description }}</dd>
-    <dt>Mapping-Datei</dt><dd>{{ mapping_path }}</dd>
-    <dt>Ohne Treffer</dt><dd>{{ fallback_folder }}</dd>
-    <dt>Gesperrte Dateiendungen</dt><dd>{{ quarantine_folder }}</dd>
-  </dl>
+  <h2 style="margin-top:0">Sichern und uebertragen</h2>
+  <p class="hint" style="margin-top:0">Die Zuordnungen liegen in der Datenbank des
+  Containers. Als Datei exportiert sind sie eine lesbare Sicherung - und lassen sich
+  in eine andere Installation uebernehmen.</p>
+  <p><a href="{{ url_for('export_rules') }}"><button class="secondary" type="button">
+    Als mapping.yaml herunterladen</button></a></p>
+  <form method="post" action="{{ url_for('import_rules') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field">
+        <label for="rules_file">mapping.yaml importieren</label>
+        <input id="rules_file" name="rules_file" type="file" accept=".yaml,.yml,.txt" required>
+      </div>
+      <div class="field">
+        <label for="import_mode">Vorhandene Zuordnungen</label>
+        <select id="import_mode" name="mode">
+          <option value="append">behalten, neue anhaengen</option>
+          <option value="replace">ersetzen</option>
+        </select>
+      </div>
+      <button type="submit">Importieren</button>
+    </div>
+  </form>
+  <p class="hint" style="margin-bottom:0">Gelesen werden das aktuelle Format und das alte
+  (<code>Stichwort: ordner</code>). Beim Anhaengen werden Stichwoerter, die es schon gibt,
+  uebersprungen. Ohne Treffer landet alles in <strong>{{ fallback_folder }}</strong>,
+  gesperrte Dateitypen in <strong>{{ quarantine_folder }}</strong>.</p>
 </div>
 """
 
@@ -5376,7 +6413,8 @@ CONFIG_BODY = """
   <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
   CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
   {% else %}
-  <p class="hint">Drucken ist per <code>PRINTING_ENABLED=false</code> abgeschaltet.</p>
+  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Einstellungen</a>
+  abgeschaltet.</p>
   {% endif %}
   <p style="margin-bottom:0">
     <a href="{{ url_for('new_printer') }}">
@@ -5406,11 +6444,13 @@ CONFIG_BODY = """
     {% endfor %}
   </table>
   </div>
-  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dort liegt die
-  Mapping-Datei, dorthin geht alles ohne eigene Angabe. Zuordnungen, Zustelladressen
-  und Abholordner koennen jeweils ein anderes waehlen.</p>
+  <p class="hint">Das erste aktive Archiv ist das Standard-Archiv: dorthin geht alles
+  ohne eigene Angabe. Zuordnungen, Zustelladressen und Abholordner koennen jeweils ein
+  anderes waehlen.</p>
   {% else %}
-  <p class="hint">Es wird das Archiv aus der .env verwendet: {{ storage_description }}</p>
+  <p class="hint"><strong>Noch kein Archiv eingerichtet</strong> - solange wird nichts
+  abgeholt. Meist ist das eine SMB-Freigabe auf dem NAS; gemountet werden muss dafuer
+  nichts.</p>
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
     <button type="button">Archiv hinzufuegen</button></a></p>
@@ -5446,33 +6486,6 @@ CONFIG_BODY = """
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_pickup') }}">
     <button type="button">Abholordner hinzufuegen</button></a></p>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">Quarantaene und Abholen</h2>
-  <form method="post" action="{{ url_for('save_settings') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div class="field">
-      <label for="blocked_extensions">Gesperrte Dateiendungen</label>
-      <input id="blocked_extensions" name="blocked_extensions" type="text"
-             value="{{ blocked_extensions }}">
-    </div>
-    <p class="hint">Anhaenge mit einer dieser Endungen landen <strong>immer</strong> im
-    Ordner <code>{{ quarantine_folder }}</code> - auch wenn ein Stichwort passt und auch
-    wenn sie aus einem Abholordner kommen. So kann „Rechnung.exe" nicht im
-    Rechnungsordner landen. Gedruckt wird so etwas nie.
-    Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
-    <strong>Leer heisst: keine Pruefung.</strong></p>
-    <div class="row" style="margin-top:.6rem">
-      <div class="field">
-        <label for="pickup_min_age">Abholordner: Datei gilt als fertig nach (Sekunden)</label>
-        <input id="pickup_min_age" name="pickup_min_age" type="text" value="{{ pickup_min_age }}">
-      </div>
-      <button type="submit">Speichern</button>
-    </div>
-    <p class="hint" style="margin-bottom:0">Wirkt sofort, ohne Neustart. Die
-    <code>.env</code> gibt nur noch den Startwert vor.</p>
-  </form>
 </div>
 
 <div class="card">
@@ -5513,37 +6526,9 @@ CONFIG_BODY = """
     <button type="button">Zustelladresse hinzufuegen</button></a></p>
 </div>
 
-<div class="card">
-  <h2 style="margin-top:0">Mapping-Datei</h2>
-  <form method="post" action="{{ url_for('move_mapping') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div class="row">
-      <div class="field">
-        <label for="mapping_path">Pfad relativ zur Archiv-Wurzel</label>
-        <input id="mapping_path" name="mapping_path" type="text" value="{{ mapping_path }}" required>
-      </div>
-      <button type="submit">Verschieben</button>
-    </div>
-    <p class="hint">Die vorhandene Datei wird an den neuen Ort kopiert und am
-    alten geloescht. Archiv: {{ storage_description }}</p>
-  </form>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">Feste Einstellungen</h2>
-  <p class="hint" style="margin-top:0">Diese kommen aus der .env und brauchen einen
-  Neustart des Containers.</p>
-  <dl>
-    <dt>Archiv</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
-    <dt>Fallback-Ordner</dt><dd>{{ fallback_folder }}</dd>
-    <dt>Quarantaene-Ordner</dt><dd>{{ quarantine_folder }}</dd>
-    <dt>Archiv aus der .env</dt><dd>{{ storage_description }} ({{ storage_backend }})</dd>
-    <dt>Mailtext durchsuchen</dt><dd>{{ 'ja' if match_body else 'nein' }}</dd>
-    <dt>Dateinamen-Praefix</dt><dd>{{ filename_prefix }}</dd>
-    <dt>Intervall</dt><dd>{{ poll_interval }} s</dd>
-    <dt>Testmodus (DRY_RUN)</dt><dd>{{ 'an' if dry_run else 'aus' }}</dd>
-  </dl>
-</div>
+<p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
+Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
+<a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
 """
 
 ACCOUNT_BODY = """
@@ -5656,6 +6641,16 @@ ACCOUNT_BODY = """
 </div>
 
 {% if account %}
+<div class="card">
+  <h2 style="margin-top:0">Verbindung testen</h2>
+  <form method="post" action="{{ url_for('test_account', account_id=account.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Anmeldung und Ordner pruefen</button>
+    <p class="hint">Meldet sich mit den gespeicherten Daten an und oeffnet den Ordner -
+    liest und veraendert keine Mail.</p>
+  </form>
+</div>
+
 <div class="card">
   <h2 style="margin-top:0">Postfach loeschen</h2>
   <form method="post" action="{{ url_for('delete_account', account_id=account.id) }}">
@@ -5985,8 +6980,9 @@ ARCHIVE_BODY = """
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
     </div>
   </form>
-  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dort
-  liegt die Mapping-Datei, und dorthin geht alles, was kein eigenes Archiv nennt.
+  <p class="hint">Das <strong>erste aktive</strong> Archiv ist das Standard-Archiv: dorthin
+  geht alles, was kein eigenes Archiv nennt, und dort liegen der Fallback- und der
+  Quarantaene-Ordner.
   Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
   mountet nichts.</p>
 </div>
@@ -6111,6 +7107,200 @@ PICKUP_BODY = """
 {% endif %}
 """
 
+OVERVIEW_BODY = """
+{% if initial_password %}
+<div class="msg warn">Angemeldet mit dem automatisch erzeugten Startpasswort. Bitte unter
+  <a href="{{ url_for('password_page') }}">Passwort</a> ein eigenes setzen.</div>
+{% endif %}
+
+{% if steps_open %}
+<div class="card">
+  <h2 style="margin-top:0">Einrichtung</h2>
+  <ol class="steps">
+    {% for step in steps %}
+    <li class="{{ 'done' if step.done }}">
+      {% if step.done %}&#10003;{% endif %}
+      <a href="{{ step.url }}">{{ step.title }}</a> - <span class="hint">{{ step.hint }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  <p class="hint" style="margin-bottom:0">Alles wird hier eingestellt und sofort
+  uebernommen - ein Neustart des Containers ist nie noetig.</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">Status</h2>
+  <table>
+    <tr><th>Was</th><th>Zustand</th><th>Details</th></tr>
+    <tr>
+      <td class="keyword">Standard-Archiv</td>
+      <td>{% if archive_status.ok %}<span class="state-ok">bereit</span>
+          {% elif archive_status.ok is none %}<span class="state-wait">wird geprueft</span>
+          {% else %}<span class="state-bad">nicht bereit</span>{% endif %}</td>
+      <td>{{ archive_status.detail or '-' }}</td>
+    </tr>
+    {% for row in workers %}
+    <tr>
+      <td class="keyword">{{ row.label }}</td>
+      <td>{% if row.state == 'verbunden' %}<span class="state-ok">verbunden</span>
+          {% elif row.state == 'Fehler' %}<span class="state-bad">Fehler</span>
+          {% else %}<span class="state-wait">{{ row.state }}</span>{% endif %}</td>
+      <td>{% if row.detail %}{{ row.detail }}{% endif %}
+          {% if row.processed %}<span class="hint">&middot; {{ row.processed }} verarbeitet</span>{% endif %}
+          {% if row.last_ok %}<span class="hint">&middot; zuletzt ok {{ row.last_ok }}</span>{% endif %}
+          {% if row.last_error %}<br><span class="state-bad">{{ row.last_error }}</span>
+            <span class="hint">({{ row.last_error_at }})</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    {% for problem in pickup_problems %}
+    <tr><td class="keyword">Abholordner</td><td><span class="state-bad">Problem</span></td>
+      <td>{{ problem }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if not workers and ready %}
+  <p class="hint">Kein aktives Postfach - es wird keine Mail abgeholt.</p>
+  {% endif %}
+  {% if dry_run %}
+  <p class="state-wait">Testmodus ist an: es wird nichts abgelegt, gedruckt oder als
+  gelesen markiert, nur protokolliert.</p>
+  {% endif %}
+  <p class="hint" style="margin-bottom:0">Stand {{ now }} &middot; laeuft seit {{ started }}.
+  Details stehen im Container-Log (<code>docker compose logs -f</code>).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Auf einen Blick</h2>
+  <dl>
+    <dt>Postfaecher</dt><dd>{{ counts.accounts }}</dd>
+    <dt>Archive</dt><dd>{{ counts.archives }}</dd>
+    <dt>Zuordnungen</dt><dd>{{ counts.rules }}</dd>
+    <dt>Drucker</dt><dd>{{ counts.printers }}</dd>
+    <dt>Zustelladressen</dt><dd>{{ counts.addresses }}</dd>
+    <dt>Abholordner</dt><dd>{{ counts.pickups }}</dd>
+  </dl>
+</div>
+"""
+
+SETTINGS_BODY = """
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <div class="card">
+    <h2 style="margin-top:0">Ablage</h2>
+    <div class="row">
+      <div class="field">
+        <label for="fallback_folder">Ordner fuer Anhaenge ohne Treffer</label>
+        <input id="fallback_folder" name="fallback_folder" type="text" value="{{ o.fallback_folder }}">
+      </div>
+      <div class="field">
+        <label for="quarantine_folder">Quarantaene-Ordner</label>
+        <input id="quarantine_folder" name="quarantine_folder" type="text"
+               value="{{ o.quarantine_folder }}">
+      </div>
+      <div class="field">
+        <label for="filename_prefix">Dateiname beginnt mit</label>
+        <select id="filename_prefix" name="filename_prefix">
+          {% for value, text in prefixes.items() %}
+            <option value="{{ value }}" {% if o.filename_prefix == value %}selected{% endif %}>{{ text }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p style="margin:.7rem 0 .2rem"><label><input type="checkbox" name="match_body" value="1"
+      {% if o.match_body %}checked{% endif %}> Stichwoerter auch im Mailtext suchen
+      (sonst nur Dateiname und Betreff)</label></p>
+    <p class="hint" style="margin-bottom:0">Beide Ordner liegen im Standard-Archiv, relativ zu
+    dessen Wurzel. Beispiel fuer den Dateinamen:
+    <code>2026-03-01_lieferant_example.com_Rechnung.pdf</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Gesperrte Dateitypen</h2>
+    <div class="field">
+      <label for="blocked_extensions">Endungen, die immer in die Quarantaene gehen</label>
+      <input id="blocked_extensions" name="blocked_extensions" type="text" style="max-width:100%"
+             value="{{ blocked }}">
+    </div>
+    <p class="hint" style="margin-bottom:0">Gilt auch, wenn ein Stichwort passt und auch fuer
+    Abholordner - so kann &bdquo;Rechnung.exe&ldquo; nie im Rechnungsordner landen. Gedruckt
+    wird so etwas nie. Komma-, Semikolon- oder Leerzeichen-getrennt, ohne Punkt.
+    <strong>Leer heisst: keine Pruefung.</strong></p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Abruf und Grenzwerte</h2>
+    <div class="row">
+      <div class="field">
+        <label for="poll_interval">Abrufintervall (Sekunden)</label>
+        <input id="poll_interval" name="poll_interval" type="number" value="{{ o.poll_interval }}"
+               min="{{ limits.poll_interval[0] }}" max="{{ limits.poll_interval[1] }}">
+      </div>
+      <div class="field">
+        <label for="max_attachment_size_mb">Max. Groesse je Anhang (MB)</label>
+        <input id="max_attachment_size_mb" name="max_attachment_size_mb" type="number"
+               value="{{ o.max_attachment_size_mb }}" min="1">
+      </div>
+      <div class="field">
+        <label for="max_message_size_mb">Max. Groesse je Mail (MB)</label>
+        <input id="max_message_size_mb" name="max_message_size_mb" type="number"
+               value="{{ o.max_message_size_mb }}" min="1">
+      </div>
+      <div class="field">
+        <label for="max_attachments_per_message">Max. Anhaenge je Mail</label>
+        <input id="max_attachments_per_message" name="max_attachments_per_message" type="number"
+               value="{{ o.max_attachments_per_message }}" min="1">
+      </div>
+      <div class="field">
+        <label for="pickup_min_age">Abholordner: fertig nach (Sekunden)</label>
+        <input id="pickup_min_age" name="pickup_min_age" type="number"
+               value="{{ o.pickup_min_age }}" min="0">
+      </div>
+    </div>
+    <p class="hint" style="margin-bottom:0">Das Intervall gilt im Polling-Modus und als
+    Erneuerung bei IDLE. Mails ueber der Maximalgroesse werden gar nicht erst geladen,
+    sondern nur als gelesen markiert (und ggf. in den Ordner fuer zu grosse Mails
+    verschoben). Eine Datei im Abholordner wird erst angefasst, wenn sie so lange
+    unveraendert ist - ein Scan, der noch geschrieben wird, bleibt liegen.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Drucken</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="printing_enabled" value="1"
+      {% if o.printing_enabled %}checked{% endif %}> Drucken erlaubt</label></p>
+    <div class="row">
+      <div class="field">
+        <label for="printable_extensions">Druckbare Dateitypen</label>
+        <input id="printable_extensions" name="printable_extensions" type="text"
+               style="max-width:100%" value="{{ printable }}">
+      </div>
+      <div class="field">
+        <label for="print_timeout">Zeitgrenze je Druckauftrag (Sekunden)</label>
+        <input id="print_timeout" name="print_timeout" type="number"
+               value="{{ o.print_timeout }}" min="5">
+      </div>
+    </div>
+    <p class="hint" style="margin-bottom:0">Ausgeschaltet ist das der Notschalter: es wird
+    nichts gedruckt, egal was bei Postfaechern, Zuordnungen und Adressen steht. Nur die
+    genannten Formate gehen an einen Drucker (leer = Standardliste) - ein .docx ohne
+    Konverter kaeme als Zeichensalat heraus.</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Testmodus</h2>
+    <p style="margin-top:0"><label><input type="checkbox" name="dry_run" value="1"
+      {% if o.dry_run %}checked{% endif %}> Nur protokollieren - nichts ablegen, nichts
+      drucken, keine Mail als gelesen markieren</label></p>
+    <p class="hint" style="margin-bottom:0">Zum Ausprobieren neuer Zuordnungen: im
+    Container-Log steht dann, was passiert waere. Achtung: im Testmodus wird dieselbe
+    Mail bei jedem Durchlauf erneut geprueft.</p>
+  </div>
+
+  <button type="submit">Einstellungen speichern</button>
+  <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
+</form>
+"""
+
 PASSWORD_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Passwort aendern</h2>
@@ -6131,9 +7321,26 @@ PASSWORD_BODY = """
     <button type="submit">Passwort aendern</button>
   </form>
   <p class="hint">Nach der Aenderung werden alle anderen angemeldeten Sitzungen
-  abgemeldet. Ein in der .env gesetztes WEB_PASSWORD wird ab dann ignoriert.</p>
+  abgemeldet. Passwort vergessen? Auf dem Server:
+  <code>docker compose exec mail2nas python -m mail2nas.cli reset-password</code></p>
 </div>
 """
+
+
+def test_imap(account, timeout: int = 20) -> int:
+    """Log in, open the folder, count unseen mail. Raises on any failure."""
+    from imapclient import IMAPClient
+
+    client = IMAPClient(account.host, port=account.port, ssl=account.ssl, timeout=timeout)
+    try:
+        client.login(account.user, account.password)
+        client.select_folder(account.folder, readonly=True)
+        return len(client.search(["UNSEEN"]))
+    finally:
+        try:
+            client.logout()
+        except Exception:  # noqa: BLE001 - the answer is already known
+            pass
 
 
 def create_app(runtime) -> Flask:
@@ -6141,7 +7348,7 @@ def create_app(runtime) -> Flask:
     config, settings = runtime.config, runtime.settings
 
     def storage():
-        """The default archive - looked up per request, because it is editable."""
+        """The default archive, or None - looked up per request, it is editable."""
         return runtime.storage
     app = Flask(__name__)
     app.config.update(
@@ -6185,6 +7392,7 @@ def create_app(runtime) -> Flask:
             title=title,
             body=body,
             logged_in=logged_in(),
+            setup_hint=_setup_hint() if request.endpoint != "overview_page" else "",
             csrf_token=csrf_token(),
             messages=get_flashed_messages(with_categories=True),
         )
@@ -6218,12 +7426,12 @@ def create_app(runtime) -> Flask:
 
     @app.get("/")
     def index():
-        return redirect(url_for("mapping_page") if logged_in() else url_for("login"))
+        return redirect(url_for("overview_page") if logged_in() else url_for("login"))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if logged_in():
-            return redirect(url_for("mapping_page"))
+            return redirect(url_for("overview_page"))
 
         if request.method == "POST":
             require_csrf()
@@ -6242,7 +7450,7 @@ def create_app(runtime) -> Flask:
                 session.permanent = True
                 session["auth_version"] = session_version()
                 logger.info("Web UI: successful login from %s", client)
-                return redirect(url_for("mapping_page"))
+                return redirect(url_for("overview_page"))
 
             throttle.record_failure(client)
             logger.warning("Web UI: failed login from %s", client)
@@ -6258,9 +7466,23 @@ def create_app(runtime) -> Flask:
         flash("Abgemeldet.", "ok")
         return redirect(url_for("login"))
 
+    def _setup_hint() -> str:
+        """One line on every page while something essential is missing."""
+        if runtime.default_archive() is None:
+            return "Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt."
+        if runtime.status.archive.ok is False:
+            return "Das Standard-Archiv ist nicht bereit: " + runtime.status.archive.detail
+        if not runtime.accounts.enabled() and not (runtime.pickups and runtime.pickups.enabled()):
+            return "Noch kein aktives Postfach - es wird keine Mail abgeholt."
+        return ""
+
+    def _changed() -> None:
+        """Tell the supervisor to look at the configuration now, not in 5 s."""
+        runtime.changed.set()
+
     def _printers() -> list:
         """The printers offered in the dropdowns, or none if printing is off."""
-        if runtime.printers is None or not config.printing_enabled:
+        if runtime.printers is None or not runtime.options.printing_enabled:
             return []
         return runtime.printers.all()
 
@@ -6276,10 +7498,10 @@ def create_app(runtime) -> Flask:
         return True, value
 
     def _rules() -> list[Rule]:
-        return load_rules(storage(), runtime.mapping_path)
+        return runtime.rule_store.load()
 
     def _save(rules: list[Rule]) -> None:
-        save_rules(storage(), runtime.mapping_path, rules)
+        runtime.mapping.save(rules)
 
     def _index(rules: list[Rule]) -> int:
         try:
@@ -6299,12 +7521,14 @@ def create_app(runtime) -> Flask:
             rules = []
             flash(str(exc), "error")
 
-        try:
-            folders = storage().list_folders()
-        except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
-            folders = []
-            logger.warning("Web UI: could not list folders (%s)", exc)
-            flash(f"Ordnerliste konnte nicht geladen werden: {exc}", "error")
+        folders, storage_ok = [], False
+        if storage() is not None:
+            try:
+                folders = storage().list_folders()
+                storage_ok = True
+            except Exception as exc:  # noqa: BLE001 - the share may be unreachable right now
+                logger.warning("Web UI: could not list folders (%s)", exc)
+                flash(f"Ordnerliste konnte nicht geladen werden: {exc}", "error")
 
         def folder_options(current: str) -> list[str]:
             # A rule may point at a folder that does not exist yet (it is
@@ -6324,11 +7548,84 @@ def create_app(runtime) -> Flask:
             printers=printers,
             printer_keys=[printer.key for printer in printers],
             **_archive_context(),
-            storage_description=storage().description,
-            mapping_path=runtime.mapping_path,
-            fallback_folder=config.fallback_folder,
-            quarantine_folder=config.quarantine_folder,
+            storage_ok=storage_ok,
+            migration_note=settings.get(SETTING_RULES_NOTE) or "",
+            fallback_folder=runtime.options.fallback_folder,
+            quarantine_folder=runtime.options.quarantine_folder,
         )
+
+    @app.post("/mapping/note/dismiss")
+    @login_required
+    def dismiss_migration_note():
+        require_csrf()
+        settings.set(SETTING_RULES_NOTE, "")
+        return redirect(url_for("mapping_page"))
+
+    @app.get("/mapping/export")
+    @login_required
+    def export_rules():
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        body = (
+            f"# mail2nas - Zuordnungen, exportiert am {stamp}\n"
+            "# Import: Weboberflaeche -> Zuordnungen -> Sichern und uebertragen\n"
+            + dump_rules(_rules())
+        )
+        return body, 200, {
+            "Content-Type": "application/x-yaml; charset=utf-8",
+            "Content-Disposition": f'attachment; filename="mail2nas-mapping-{stamp}.yaml"',
+        }
+
+    @app.post("/mapping/import")
+    @login_required
+    def import_rules():
+        require_csrf()
+        upload = request.files.get("rules_file")
+        try:
+            if upload is None or not upload.filename:
+                raise MappingError("Bitte eine Datei auswaehlen.")
+            try:
+                text = upload.read().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise MappingError("Die Datei ist kein UTF-8-Text.") from None
+            imported = rules_from_yaml(text)
+            replace_all = request.form.get("mode") == "replace"
+            rules = [] if replace_all else _rules()
+            added = skipped = 0
+            for rule in imported:
+                try:
+                    keyword = validate_keyword(rule.keyword, rules)
+                except MappingError:
+                    skipped += 1
+                    continue
+                folder = validate_folder(rule.folder)
+                known = {a.key for a in runtime.accounts.all()}
+                account = rule.account if rule.account in known else ALL_ACCOUNTS
+                printers = {p.key for p in (runtime.printers.all() if runtime.printers else [])}
+                archives = {a.key for a in _archives()}
+                rules.append(
+                    Rule.create(
+                        keyword,
+                        folder,
+                        account,
+                        rule.print_attachments,
+                        rule.printer if rule.printer in printers else "",
+                        rule.archive if rule.archive in archives else "",
+                    )
+                )
+                added += 1
+            _save(rules)
+        except MappingError as exc:
+            flash(f"Import abgebrochen: {exc}", "error")
+        else:
+            logger.info("Web UI: imported %d rule(s), skipped %d", added, skipped)
+            flash(
+                f"{added} Zuordnung(en) importiert"
+                + (f", {skipped} uebersprungen (Stichwort gab es schon)" if skipped else "")
+                + ". Postfaecher, Drucker und Archive, die es hier nicht gibt, wurden auf "
+                "den Standard gesetzt.",
+                "ok",
+            )
+        return redirect(url_for("mapping_page"))
 
     @app.post("/mapping/add")
     @login_required
@@ -6344,7 +7641,11 @@ def create_app(runtime) -> Flask:
             printing, printer = _print_choice(request.form.get("printer", ""))
             archive = _archive_choice(request.form.get("archive", ""))
             if new_folder:
-                _archive_storage(archive).create_folder(folder)
+                try:
+                    _archive_storage(archive).create_folder(folder)
+                except Exception as exc:  # noqa: BLE001 - the rule is still worth saving
+                    flash(f"Ordner konnte noch nicht angelegt werden ({exc}) - das passiert "
+                          "beim ersten Anhang.", "error")
             rules.append(Rule.create(keyword, folder, account, printing, printer, archive))
             _save(rules)
         except MappingError as exc:
@@ -6459,59 +7760,123 @@ def create_app(runtime) -> Flask:
             archives=_archives(),
             pickups=_pickup_rows(),
             pickup_interval=PICKUP_INTERVAL,
-            blocked_extensions=", ".join(sorted(runtime.blocked_extensions)),
-            pickup_min_age=runtime.pickup_min_age,
-            printing_enabled=config.printing_enabled,
-            mapping_path=runtime.mapping_path,
-            storage_description=storage().description,
-            storage_backend=config.storage_backend,
-            fallback_folder=config.fallback_folder,
-            quarantine_folder=config.quarantine_folder,
-            match_body=config.match_body,
-            filename_prefix=config.filename_prefix,
-            poll_interval=config.poll_interval,
-            dry_run=config.dry_run,
+            printing_enabled=runtime.options.printing_enabled,
         )
 
-    @app.post("/config/settings")
-    @login_required
-    def save_settings():
-        require_csrf()
-        extensions = runtime.set_blocked_extensions(request.form.get("blocked_extensions", ""))
-        try:
-            age = runtime.set_pickup_min_age(request.form.get("pickup_min_age", "20").strip() or 0)
-        except (TypeError, ValueError):
-            age = runtime.pickup_min_age
-            flash("Die Wartezeit muss eine Zahl sein - sie blieb unveraendert.", "error")
-        logger.info(
-            "Web UI: quarantine list set to %d extension(s), pickup age %ss",
-            len(extensions),
-            age,
-        )
-        if extensions:
-            flash("Einstellungen gespeichert.", "ok")
-        else:
-            flash(
-                "Einstellungen gespeichert. Achtung: ohne gesperrte Endungen wird "
-                "nichts mehr in die Quarantaene verschoben.",
-                "error",
-            )
-        return redirect(url_for("config_page"))
+    # --- general settings ----------------------------------------------------
 
-    @app.post("/config/mapping-path")
+    @app.route("/settings", methods=["GET", "POST"])
     @login_required
-    def move_mapping():
-        require_csrf()
-        try:
-            runtime.set_mapping_path(request.form.get("mapping_path", ""))
-        except MappingError as exc:
-            flash(str(exc), "error")
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Web UI: could not move the mapping file")
-            flash(f"Verschieben fehlgeschlagen: {exc}", "error")
-        else:
-            flash(f"Mapping-Datei liegt jetzt unter {runtime.mapping_path}.", "ok")
-        return redirect(url_for("config_page"))
+    def settings_page():
+        options = runtime.options
+        if request.method == "POST":
+            require_csrf()
+            try:
+                new = validate_options(request.form, options)
+            except OptionsError as exc:
+                flash(str(exc), "error")
+            else:
+                runtime.set_options(new)
+                logger.info("Web UI: settings saved")
+                if not new.blocked_extensions:
+                    flash("Gespeichert. Achtung: ohne gesperrte Dateiendungen wird nichts mehr "
+                          "in die Quarantaene verschoben.", "error")
+                elif new.dry_run and not options.dry_run:
+                    flash("Gespeichert. Der Testmodus ist jetzt an - es wird nichts abgelegt.",
+                          "error")
+                else:
+                    flash("Einstellungen gespeichert.", "ok")
+                return redirect(url_for("settings_page"))
+        return render(
+            SETTINGS_BODY,
+            "Einstellungen",
+            o=options,
+            prefixes=FILENAME_PREFIXES,
+            limits=LIMITS,
+            blocked=", ".join(sorted(options.blocked_extensions)),
+            printable=", ".join(sorted(options.printable_extensions)),
+        )
+
+    # --- overview --------------------------------------------------------------
+
+    def _when(timestamp) -> str:
+        if not timestamp:
+            return ""
+        return datetime.fromtimestamp(timestamp).strftime("%d.%m. %H:%M:%S")
+
+    @app.get("/overview")
+    @login_required
+    def overview_page():
+        archives = _archives()
+        accounts = runtime.accounts.all()
+        rules = runtime.rule_store.count()
+        printers = runtime.printers.all() if runtime.printers else []
+        steps = [
+            SimpleNamespace(
+                title="Archiv einrichten",
+                hint="wohin abgelegt wird - SMB-Freigabe auf dem NAS, mit Verbindungstest",
+                url=url_for("new_archive") if not archives else url_for(
+                    "edit_archive", archive_id=archives[0].id),
+                done=bool(archives) and runtime.status.archive.ok is not False,
+            ),
+            SimpleNamespace(
+                title="Postfach anlegen",
+                hint="woher die Mails kommen (IMAP), mit Anmeldetest",
+                url=url_for("new_account"),
+                done=bool(accounts),
+            ),
+            SimpleNamespace(
+                title="Zuordnungen anlegen",
+                hint="welches Stichwort in welchen Ordner - oder eine alte mapping.yaml importieren",
+                url=url_for("mapping_page"),
+                done=rules > 0,
+            ),
+            SimpleNamespace(
+                title="Drucker (optional)",
+                hint="einmal anlegen, dann je Postfach, Zuordnung oder Adresse auswaehlen",
+                url=url_for("new_printer") if not printers else url_for("config_page"),
+                done=bool(printers),
+            ),
+        ]
+        board = runtime.status.workers()
+        names = {f"account:{a.id}": a.name for a in accounts}
+        workers = []
+        for key, row in sorted(board.items()):
+            if key.startswith("account:") and key not in names:
+                continue
+            workers.append(SimpleNamespace(
+                label=names.get(key, "Abholordner" if key == "pickups" else row.label),
+                state=row.state,
+                detail=row.detail,
+                processed=row.processed,
+                last_ok=_when(row.last_ok),
+                last_error=row.last_error,
+                last_error_at=_when(row.last_error_at),
+            ))
+        supervisor = getattr(runtime, "supervisor", None)
+        problems = list(supervisor.pickup_problems().values()) if supervisor else []
+        return render(
+            OVERVIEW_BODY,
+            "Uebersicht",
+            steps=steps,
+            steps_open=not all(step.done for step in steps[:3]),
+            archive_status=runtime.status.archive,
+            workers=workers,
+            pickup_problems=problems,
+            ready=runtime.status.archive.ok,
+            dry_run=runtime.options.dry_run,
+            initial_password=read_initial_password(config.data_dir) is not None,
+            now=_when(time.time()),
+            started=_when(runtime.status.started_at),
+            counts=SimpleNamespace(
+                accounts=len(accounts),
+                archives=len(archives),
+                rules=rules,
+                printers=len(printers),
+                addresses=len(runtime.addresses.all()) if runtime.addresses else 0,
+                pickups=len(runtime.pickups.all()) if runtime.pickups else 0,
+            ),
+        )
 
     def _account_form(account=None):
         """Read the account form, keeping the stored password if left empty."""
@@ -6572,6 +7937,7 @@ def create_app(runtime) -> Flask:
             except MappingError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: added IMAP account %r", request.form.get("host"))
                 flash("Postfach angelegt.", "ok")
                 return redirect(url_for("config_page"))
@@ -6592,6 +7958,7 @@ def create_app(runtime) -> Flask:
             except MappingError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: updated IMAP account %s", account_id)
                 flash("Postfach gespeichert.", "ok")
                 return redirect(url_for("config_page"))
@@ -6603,9 +7970,31 @@ def create_app(runtime) -> Flask:
     def delete_account(account_id: int):
         require_csrf()
         runtime.accounts.delete(account_id)
+        _changed()
         logger.info("Web UI: deleted IMAP account %s", account_id)
         flash("Postfach geloescht.", "ok")
         return redirect(url_for("config_page"))
+
+    @app.post("/config/accounts/<int:account_id>/test")
+    @login_required
+    def test_account(account_id: int):
+        require_csrf()
+        account = runtime.accounts.get(account_id)
+        if account is None:
+            flash("Dieses Postfach gibt es nicht mehr.", "error")
+            return redirect(url_for("config_page"))
+        try:
+            unseen = test_imap(account)
+        except Exception as exc:  # noqa: BLE001 - report every failure in the UI
+            logger.info("Web UI: IMAP test for %s failed: %s", account.host, exc)
+            flash(f"Anmeldung fehlgeschlagen: {exc}", "error")
+        else:
+            flash(
+                f"Angemeldet, Ordner {account.folder} geoeffnet - "
+                f"{unseen} ungelesene Mail(s) warten dort.",
+                "ok",
+            )
+        return redirect(url_for("edit_account", account_id=account_id))
 
     # --- archives -------------------------------------------------------------
 
@@ -6664,6 +8053,7 @@ def create_app(runtime) -> Flask:
             except ArchiveError as exc:
                 flash(str(exc), "error")
             else:
+                _changed()
                 logger.info("Web UI: added archive %r", request.form.get("name"))
                 flash("Archiv angelegt. Mit „Verbindung testen\" pruefen, ob es erreichbar ist.", "ok")
                 return redirect(url_for("config_page"))
@@ -6692,7 +8082,7 @@ def create_app(runtime) -> Flask:
             else:
                 logger.info("Web UI: updated archive %s", archive_id)
                 flash("Archiv gespeichert.", "ok")
-                runtime.mapping_path_changed.set()
+                _changed()
                 return redirect(url_for("config_page"))
             archive = archives.get(archive_id)
         return render(ARCHIVE_BODY, "Archiv", archive=archive)
@@ -6726,7 +8116,7 @@ def create_app(runtime) -> Flask:
             return redirect(url_for("config_page"))
         archives.delete(archive_id)
         logger.info("Web UI: deleted archive %s", archive_id)
-        runtime.mapping_path_changed.set()
+        _changed()
         flash(
             "Archiv geloescht. Zuordnungen, Zustelladressen und Abholordner, die darauf "
             "zeigten, nutzen jetzt das Standard-Archiv.",
@@ -7095,16 +8485,15 @@ def create_app(runtime) -> Flask:
             elif new == current:
                 flash("Das neue Passwort ist mit dem alten identisch.", "error")
             else:
-                settings.set(SETTING_PASSWORD_HASH, generate_password_hash(new))
-                # Invalidate every session, including this one, then log this
-                # browser back in - so a stolen cookie stops working.
-                settings.set(SETTING_SESSION_VERSION, str(int(session_version()) + 1))
+                # Invalidates every session, including this one; this browser
+                # is logged back in below - so a stolen cookie stops working.
+                set_password(settings, new, config.data_dir)
                 session.clear()
                 session.permanent = True
                 session["auth_version"] = session_version()
                 logger.info("Web UI: password changed")
                 flash("Passwort geaendert.", "ok")
-                return redirect(url_for("mapping_page"))
+                return redirect(url_for("overview_page"))
 
         return render(PASSWORD_BODY, "Passwort", min_length=MIN_PASSWORD_LENGTH)
 
@@ -7120,26 +8509,96 @@ def _secret_key(settings) -> str:
     return key
 
 
-def ensure_password(settings, initial_password: str) -> None:
-    """Take the initial password from the configuration, once.
+INITIAL_PASSWORD_FILE = "initial-password.txt"
+# No 0/O, 1/l/I: the password is read off a terminal and typed into a browser.
+_PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
-    Raises SystemExit if there is neither a stored password nor one in the
-    configuration - starting a password-protected UI without a password would
-    either lock the user out or, worse, not.
+
+def generate_password() -> str:
+    """A random password that survives being read aloud: 4 x 4 characters."""
+    chars = "".join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(16))
+    return "-".join(chars[i : i + 4] for i in range(0, 16, 4))
+
+
+def initial_password_path(data_dir: str | None) -> str | None:
+    return os.path.join(data_dir, INITIAL_PASSWORD_FILE) if data_dir else None
+
+
+def _write_initial_password(data_dir: str | None, password: str) -> None:
+    path = initial_password_path(data_dir)
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(password + "\n")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning("Could not write %s (%s) - the password is only in this log", path, exc)
+
+
+def read_initial_password(data_dir: str | None) -> str | None:
+    path = initial_password_path(data_dir)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def set_password(settings, new_password: str, data_dir: str | None = None) -> None:
+    """Store a new password and log every session out.
+
+    The generated first password is removed from disk at the same time: once
+    somebody chose their own, a readable copy of the old one has no purpose.
+    """
+    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(new_password))
+    version = settings.get(SETTING_SESSION_VERSION) or "1"
+    settings.set(SETTING_SESSION_VERSION, str(int(version) + 1))
+    path = initial_password_path(data_dir)
+    if path:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not remove %s (%s)", path, exc)
+
+
+def ensure_password(settings, initial_password: str = "", data_dir: str | None = None) -> str | None:
+    """Make sure the UI has a password. Returns it if one was generated.
+
+    Order of preference: a stored hash (the user's own choice, or the first
+    password from an earlier start), then WEB_PASSWORD from an older `.env`,
+    then a random one. The random one is written to `initial-password.txt`
+    next to the database (mode 0600) - that is where the installer reads it
+    from to show it - and logged once, so a plain `docker compose logs`
+    finds it too. Either way it is meant to be changed after the first login.
     """
     if settings.get(SETTING_PASSWORD_HASH):
-        return
-    if not initial_password:
-        raise SystemExit(
-            "WEB_ENABLED=true, but no password is set. Put an initial password in "
-            "WEB_PASSWORD (it is hashed on first start and can be changed in the UI)."
+        return None
+    if initial_password and len(initial_password) >= MIN_PASSWORD_LENGTH:
+        settings.set(SETTING_PASSWORD_HASH, generate_password_hash(initial_password))
+        logger.info("Web UI: initial password taken from WEB_PASSWORD")
+        return None
+    if initial_password:
+        logger.error(
+            "WEB_PASSWORD is shorter than %d characters - generating a random one instead",
+            MIN_PASSWORD_LENGTH,
         )
-    if len(initial_password) < MIN_PASSWORD_LENGTH:
-        raise SystemExit(
-            f"WEB_PASSWORD must be at least {MIN_PASSWORD_LENGTH} characters long."
-        )
-    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(initial_password))
-    logger.info("Web UI: initial password taken from WEB_PASSWORD")
+
+    password = generate_password()
+    settings.set(SETTING_PASSWORD_HASH, generate_password_hash(password))
+    _write_initial_password(data_dir, password)
+    logger.warning(
+        "Web UI: no password was set, generated one: %s  (also in %s - "
+        "please change it after the first login)",
+        password,
+        initial_password_path(data_dir) or "nowhere else",
+    )
+    return password
 
 
 def serve(runtime) -> threading.Thread:
@@ -7152,7 +8611,7 @@ def serve(runtime) -> threading.Thread:
     from waitress import create_server
 
     config = runtime.config
-    ensure_password(runtime.settings, config.web_password)
+    ensure_password(runtime.settings, config.web_password, config.data_dir)
     app = create_app(runtime)
     try:
         server = create_server(app, host=config.web_host, port=config.web_port, threads=4)
@@ -7177,18 +8636,17 @@ import sys
 import threading
 import time
 
-from . import printing as printing_module
-from . import storage as storage_module
-from .accounts import AccountStore, seed_from_config
+from .accounts import AccountStore
 from .addresses import AddressStore
 from .archiver import Archiver
 from .archives import ArchiveStore
-from .archives import seed_from_config as seed_archive_from_config
 from .config import Config
+from .legacy import LegacyEnv
+from .mapping import RuleStore
+from .migrate import migrate_rule_file, rules_settled, seed_from_legacy
 from .pickups import PICKUP_INTERVAL, PickupStore
 from .printers import PrinterStore
-from .printers import seed_from_config as seed_printer_from_config
-from .runtime import SETTING_MAPPING_PATH, Runtime
+from .runtime import Runtime
 from .scanning import PickupRunner
 from .state import ProcessedStore, SettingsStore
 
@@ -7198,6 +8656,34 @@ logger = logging.getLogger("mail2nas")
 # removed in the web UI. Short enough to feel immediate, long enough to be
 # free.
 SUPERVISOR_INTERVAL = 5
+# How often an archive that failed its write test is tried again.
+ARCHIVE_RETRY = 60
+# IMAP IDLE is waited on in short slices, so stopping a worker (because its
+# settings changed) takes a few seconds instead of up to a whole interval.
+IDLE_SLICE = 5
+# RFC 2177: re-issue IDLE before 29 minutes, or the server may drop us.
+MAX_IDLE = 29 * 60
+
+
+def build_runtime(config: Config, environ=None) -> Runtime:
+    """Open the database, bring an older installation up to date, wire it up."""
+    settings = SettingsStore(config.state_db_path)
+    # Before anything is written: the file holds IMAP and SMB passwords.
+    _protect_state_file(config.state_db_path)
+    printers = PrinterStore(config.state_db_path)
+    runtime = Runtime(
+        config,
+        settings,
+        AccountStore(config.state_db_path),
+        ProcessedStore(config.state_db_path),
+        RuleStore(config.state_db_path),
+        printers=printers,
+        addresses=AddressStore(config.state_db_path),
+        archives=ArchiveStore(config.state_db_path),
+        pickups=PickupStore(config.state_db_path),
+    )
+    seed_from_legacy(runtime, LegacyEnv.from_environ(environ))
+    return runtime
 
 
 def main() -> None:
@@ -7208,96 +8694,45 @@ def main() -> None:
     )
 
     config = Config.from_env()
-    env_storage = storage_module.from_config(config)
+    runtime = build_runtime(config)
 
-    settings = SettingsStore(config.state_db_path)
-    accounts = AccountStore(config.state_db_path)
-    # Before seeding: from here on the file contains IMAP passwords.
-    _protect_state_file(config.state_db_path)
-    seed_from_config(accounts, settings, config)
+    if os.environ.get("WEB_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
+        # The web UI is the only place left to configure anything, so it
+        # cannot be switched off any more. Say so instead of silently ignoring.
+        logger.warning("WEB_ENABLED=false is ignored - the web UI is where mail2nas is configured")
 
-    printers = PrinterStore(config.state_db_path)
-    seed_printer_from_config(printers, settings, config)
-    printing = printing_module.from_config(config, printers)
-    addresses = AddressStore(config.state_db_path)
-    archives = ArchiveStore(config.state_db_path)
-    seed_archive_from_config(archives, settings, config)
-    pickups = PickupStore(config.state_db_path)
+    # Imported here so the modules above stay importable without Flask.
+    from . import web
 
-    mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
-    store = ProcessedStore(config.state_db_path)
-    runtime = Runtime(
-        config,
-        env_storage,
-        None,  # the mapping needs the default archive, which Runtime resolves
-        store,
-        settings,
-        accounts,
-        printers=printers,
-        printing=printing,
-        addresses=addresses,
-        archives=archives,
-        pickups=pickups,
-    )
-    # Fail fast: an unreachable share is otherwise indistinguishable from an
-    # empty one, and attachments would land somewhere they silently vanish.
-    runtime.storage.check_writable()
-    runtime.attach_mapping(mapping_path)
-    _check_other_archives(runtime)
+    web.serve(runtime)
 
-    if config.web_enabled:
-        # Imported lazily so the archiver still runs if the web dependencies
-        # are missing (e.g. an older image built before the UI existed).
-        from . import web
-
-        web.serve(runtime)
-
+    options = runtime.options
     logger.info(
-        "Starting mail2nas: archive=%s mapping=%s archives=%d printers=%d addresses=%d "
+        "Starting mail2nas: mailboxes=%d archives=%d rules=%d printers=%d addresses=%d "
         "pickups=%d dry_run=%s",
-        runtime.storage.description,
-        mapping_path,
-        len(archives.enabled()) or 1,
-        len(printers.enabled()) if config.printing_enabled else 0,
-        len(addresses.enabled()),
-        len(pickups.enabled()),
-        config.dry_run,
+        len(runtime.accounts.enabled()),
+        len(runtime.archives.enabled()),
+        runtime.rule_store.count(),
+        len(runtime.printers.enabled()) if options.printing_enabled else 0,
+        len(runtime.addresses.enabled()),
+        len(runtime.pickups.enabled()),
+        options.dry_run,
     )
 
+    supervisor = Supervisor(runtime)
     try:
-        _supervise(runtime)
+        supervisor.run()
     finally:
-        store.close()
+        supervisor.stop_all()
+        runtime.store.close()
         runtime.storages.close()
-        env_storage.close()
-
-
-def _check_other_archives(runtime: Runtime) -> None:
-    """Report archives besides the default one, without refusing to start.
-
-    The default archive is fatal when it is unreachable - nothing can be
-    filed at all. A second NAS being down is different: everything else keeps
-    working, and the mails meant for it are simply retried until it is back.
-    """
-    if runtime.archives is None:
-        return
-    default = runtime.archives.default()
-    for archive in runtime.archives.enabled():
-        if default is not None and archive.id == default.id:
-            continue
-        try:
-            archive.to_storage().check_writable()
-        except SystemExit as exc:
-            logger.error("Archive %r is not usable: %s", archive.name, exc)
-        except Exception as exc:  # noqa: BLE001 - never fail startup over a second archive
-            logger.error("Archive %r is not usable: %s", archive.name, exc)
-        else:
-            logger.info("Archive %r -> %s", archive.name, archive.location())
 
 
 def _protect_state_file(path: str) -> None:
-    """The state database holds IMAP passwords, so nobody else may read it."""
+    """The state database holds passwords, so nobody else may read it."""
     try:
+        if not os.path.exists(path):
+            open(path, "a").close()
         os.chmod(path, 0o600)
     except OSError as exc:
         logger.warning("Could not restrict permissions on %s (%s)", path, exc)
@@ -7314,6 +8749,7 @@ class _Worker:
     def __init__(self, runtime: Runtime, account):
         self.account = account
         self.fingerprint = account.fingerprint()
+        self.key = f"account:{account.id}"
         self._runtime = runtime
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -7321,6 +8757,7 @@ class _Worker:
         )
 
     def start(self) -> None:
+        self._runtime.status.worker(self.key, self.account.name)
         self._thread.start()
 
     def stop(self) -> None:
@@ -7329,19 +8766,21 @@ class _Worker:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
+    def _interval(self) -> int:
+        return self._runtime.options.poll_interval
+
     def _run(self) -> None:
-        config = self._runtime.config
+        runtime = self._runtime
         archiver = Archiver(
-            config,
-            self._runtime.mapping,
-            self._runtime.store,
-            self._runtime.storage,
+            lambda: runtime.options,
+            runtime.mapping,
+            runtime.store,
+            runtime.storages,
             self.account,
-            self._runtime.printing,
-            self._runtime.addresses,
-            self._runtime.storages,
-            lambda: self._runtime.blocked_extensions,
+            runtime.printing,
+            runtime.addresses,
         )
+        status = runtime.status
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(
             "Account %s: watching %s on %s (%s mode)",
@@ -7352,15 +8791,15 @@ class _Worker:
         )
 
         while not self._stop.is_set():
+            status.set(self.key, "verbindet")
             try:
                 client = archiver.connect()
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "Account %s: IMAP connection failed, retrying in %ss",
-                    label,
-                    config.poll_interval,
+                    "Account %s: IMAP connection failed, retrying in %ss", label, self._interval()
                 )
-                self._stop.wait(config.poll_interval)
+                status.error(self.key, f"Verbindung fehlgeschlagen: {exc}")
+                self._stop.wait(self._interval())
                 continue
 
             try:
@@ -7368,41 +8807,47 @@ class _Worker:
                     self._run_idle(archiver, client, label)
                 else:
                     self._run_poll(archiver, client, label)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "Account %s: IMAP session failed, reconnecting in %ss",
-                    label,
-                    config.poll_interval,
+                    "Account %s: IMAP session failed, reconnecting in %ss", label, self._interval()
                 )
+                status.error(self.key, f"Sitzung abgebrochen: {exc}")
             finally:
                 try:
                     client.logout()
                 except Exception:
                     pass
-            self._stop.wait(config.poll_interval)
+            self._stop.wait(self._interval())
 
+        status.set(self.key, "gestoppt")
         logger.info("Account %s: stopped", label)
 
     def _cycle(self, archiver: Archiver, client, label: str) -> None:
         count = archiver.run_once(client)
+        status = self._runtime.status
         if count:
             logger.info("Account %s: processed %d message(s)", label, count)
+            status.processed(self.key, count)
+        status.set(self.key, "verbunden", "IDLE" if self.account.mode == "idle" else "Polling")
 
     def _run_poll(self, archiver: Archiver, client, label: str) -> None:
         while not self._stop.is_set():
             self._cycle(archiver, client, label)
-            self._stop.wait(self._runtime.config.poll_interval)
+            self._stop.wait(self._interval())
 
     def _run_idle(self, archiver: Archiver, client, label: str) -> None:
         self._cycle(archiver, client, label)
-        idle_timeout = self._runtime.config.poll_interval or 300
         while not self._stop.is_set():
+            deadline = time.monotonic() + min(max(self._interval(), IDLE_SLICE), MAX_IDLE)
             client.idle()
             try:
-                client.idle_check(timeout=idle_timeout)
+                while not self._stop.is_set() and time.monotonic() < deadline:
+                    if client.idle_check(timeout=IDLE_SLICE):
+                        break
             finally:
                 client.idle_done()
-            self._cycle(archiver, client, label)
+            if not self._stop.is_set():
+                self._cycle(archiver, client, label)
 
 
 def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
@@ -7417,13 +8862,14 @@ def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
     for account_id, worker in list(workers.items()):
         account = wanted.get(account_id)
         if account is None or account.fingerprint() != worker.fingerprint:
-            # Settings changed or the account is gone. The worker notices at
-            # the end of its current cycle, so a reconnect can lag by up to
-            # one poll interval.
+            # Settings changed or the account is gone. The worker notices
+            # within a few seconds (see IDLE_SLICE).
             if account is not None:
                 logger.info("Account %s: configuration changed, restarting", account.name)
             worker.stop()
             del workers[account_id]
+            if account is None:
+                runtime.status.forget(f"account:{account_id}")
         elif not worker.is_alive():
             del workers[account_id]
 
@@ -7436,58 +8882,139 @@ def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
     return workers
 
 
-def _make_pickup_runner(runtime: Runtime) -> PickupRunner | None:
-    if runtime.pickups is None:
-        return None
-    return PickupRunner(
-        runtime.config,
-        runtime.mapping,
-        runtime.storages,
-        runtime.pickups,
-        printing=runtime.printing,
-        blocked_extensions=lambda: runtime.blocked_extensions,
-        min_age_seconds=runtime.pickup_min_age,
-    )
+class Supervisor:
+    """Keeps the workers in line with what is configured in the UI.
 
+    Nothing is started before the service is *ready*: an archive exists and
+    passed its write test, and the rules of an older installation have been
+    taken over. Filing mail before that would put it into a directory that
+    may not be the share, or file it without its rules.
+    """
 
-def _supervise(runtime: Runtime) -> None:
-    """Keep one worker per enabled account, following changes made in the UI."""
-    workers: dict[int, _Worker] = {}
-    idle_warning_shown = False
-    pickup = _make_pickup_runner(runtime)
-    next_pickup = 0.0
-    try:
-        while True:
-            reconcile(runtime, workers)
+    def __init__(self, runtime: Runtime, factory=None):
+        self.runtime = runtime
+        self.workers: dict[int, object] = {}
+        self._factory = factory
+        self._pickup = (
+            PickupRunner(
+                lambda: runtime.options,
+                runtime.mapping,
+                runtime.storages,
+                runtime.pickups,
+                printing=runtime.printing,
+            )
+            if runtime.pickups is not None
+            else None
+        )
+        self._next_pickup = 0.0
+        self._was_ready: bool | None = None
 
-            # Folders are walked on their own schedule: the supervisor wakes
-            # up every few seconds to notice UI changes, which is far more
-            # often than a share should be listed over SMB.
-            if pickup is not None and time.monotonic() >= next_pickup:
-                pickup.min_age_seconds = runtime.pickup_min_age
-                try:
-                    filed = pickup.run_once()
-                    if filed:
-                        logger.info("Picked up %d document(s) from the watched folders", filed)
-                except Exception:  # noqa: BLE001 - never let this stop the supervisor
-                    logger.exception("Pickup cycle failed")
-                next_pickup = time.monotonic() + PICKUP_INTERVAL
+    # --- readiness -------------------------------------------------------------
 
-            if not workers and not idle_warning_shown:
-                # Once, not on every pass - this loop runs every few seconds.
+    def check_archive(self) -> bool:
+        """Write-test the default archive when it changed, or retry a failure."""
+        runtime = self.runtime
+        status = runtime.status.archive
+        archive = runtime.default_archive()
+        if archive is None:
+            status.ok, status.detail, status.fingerprint = False, "Kein Archiv eingerichtet.", ()
+            return False
+
+        fingerprint = (archive.id, *archive.fingerprint())
+        due = status.checked_at is None or (
+            not status.ok and time.time() - status.checked_at >= ARCHIVE_RETRY
+        )
+        if fingerprint == status.fingerprint and not due:
+            return bool(status.ok)
+
+        status.fingerprint = fingerprint
+        status.checked_at = time.time()
+        try:
+            runtime.storages.get(archive.key).check_writable()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit is how check_writable reports
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            status.ok, status.detail = False, str(exc) or exc.__class__.__name__
+            logger.error("Archive %r is not usable: %s", archive.name, status.detail)
+            return False
+
+        status.ok = True
+        status.detail = f"{archive.location()} ist erreichbar und beschreibbar."
+        if archive.backend == "local" and not os.path.ismount(archive.path):
+            # Not fatal - a directory on the container's own disk is a valid
+            # (if unusual) choice - but it is exactly what a missing bind mount
+            # looks like, and then every attachment would vanish with the next
+            # rebuild. So it is said loudly.
+            status.detail += (
+                " Achtung: das Verzeichnis ist kein Mountpoint - ist das Share "
+                "wirklich eingebunden?"
+            )
+            logger.warning("Archive %r: %s is not a mount point", archive.name, archive.path)
+        logger.info("Archive %r -> %s", archive.name, archive.location())
+        return True
+
+    def ready(self) -> bool:
+        runtime = self.runtime
+        if not self.check_archive():
+            return False
+        if not rules_settled(runtime.settings):
+            migrate_rule_file(runtime.settings, runtime.rule_store, runtime.storage)
+            runtime.mapping.reload()
+        return rules_settled(runtime.settings)
+
+    # --- the loop ----------------------------------------------------------------
+
+    def step(self) -> None:
+        runtime = self.runtime
+        ready = self.ready()
+        if ready != self._was_ready:
+            if ready:
+                logger.info("Ready - watching the configured mailboxes and folders")
+            else:
                 logger.warning(
-                    "No enabled IMAP account configured - nothing is being watched. "
-                    "Add one in the web UI."
+                    "Not ready yet (%s) - nothing is archived until the web UI shows an "
+                    "archive that works",
+                    runtime.status.archive.detail or "rules not taken over yet",
                 )
-            idle_warning_shown = bool(not workers)
+            self._was_ready = ready
 
-            runtime.mapping_path_changed.wait(SUPERVISOR_INTERVAL)
-            if runtime.mapping_path_changed.is_set():
-                runtime.mapping_path_changed.clear()
-                runtime.apply_mapping_path()
-    finally:
-        for worker in workers.values():
+        if not ready:
+            self.stop_all()
+            return
+
+        reconcile(runtime, self.workers, self._factory)
+
+        # Folders are walked on their own schedule: the supervisor wakes up
+        # every few seconds to notice UI changes, which is far more often than
+        # a share should be listed over SMB.
+        if self._pickup is not None and time.monotonic() >= self._next_pickup:
+            try:
+                filed = self._pickup.run_once()
+                if filed:
+                    logger.info("Picked up %d document(s) from the watched folders", filed)
+                    runtime.status.processed("pickups", filed)
+            except Exception:  # noqa: BLE001 - never let this stop the supervisor
+                logger.exception("Pickup cycle failed")
+            self._next_pickup = time.monotonic() + PICKUP_INTERVAL
+
+    def pickup_problems(self) -> dict[int, str]:
+        return self._pickup.problems() if self._pickup is not None else {}
+
+    def run(self) -> None:
+        runtime = self.runtime
+        runtime.supervisor = self
+        while True:
+            self.step()
+            runtime.changed.wait(SUPERVISOR_INTERVAL)
+            if runtime.changed.is_set():
+                runtime.changed.clear()
+                # An archive may have been edited: test it again right away.
+                runtime.status.archive.checked_at = None
+
+    def stop_all(self) -> None:
+        for worker in self.workers.values():
             worker.stop()
+        self.workers.clear()
 
 
 if __name__ == "__main__":
@@ -7498,7 +9025,6 @@ MAIL2NAS_EOF
 cat > tests/test_mapping.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
-import os
 import textwrap
 
 import pytest
@@ -7507,35 +9033,43 @@ from mail2nas.mapping import (
     Mapping,
     MappingError,
     Rule,
-    load_rules,
+    RuleStore,
+    dump_rules,
     move_rule,
-    save_rules,
+    rules_from_yaml,
     set_printing,
     validate_keyword,
 )
-from mail2nas.storage import LocalStorage
+
+
+def _store(tmp_path) -> RuleStore:
+    return RuleStore(str(tmp_path / "state.db"))
 
 
 def _write_rules(tmp_path, rules) -> None:
-    """Write rules in the current format, as (keyword, folder[, account])."""
-    save_rules(
-        LocalStorage(str(tmp_path)),
-        "mapping.yaml",
-        [Rule.create(*rule) for rule in rules],
-    )
+    """Store rules as (keyword, folder[, account]) tuples."""
+    _store(tmp_path).save([Rule.create(*rule) for rule in rules])
 
 
 def _write_mapping(path, content: str) -> None:
-    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    """Store the rules of a YAML snippet - as an import or the migration would."""
+    _store(path.parent).save(rules_from_yaml(textwrap.dedent(content)))
 
 
-def _mapping(tmp_path, fallback_folder="unsorted", relative="mapping.yaml") -> Mapping:
-    return Mapping(LocalStorage(str(tmp_path)), relative, fallback_folder=fallback_folder)
+def _mapping(tmp_path, fallback_folder="unsorted") -> Mapping:
+    return Mapping(_store(tmp_path), fallback_folder)
+
+
+def load_rules(tmp_path) -> list[Rule]:
+    return _store(tmp_path).load()
+
+
+def save_rules(tmp_path, rules) -> None:
+    _store(tmp_path).save(rules)
 
 
 def test_resolve_matches_case_insensitive(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, """
+    _write_mapping(tmp_path / "mapping.yaml", """
         RE: rechnungen
         LS: lieferscheine
     """)
@@ -7548,8 +9082,7 @@ def test_resolve_matches_case_insensitive(tmp_path):
 
 
 def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+    _write_mapping(tmp_path / "mapping.yaml", "RE: rechnungen\n")
     mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Newsletter August")
@@ -7558,9 +9091,17 @@ def test_resolve_falls_back_when_no_keyword_matches(tmp_path):
     assert keyword is None
 
 
-def test_resolve_prefers_longer_keyword_match(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, """
+def test_the_fallback_follows_the_settings_page(tmp_path):
+    current = {"folder": "unsorted"}
+    mapping = Mapping(_store(tmp_path), lambda: current["folder"])
+
+    current["folder"] = "sonstiges"
+
+    assert mapping.resolve("Newsletter")[0] == "sonstiges"
+
+
+def test_an_old_flat_file_keeps_its_longest_keyword_first_priority(tmp_path):
+    _write_mapping(tmp_path / "mapping.yaml", """
         RE: rechnungen
         Rechnungskorrektur: korrekturen
     """)
@@ -7572,8 +9113,8 @@ def test_resolve_prefers_longer_keyword_match(tmp_path):
     assert keyword == "Rechnungskorrektur"
 
 
-def test_missing_mapping_file_falls_back_to_default(tmp_path):
-    mapping = _mapping(tmp_path, relative="does-not-exist.yaml")
+def test_no_rules_means_everything_goes_to_the_fallback(tmp_path):
+    mapping = _mapping(tmp_path)
 
     folder, keyword = mapping.resolve("Rechnung 123")
 
@@ -7581,67 +9122,46 @@ def test_missing_mapping_file_falls_back_to_default(tmp_path):
     assert keyword is None
 
 
-def test_reload_picks_up_changes(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+def test_reload_picks_up_changes_made_in_the_ui(tmp_path):
+    _write_rules(tmp_path, [("RE", "rechnungen")])
     mapping = _mapping(tmp_path)
     assert mapping.resolve("RE 1")[0] == "rechnungen"
 
-    _write_mapping(mapping_path, "RE: invoices\n")
-    # Nudge mtime forward in case the filesystem has coarse timestamp resolution.
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
-
+    _write_rules(tmp_path, [("RE", "invoices")])
     mapping.reload()
 
     assert mapping.resolve("RE 1")[0] == "invoices"
 
 
-def test_broken_yaml_keeps_previous_rules_instead_of_raising(tmp_path):
-    """A half-written mapping.yaml on the share must not take the service down."""
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = _mapping(tmp_path)
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
-
-    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
-
-    mapping.reload()  # must not raise
-
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
-
-
-def test_non_mapping_yaml_keeps_previous_rules(tmp_path):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
+def test_saving_through_the_mapping_takes_effect_at_once(tmp_path):
     mapping = _mapping(tmp_path)
 
-    mapping_path.write_text("- just\n- a\n- list\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+    mapping.save([Rule.create("LS", "lieferscheine")])
 
-    mapping.reload()
-
-    assert mapping.resolve("RE 1")[0] == "rechnungen"
+    assert mapping.resolve("LS 7")[0] == "lieferscheine"
+    assert [r.keyword for r in load_rules(tmp_path)] == ["LS"]
 
 
-def test_broken_yaml_is_not_re_reported_every_cycle(tmp_path, caplog):
-    mapping_path = tmp_path / "mapping.yaml"
-    _write_mapping(mapping_path, "RE: rechnungen\n")
-    mapping = _mapping(tmp_path)
+def test_the_order_survives_the_database(tmp_path):
+    rules = [Rule.create(k, "x") for k in ("Zeta", "Alpha", "Mitte")]
+    save_rules(tmp_path, rules)
 
-    mapping_path.write_text("RE: [unclosed\n", encoding="utf-8")
-    stat = mapping_path.stat()
-    os.utime(mapping_path, (stat.st_atime, stat.st_mtime + 5))
+    assert [r.keyword for r in load_rules(tmp_path)] == ["Zeta", "Alpha", "Mitte"]
 
-    with caplog.at_level("ERROR"):
-        mapping.reload()
-        mapping.reload()
-        mapping.reload()
 
-    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+@pytest.mark.parametrize("text", ["RE: [unclosed\n", "- just\n- a\n- list\n"])
+def test_an_unreadable_import_is_refused_with_a_reason(text):
+    with pytest.raises(MappingError):
+        rules_from_yaml(text)
+
+
+def test_export_and_import_round_trip(tmp_path):
+    rules = [
+        Rule.create("Rechnungskorrektur", "korrekturen"),
+        Rule.create("RE*", "rechnungen", "2", True, "1", "3"),
+    ]
+
+    assert rules_from_yaml(dump_rules(rules)) == rules
 
 
 # --- priority: explicit order, first match wins --------------------------------
@@ -7657,9 +9177,9 @@ def test_first_matching_rule_wins_regardless_of_keyword_length(tmp_path):
 
 def test_moving_a_rule_up_changes_which_one_wins(tmp_path):
     _write_rules(tmp_path, [("RE", "rechnungen"), ("Rechnungskorrektur", "korrekturen")])
-    rules = load_rules(LocalStorage(str(tmp_path)), "mapping.yaml")
+    rules = load_rules(tmp_path)
 
-    save_rules(LocalStorage(str(tmp_path)), "mapping.yaml", move_rule(rules, 1, -1))
+    save_rules(tmp_path, move_rule(rules, 1, -1))
 
     assert _mapping(tmp_path).resolve("Rechnungskorrektur zur RE-1")[0] == "korrekturen"
 
@@ -7688,11 +9208,8 @@ def test_old_flat_file_is_read_with_its_original_priority(tmp_path):
     assert mapping.resolve("RE-1")[0] == "rechnungen"
 
 
-def test_saving_writes_the_versioned_format(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "2")])
-
-    text = storage.read_text("mapping.yaml")
+def test_the_export_uses_the_versioned_format(tmp_path):
+    text = dump_rules([Rule.create("RE", "rechnungen", "2")])
 
     assert "version: 2" in text
     assert "keyword: RE" in text
@@ -7826,19 +9343,15 @@ def test_a_rule_without_print_settings_prints_nothing(tmp_path):
 
 
 def test_print_settings_survive_a_save_and_reload(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen", "all", True, "2")])
+    save_rules(tmp_path, [Rule.create("RE", "rechnungen", "all", True, "2")])
 
-    reloaded = load_rules(storage, "mapping.yaml")[0]
+    reloaded = load_rules(tmp_path)[0]
 
     assert (reloaded.print_attachments, reloaded.printer) == (True, "2")
 
 
-def test_a_file_that_never_used_printing_stays_unchanged(tmp_path):
-    storage = LocalStorage(str(tmp_path))
-    save_rules(storage, "mapping.yaml", [Rule.create("RE", "rechnungen")])
-
-    text = storage.read_text("mapping.yaml")
+def test_an_export_without_printing_stays_short(tmp_path):
+    text = dump_rules([Rule.create("RE", "rechnungen")])
 
     assert "print" not in text
     assert "printer" not in text
@@ -7874,7 +9387,6 @@ cat > tests/test_filenames.py <<'MAIL2NAS_EOF'
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -8018,19 +9530,17 @@ from __future__ import annotations
 
 import email
 import textwrap
+from dataclasses import replace
 from email.message import EmailMessage
 
+from mail2nas.accounts import Account
 from mail2nas.addresses import AddressStore
 from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.archiver import MAX_RECIPIENTS, Archiver, recipients_of
-from mail2nas.config import (
-    DEFAULT_BLOCKED_EXTENSIONS,
-    DEFAULT_PRINTABLE_EXTENSIONS,
-    Config,
-)
-from mail2nas.mapping import Mapping
-from mail2nas.state import ProcessedStore
-from mail2nas.accounts import Account
+from mail2nas.config import DEFAULT_PRINTABLE_EXTENSIONS, Config
+from mail2nas.legacy import LegacyEnv
+from mail2nas.mapping import Mapping, RuleStore, rules_from_yaml
+from mail2nas.options import Options
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import (
     PrintError,
@@ -8038,6 +9548,7 @@ from mail2nas.printing import (
     Spooler,
     parse_extensions,
 )
+from mail2nas.state import ProcessedStore
 from mail2nas.storage import LocalStorage
 
 TEST_ACCOUNT = Account(
@@ -8048,69 +9559,68 @@ TEST_ACCOUNT = Account(
 
 
 def _account(**overrides) -> Account:
-    from dataclasses import replace
     return replace(TEST_ACCOUNT, **overrides)
 
 
+def _make_options(**overrides) -> Options:
+    """The settings as they would be stored, with test-friendly overrides."""
+    return replace(Options(), **overrides)
+
+
 def _make_config(tmp_path, **overrides) -> Config:
-    defaults = dict(
-        imap_host="imap.example.com",
-        imap_port=993,
-        imap_user="u",
-        imap_password="p",
-        imap_ssl=True,
-        imap_folder="INBOX",
-        imap_processed_folder=None,
-        imap_oversized_folder=None,
-        imap_mode="poll",
-        poll_interval=60,
-        storage_backend="local",
-        storage_root=str(tmp_path),
-        smb_host="",
-        smb_share="",
-        smb_user="",
-        smb_password="",
-        smb_domain="",
-        smb_port=445,
-        smb_root="",
-        smb_encrypt=True,
-        mapping_path="mapping.yaml",
-        fallback_folder="unsorted",
-        match_body=False,
-        filename_prefix="date_sender",
-        max_attachment_size_mb=25,
-        max_message_size_mb=50,
-        max_attachments_per_message=20,
-        blocked_extensions=frozenset(
-            e.strip() for e in DEFAULT_BLOCKED_EXTENSIONS.split(",")
-        ),
-        quarantine_folder="quarantaene",
-        state_db_path=str(tmp_path / "state.db"),
-        dry_run=False,
-        printing_enabled=True,
-        lp_binary="lp",
-        lpstat_binary="lpstat",
-        print_timeout=120,
-        printable_extensions=frozenset(
-            e.strip() for e in DEFAULT_PRINTABLE_EXTENSIONS.split(",")
-        ),
-        printer_name="",
-        printer_destination="",
-        printer_server="",
-        printer_options="",
-        printer_copies=1,
-        web_enabled=False,
-        web_host="127.0.0.1",
-        web_port=8080,
-        web_password="",
-        web_cookie_secure=False,
-    )
+    """The (infrastructure-only) container configuration for a test."""
+    defaults = dict(state_db_path=str(tmp_path / "state.db"), web_host="127.0.0.1")
     defaults.update(overrides)
     return Config(**defaults)
 
 
+def _make_legacy(**overrides) -> LegacyEnv:
+    """An old-style .env, as `legacy.py` reads it."""
+    return replace(LegacyEnv(), **overrides)
+
+
+def _seed_config(tmp_path, **overrides):
+    """An old .env plus where the database lives - what the seeding tests need.
+
+    The seed functions read the old variable names as attributes, exactly as
+    they come out of `LegacyEnv`.
+    """
+    from dataclasses import fields
+    from types import SimpleNamespace
+
+    defaults = dict(
+        imap_host="imap.example.com", imap_user="u", imap_password="p", storage_root=str(tmp_path)
+    )
+    defaults.update(overrides)
+    legacy = _make_legacy(**defaults)
+    values = {spec.name: getattr(legacy, spec.name) for spec in fields(legacy)}
+    return SimpleNamespace(**values, state_db_path=str(tmp_path / "state.db"))
+
+
+def _make_runtime(tmp_path, with_archive: bool = True, environ=None, **config_overrides):
+    """A wired-up service as `main` builds it - with a local archive in tmp_path.
+
+    `environ` is the (old) .env to take over; empty by default, i.e. a fresh
+    installation.
+    """
+    from mail2nas.main import build_runtime
+
+    runtime = build_runtime(_make_config(tmp_path, **config_overrides), environ or {})
+    if with_archive:
+        runtime.archives.add(name="Test", backend="local", path=str(tmp_path))
+    return runtime
+
+
 def _write_mapping(path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+
+def _make_mapping(tmp_path, mapping_content: str | None = None, fallback="unsorted") -> Mapping:
+    """Rules as the database holds them, written from a YAML snippet."""
+    store = RuleStore(str(tmp_path / "state.db"))
+    if mapping_content is not None:
+        store.save(rules_from_yaml(textwrap.dedent(mapping_content)))
+    return Mapping(store, fallback)
 
 
 def _make_archiver(
@@ -8121,25 +9631,23 @@ def _make_archiver(
     addresses=None,
     storages=None,
     blocked_extensions=None,
-    **config_overrides,
+    **option_overrides,
 ) -> Archiver:
-    config = _make_config(tmp_path, **config_overrides)
-    mapping_path = tmp_path / "mapping.yaml"
-    if mapping_content is not None:
-        _write_mapping(mapping_path, mapping_content)
-    storage = LocalStorage(config.storage_root)
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
-    store = ProcessedStore(config.state_db_path)
+    options = _make_options(**option_overrides)
+    mapping = _make_mapping(tmp_path, mapping_content, options.fallback_folder)
+    if blocked_extensions is not None:
+        # A callable, so a test can change the list between two messages -
+        # the way the settings page does while the service runs.
+        base = options
+        options = lambda: replace(base, blocked_extensions=blocked_extensions())  # noqa: E731
     return Archiver(
-        config,
+        options,
         mapping,
-        store,
-        storage,
+        ProcessedStore(str(tmp_path / "state.db")),
+        storages if storages is not None else LocalStorage(str(tmp_path)),
         account or TEST_ACCOUNT,
         printing,
         addresses,
-        storages,
-        blocked_extensions,
     )
 
 
@@ -8919,15 +10427,13 @@ def test_end_to_end_a_mail_to_the_address_reaches_the_lp_command(tmp_path):
     printer_id = printers.add(
         name="Buero", destination="Buero_MFP", server="cups.lan:631", options="media=A4"
     )
-    config = _make_config(tmp_path, lp_binary=str(fake_lp))
     printing = PrintService(printers, Spooler(lp_binary=str(fake_lp), timeout=30))
 
-    storage = LocalStorage(config.storage_root)
     archiver = Archiver(
-        config,
-        Mapping(storage, config.mapping_path, config.fallback_folder),
-        ProcessedStore(config.state_db_path),
-        storage,
+        _make_options(),
+        _make_mapping(tmp_path),
+        ProcessedStore(str(tmp_path / "state.db")),
+        LocalStorage(str(tmp_path)),
         TEST_ACCOUNT,
         printing,
         _addresses(tmp_path, printer=str(printer_id)),
@@ -9076,6 +10582,82 @@ def test_the_blocked_extension_list_is_read_per_message(tmp_path):
     )
 
     assert len(list((tmp_path / "quarantaene").glob("*"))) == 1
+
+
+# --- "print only" never loses an attachment ----------------------------------
+
+
+def test_print_only_files_the_attachment_when_the_printer_fails(tmp_path):
+    class BrokenSpooler(RecordingSpooler):
+        def print_bytes(self, printer, data, filename, title=""):
+            raise PrintError("Drucker offline")
+
+    store = PrinterStore(str(tmp_path / "printers.db"))
+    printer_id = str(store.add(name="Kaputt", destination="drucker_a"))
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=PrintService(store, BrokenSpooler()),
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=11, raw=_build_message("RE-1", [("beleg.pdf", b"DATA")])), 11
+    )
+
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_print_only_without_any_printer_files_the_attachment(tmp_path):
+    printing, spooler, _ = _make_printing(tmp_path)
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, archive_attachments=False),
+        printing=printing,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=12, raw=_build_message("RE-1", [("beleg.pdf", b"DATA")])), 12
+    )
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*"))
+
+
+def test_print_only_with_an_unprintable_format_files_it(tmp_path):
+    printing, spooler, (printer_id,) = _make_printing(tmp_path, "drucker_a")
+    archiver = _make_archiver(
+        tmp_path,
+        mapping_content="RE: rechnungen\n",
+        account=_account(print_attachments=True, printer=printer_id, archive_attachments=False),
+        printing=printing,
+    )
+
+    archiver._process_message(
+        FakeIMAPClient(uid=13, raw=_build_message("RE-1", [("tabelle.xlsx", b"PK")])), 13
+    )
+
+    assert spooler.jobs == []
+    assert any((tmp_path / "rechnungen").glob("*tabelle.xlsx"))
+
+
+def test_settings_changed_in_the_ui_apply_to_the_next_message(tmp_path):
+    current = {"options": _make_options()}
+    archiver = Archiver(
+        lambda: current["options"],
+        _make_mapping(tmp_path),
+        ProcessedStore(str(tmp_path / "state.db")),
+        LocalStorage(str(tmp_path)),
+        TEST_ACCOUNT,
+    )
+
+    current["options"] = _make_options(fallback_folder="sonstiges")
+    archiver._process_message(
+        FakeIMAPClient(uid=14, raw=_build_message("Hallo", [("a.pdf", b"x")])), 14
+    )
+
+    assert any((tmp_path / "sonstiges").glob("*"))
 MAIL2NAS_EOF
 
 # --- tests/test_config.py ---
@@ -9084,164 +10666,138 @@ from __future__ import annotations
 
 import pytest
 
-from mail2nas.config import Config
+from mail2nas.config import Config, parse_extension_list
+from mail2nas.legacy import LEGACY_VARIABLES, LegacyEnv
 
-REQUIRED = {
-    "IMAP_HOST": "imap.example.com",
-    "IMAP_USER": "archiv@example.com",
-    "IMAP_PASSWORD": "secret",
-}
+INFRA = ("STATE_DB_PATH", "WEB_HOST", "WEB_PORT", "WEB_PASSWORD", "WEB_COOKIE_SECURE",
+         "LP_BINARY", "LPSTAT_BINARY")
 
 
-def _env(monkeypatch, **overrides):
-    for key in list(REQUIRED) + [
-        "IMAP_PORT", "IMAP_MODE", "POLL_INTERVAL_SECONDS", "FILENAME_PREFIX",
-        "MAX_ATTACHMENT_SIZE_MB", "MAX_MESSAGE_SIZE_MB", "MAX_ATTACHMENTS_PER_MESSAGE",
-        "STORAGE_BACKEND", "SMB_HOST", "SMB_SHARE", "SMB_USER", "SMB_PASSWORD",
-        "SMB_DOMAIN", "SMB_PORT", "SMB_ROOT", "SMB_ENCRYPT", "MAPPING_PATH",
-    ]:
+@pytest.fixture
+def clean_env(monkeypatch):
+    for key in (*INFRA, *LEGACY_VARIABLES, "NAS_PATH"):
         monkeypatch.delenv(key, raising=False)
-    for key, value in {**REQUIRED, **overrides}.items():
-        monkeypatch.setenv(key, value)
+    return monkeypatch
 
 
-def test_defaults_load(monkeypatch):
-    _env(monkeypatch)
+# --- the container configuration ----------------------------------------------
 
+
+def test_an_empty_env_is_enough_to_start(clean_env):
+    """No mailbox, no share, no password: all of that is set up in the web UI."""
     config = Config.from_env()
 
-    assert config.imap_port == 993
-    assert config.imap_mode == "poll"
-    assert config.filename_prefix == "date_sender"
+    assert config.state_db_path == "/data/state.db"
+    assert config.web_port == 8080
+    assert config.web_password == ""
 
 
-def test_missing_required_variable_is_reported(monkeypatch):
-    _env(monkeypatch)
-    monkeypatch.delenv("IMAP_PASSWORD")
+def test_old_variables_do_not_break_the_container_config(clean_env):
+    clean_env.setenv("IMAP_MODE", "tippfehler")
+    clean_env.setenv("MAX_ATTACHMENT_SIZE_MB", "viel")
 
-    with pytest.raises(SystemExit, match="IMAP_PASSWORD"):
+    Config.from_env()  # must not raise - those values are the legacy reader's job
+
+
+@pytest.mark.parametrize("value", ["0", "70000", "achtzig"])
+def test_an_unusable_web_port_is_reported(clean_env, value):
+    clean_env.setenv("WEB_PORT", value)
+
+    with pytest.raises(SystemExit, match="WEB_PORT"):
         Config.from_env()
 
 
-@pytest.mark.parametrize("value", ["not-a-number", "", "12.5"])
-def test_non_numeric_int_setting_is_rejected_clearly(monkeypatch, value):
-    _env(monkeypatch, MAX_ATTACHMENT_SIZE_MB=value)
+def test_lpstat_is_found_next_to_lp(clean_env):
+    clean_env.setenv("LP_BINARY", "/opt/cups/bin/lp")
 
-    with pytest.raises(SystemExit, match="MAX_ATTACHMENT_SIZE_MB"):
-        Config.from_env()
+    assert Config.from_env().lpstat_binary == "/opt/cups/bin/lpstat"
 
 
-@pytest.mark.parametrize("value", ["0", "-5"])
-def test_non_positive_limits_are_rejected(monkeypatch, value):
-    _env(monkeypatch, MAX_MESSAGE_SIZE_MB=value)
+def test_the_data_directory_is_next_to_the_database(clean_env):
+    clean_env.setenv("STATE_DB_PATH", "/srv/mail2nas/state.db")
 
-    with pytest.raises(SystemExit, match="MAX_MESSAGE_SIZE_MB"):
-        Config.from_env()
+    assert Config.from_env().data_dir == "/srv/mail2nas"
 
 
-@pytest.mark.parametrize("value", ["0", "70000"])
-def test_port_out_of_range_is_rejected(monkeypatch, value):
-    _env(monkeypatch, IMAP_PORT=value)
-
-    with pytest.raises(SystemExit, match="IMAP_PORT"):
-        Config.from_env()
+def test_extension_lists_accept_every_separator_people_type():
+    assert parse_extension_list(".EXE, com; bat  js") == {"exe", "com", "bat", "js"}
 
 
-def test_typo_in_imap_mode_fails_instead_of_silently_polling(monkeypatch):
-    _env(monkeypatch, IMAP_MODE="idel")
-
-    with pytest.raises(SystemExit, match="IMAP_MODE"):
-        Config.from_env()
+# --- reading an older .env ------------------------------------------------------
 
 
-def test_typo_in_filename_prefix_fails(monkeypatch):
-    _env(monkeypatch, FILENAME_PREFIX="date-sender")
+def test_a_fresh_env_describes_nothing_to_take_over(clean_env):
+    legacy = LegacyEnv.from_environ()
 
-    with pytest.raises(SystemExit, match="FILENAME_PREFIX"):
-        Config.from_env()
-
-
-def test_imap_mode_is_case_insensitive(monkeypatch):
-    _env(monkeypatch, IMAP_MODE="IDLE")
-
-    assert Config.from_env().imap_mode == "idle"
+    assert not legacy.has_mailbox
+    assert not legacy.has_archive
+    assert not legacy.has_options
 
 
-# --- storage backend ----------------------------------------------------------
+def test_generation_1_docker_cifs_volume_becomes_direct_smb():
+    """SMB credentials in the .env, no backend: Docker used to mount the share.
 
-SMB = {
-    "STORAGE_BACKEND": "smb",
-    "SMB_HOST": "nas.local",
-    "SMB_SHARE": "Belege",
-    "SMB_USER": "mail2nas",
-    "SMB_PASSWORD": "secret",
-}
+    Treating it as a mount would write into an empty directory inside the
+    container - the one mistake an update must not make.
+    """
+    legacy = LegacyEnv.from_environ({
+        "IMAP_HOST": "imap.x", "IMAP_USER": "u", "IMAP_PASSWORD": "p",
+        "SMB_HOST": "nas", "SMB_SHARE": "Belege", "SMB_USER": "a", "SMB_PASSWORD": "b",
+    })
 
-
-def test_backend_defaults_to_local_so_existing_installs_keep_working(monkeypatch):
-    _env(monkeypatch)
-
-    config = Config.from_env()
-
-    assert config.storage_backend == "local"
-    assert config.storage_root == "/mnt/nas"
+    assert legacy.storage_backend == "smb"
+    assert (legacy.smb_host, legacy.smb_share) == ("nas", "Belege")
 
 
-def test_smb_backend_loads_its_settings(monkeypatch):
-    _env(monkeypatch, **SMB, SMB_ROOT="archiv/2026", SMB_DOMAIN="WORKGROUP")
+def test_generation_2_host_mount_stays_a_mounted_directory():
+    legacy = LegacyEnv.from_environ({
+        "IMAP_HOST": "imap.x", "IMAP_USER": "u", "IMAP_PASSWORD": "p", "NAS_PATH": "/mnt/nas",
+    })
 
-    config = Config.from_env()
-
-    assert config.storage_backend == "smb"
-    assert (config.smb_host, config.smb_share) == ("nas.local", "Belege")
-    assert config.smb_root == "archiv/2026"
-    assert config.smb_domain == "WORKGROUP"
-    assert config.smb_port == 445
-    assert config.smb_encrypt is True
+    assert legacy.storage_backend == "local"
+    assert legacy.storage_root == "/mnt/nas"
 
 
-@pytest.mark.parametrize("missing", ["SMB_HOST", "SMB_SHARE", "SMB_USER", "SMB_PASSWORD"])
-def test_smb_backend_reports_the_missing_setting(monkeypatch, missing):
-    _env(monkeypatch, **SMB)
-    monkeypatch.delenv(missing)
+@pytest.mark.parametrize("backend", ["smb", "local"])
+def test_an_explicit_backend_wins(backend):
+    legacy = LegacyEnv.from_environ({
+        "STORAGE_BACKEND": backend, "SMB_HOST": "nas", "SMB_SHARE": "Belege",
+        "SMB_USER": "a", "SMB_PASSWORD": "b",
+    })
 
-    with pytest.raises(SystemExit, match=missing):
-        Config.from_env()
-
-
-def test_local_backend_does_not_require_smb_settings(monkeypatch):
-    _env(monkeypatch, STORAGE_BACKEND="local")
-
-    assert Config.from_env().smb_host == ""
+    assert legacy.storage_backend == backend
 
 
-def test_unknown_backend_is_rejected(monkeypatch):
-    _env(monkeypatch, STORAGE_BACKEND="nfs")
-
-    with pytest.raises(SystemExit, match="STORAGE_BACKEND"):
-        Config.from_env()
+def test_smb_without_a_share_is_not_taken_over():
+    assert LegacyEnv.from_environ({"STORAGE_BACKEND": "smb", "SMB_HOST": "nas"}).storage_backend == ""
 
 
-def test_empty_smb_root_means_the_share_root(monkeypatch):
-    _env(monkeypatch, **SMB, SMB_ROOT="")
+@pytest.mark.parametrize(
+    "name,value,attribute,expected",
+    [
+        ("IMAP_PORT", "abc", "imap_port", 993),
+        ("IMAP_MODE", "sofort", "imap_mode", "poll"),
+        ("FILENAME_PREFIX", "egal", "filename_prefix", "date_sender"),
+        ("MAX_ATTACHMENT_SIZE_MB", "0", "max_attachment_size_mb", 25),
+        ("PRINTER_COPIES", "99", "printer_copies", 1),
+    ],
+)
+def test_a_broken_old_value_falls_back_instead_of_stopping(name, value, attribute, expected):
+    assert getattr(LegacyEnv.from_environ({name: value}), attribute) == expected
 
-    assert Config.from_env().smb_root == ""
 
+def test_old_values_are_read_with_their_old_meaning():
+    legacy = LegacyEnv.from_environ({
+        "IMAP_MODE": "IDLE", "MATCH_BODY": "true", "FALLBACK_FOLDER": "sonstiges",
+        "BLOCKED_EXTENSIONS": "exe,js", "POLL_INTERVAL_SECONDS": "60",
+    })
 
-@pytest.mark.parametrize("value", ["../etc", "/etc", ".."])
-def test_smb_root_cannot_escape_the_share(monkeypatch, value):
-    _env(monkeypatch, **SMB, SMB_ROOT=value)
-
-    with pytest.raises(SystemExit, match="SMB_ROOT"):
-        Config.from_env()
-
-
-@pytest.mark.parametrize("value", ["../mapping.yaml", "/etc/passwd"])
-def test_mapping_path_cannot_escape_the_archive_root(monkeypatch, value):
-    _env(monkeypatch, MAPPING_PATH=value)
-
-    with pytest.raises(SystemExit, match="MAPPING_PATH"):
-        Config.from_env()
+    assert legacy.imap_mode == "idle"
+    assert legacy.match_body is True
+    assert legacy.fallback_folder == "sonstiges"
+    assert legacy.blocked_extensions == {"exe", "js"}
+    assert legacy.poll_interval == 60
+    assert legacy.has_options
 MAIL2NAS_EOF
 
 # --- tests/test_storage.py ---
@@ -9254,8 +10810,7 @@ from pathlib import Path
 
 import pytest
 
-from mail2nas.storage import LocalStorage, SmbStorage, from_config
-from tests.test_archiver import _make_config
+from mail2nas.storage import LocalStorage, SmbStorage
 
 
 # --- local backend ------------------------------------------------------------
@@ -9393,27 +10948,6 @@ def test_smb_reraises_when_the_retry_also_fails(monkeypatch):
         storage._with_reconnect("write", always_broken)
 
 
-# --- backend selection ---------------------------------------------------------
-
-
-def test_from_config_selects_the_configured_backend(tmp_path):
-    local = from_config(_make_config(tmp_path, storage_backend="local"))
-    assert isinstance(local, LocalStorage)
-
-    smb = from_config(
-        _make_config(
-            tmp_path,
-            storage_backend="smb",
-            smb_host="nas.local",
-            smb_share="Belege",
-            smb_user="u",
-            smb_password="p",
-        )
-    )
-    assert isinstance(smb, SmbStorage)
-    assert smb.description == "//nas.local/Belege"
-
-
 # --- listing and moving files (pickup folders) --------------------------------
 
 
@@ -9505,53 +11039,31 @@ import re
 
 import pytest
 
-from mail2nas.accounts import AccountStore
-from mail2nas.addresses import AddressStore
-from mail2nas.archives import ArchiveStore
-from mail2nas.pickups import PickupStore
-from mail2nas.mapping import Mapping, Rule, load_rules, save_rules
-from mail2nas.printers import PrinterStore
-from mail2nas.printing import from_config as printing_from_config
-from mail2nas.runtime import Runtime
-from mail2nas.state import ProcessedStore, SettingsStore
-from mail2nas.storage import LocalStorage
+from mail2nas.mapping import Rule
+from mail2nas.state import SettingsStore
 from mail2nas.web import (
     SETTING_PASSWORD_HASH,
     LoginThrottle,
     create_app,
     ensure_password,
 )
-from tests.test_archiver import _make_config
+from tests.test_archiver import _make_runtime
 
 PASSWORD = "geheim1234"
 
 
 @pytest.fixture
 def env(tmp_path):
-    """A configured app plus the storage and settings behind it."""
-    config = _make_config(tmp_path, web_enabled=True, web_password=PASSWORD)
-    storage = LocalStorage(config.storage_root)
-    settings = SettingsStore(config.state_db_path)
-    accounts = AccountStore(config.state_db_path)
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
-    printers = PrinterStore(config.state_db_path)
-    runtime = Runtime(
-        config,
-        storage,
-        mapping,
-        ProcessedStore(config.state_db_path),
-        settings,
-        accounts,
-        printers=printers,
-        printing=printing_from_config(config, printers),
-        addresses=AddressStore(config.state_db_path),
-        archives=ArchiveStore(config.state_db_path),
-        pickups=PickupStore(config.state_db_path),
-    )
+    """A configured app plus the storage and settings behind it.
+
+    tmp_path is the (local) default archive, as the UI would set it up.
+    """
+    runtime = _make_runtime(tmp_path, web_password=PASSWORD)
+    settings, config = runtime.settings, runtime.config
     ensure_password(settings, config.web_password)
     app = create_app(runtime)
     app.config.update(TESTING=True)
-    return app, storage, settings, config, runtime
+    return app, runtime.storage, settings, config, runtime
 
 
 @pytest.fixture
@@ -9648,7 +11160,7 @@ def test_adding_a_rule_writes_it_to_the_share(client, env):
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+    assert [(r.keyword, r.folder) for r in runtime.rule_store.load()] == [
         ("Rechnung", "rechnungen")
     ]
 
@@ -9676,7 +11188,7 @@ def test_existing_folders_are_offered_for_selection(client, tmp_path):
 
 def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
     _, storage, _, config, runtime = env
-    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    runtime.mapping.save([Rule.create("RE", "rechnungen")])
     _login(client)
 
     response = client.post(
@@ -9687,7 +11199,7 @@ def test_duplicate_keyword_is_rejected_case_insensitively(client, env):
     )
 
     assert "gibt es schon" in response.get_data(as_text=True)
-    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+    assert [(r.keyword, r.folder) for r in runtime.rule_store.load()] == [
         ("RE", "rechnungen")
     ]
 
@@ -9703,13 +11215,13 @@ def test_target_folder_cannot_escape_the_archive_root(client, env, folder, tmp_p
               "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert load_rules(storage, config.mapping_path) == []
+    assert runtime.rule_store.load() == []
     assert not (tmp_path.parent / "ausbruch").exists()
 
 
 def test_changing_the_folder_of_an_existing_rule(client, env):
     _, storage, _, config, runtime = env
-    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
+    runtime.mapping.save([Rule.create("RE", "rechnungen")])
     _login(client)
 
     client.post(
@@ -9717,15 +11229,14 @@ def test_changing_the_folder_of_an_existing_rule(client, env):
         data={"index": "0", "folder": "belege", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert [(r.keyword, r.folder) for r in load_rules(storage, config.mapping_path)] == [
+    assert [(r.keyword, r.folder) for r in runtime.rule_store.load()] == [
         ("RE", "belege")
     ]
 
 
 def test_deleting_a_rule_keeps_the_others(client, env):
     _, storage, _, config, runtime = env
-    save_rules(storage, config.mapping_path,
-               [Rule.create("RE", "rechnungen"), Rule.create("LS", "lieferscheine")])
+    runtime.mapping.save([Rule.create("RE", "rechnungen"), Rule.create("LS", "lieferscheine")])
     _login(client)
 
     client.post(
@@ -9733,7 +11244,7 @@ def test_deleting_a_rule_keeps_the_others(client, env):
         data={"index": "0", "csrf_token": _csrf(client, "/mapping")},
     )
 
-    assert [r.keyword for r in load_rules(storage, config.mapping_path)] == ["LS"]
+    assert [r.keyword for r in runtime.rule_store.load()] == ["LS"]
 
 
 def test_unreadable_share_does_not_break_the_page(client, env, monkeypatch):
@@ -9833,20 +11344,6 @@ def test_password_is_not_stored_in_clear_text(env):
     assert stored.startswith("scrypt:") or stored.startswith("pbkdf2:")
 
 
-def test_enabling_the_ui_without_a_password_fails_fast(tmp_path):
-    settings = SettingsStore(str(tmp_path / "state.db"))
-
-    with pytest.raises(SystemExit, match="WEB_PASSWORD"):
-        ensure_password(settings, "")
-
-
-def test_too_short_initial_password_fails_fast(tmp_path):
-    settings = SettingsStore(str(tmp_path / "state.db"))
-
-    with pytest.raises(SystemExit, match="at least"):
-        ensure_password(settings, "kurz")
-
-
 def test_stored_password_wins_over_the_configured_one(env):
     """WEB_PASSWORD is the initial value only - a later change must survive restarts."""
     _, _, settings, _, runtime = env
@@ -9896,61 +11393,60 @@ def test_locked_out_client_is_refused_even_with_the_right_password(client, env):
 # --- rule order ------------------------------------------------------------------
 
 
-def _keywords(storage, config):
-    return [rule.keyword for rule in load_rules(storage, config.mapping_path)]
+def _keywords(runtime):
+    return [rule.keyword for rule in runtime.rule_store.load()]
 
 
 def test_moving_a_rule_up_reorders_the_file(client, env):
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path,
-               [Rule.create("A", "a"), Rule.create("B", "b"), Rule.create("C", "c")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a"), Rule.create("B", "b"), Rule.create("C", "c")])
     _login(client)
 
     client.post("/mapping/up", data={"index": "2", "csrf_token": _csrf(client, "/mapping")})
 
-    assert _keywords(storage, config) == ["A", "C", "B"]
+    assert _keywords(runtime) == ["A", "C", "B"]
 
 
 def test_moving_a_rule_down_reorders_the_file(client, env):
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a"), Rule.create("B", "b")])
     _login(client)
 
     client.post("/mapping/down", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
 
-    assert _keywords(storage, config) == ["B", "A"]
+    assert _keywords(runtime) == ["B", "A"]
 
 
 def test_moving_the_top_rule_up_is_harmless(client, env):
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a"), Rule.create("B", "b")])
     _login(client)
 
     client.post("/mapping/up", data={"index": "0", "csrf_token": _csrf(client, "/mapping")})
 
-    assert _keywords(storage, config) == ["A", "B"]
+    assert _keywords(runtime) == ["A", "B"]
 
 
 @pytest.mark.parametrize("index", ["7", "-1", "keineZahl"])
 def test_a_bogus_row_index_is_refused(client, env, index):
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a")])
     _login(client)
 
     client.post("/mapping/delete", data={"index": index, "csrf_token": _csrf(client, "/mapping")})
 
-    assert _keywords(storage, config) == ["A"]
+    assert _keywords(runtime) == ["A"]
 
 
 def test_new_rules_are_appended_at_the_bottom(client, env):
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path, [Rule.create("A", "a")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a")])
     _login(client)
 
     client.post("/mapping/add", data={"keyword": "B", "new_folder": "b",
                                       "csrf_token": _csrf(client, "/mapping")})
 
-    assert _keywords(storage, config) == ["A", "B"]
+    assert _keywords(runtime) == ["A", "B"]
 
 
 # --- accounts ---------------------------------------------------------------------
@@ -10040,7 +11536,7 @@ def test_a_rule_can_be_bound_to_an_account(client, env):
         "keyword": "Rechnung", "new_folder": "rechnungen", "account": str(account_id),
         "csrf_token": _csrf(client, "/mapping")})
 
-    assert load_rules(storage, config.mapping_path)[0].account == str(account_id)
+    assert runtime.rule_store.load()[0].account == str(account_id)
 
 
 def test_a_rule_cannot_reference_an_unknown_account(client, env):
@@ -10051,56 +11547,22 @@ def test_a_rule_cannot_reference_an_unknown_account(client, env):
         "keyword": "Rechnung", "new_folder": "rechnungen", "account": "999",
         "csrf_token": _csrf(client, "/mapping")})
 
-    assert load_rules(storage, config.mapping_path) == []
+    assert runtime.rule_store.load() == []
 
 
 # --- moving the mapping file --------------------------------------------------------
 
 
-def test_moving_the_mapping_file_takes_the_rules_along(client, env, tmp_path):
-    _, storage, _, config, runtime = env
-    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
-    _login(client)
-
-    client.post("/config/mapping-path",
-                data={"mapping_path": "config/regeln.yaml", "csrf_token": _csrf(client, "/config")})
-
-    assert runtime.mapping_path == "config/regeln.yaml"
-    assert [r.keyword for r in load_rules(storage, "config/regeln.yaml")] == ["RE"]
-    assert not (tmp_path / "mapping.yaml").exists()
-
-
-def test_the_mapping_path_cannot_escape_the_archive_root(client, env):
-    _, _, _, _, runtime = env
-    _login(client)
-
-    client.post("/config/mapping-path",
-                data={"mapping_path": "../woanders.yaml", "csrf_token": _csrf(client, "/config")})
-
-    assert runtime.mapping_path == "mapping.yaml"
-
-
-def test_moving_to_the_same_path_is_a_no_op(client, env):
-    _, storage, _, config, runtime = env
-    save_rules(storage, config.mapping_path, [Rule.create("RE", "rechnungen")])
-    _login(client)
-
-    client.post("/config/mapping-path",
-                data={"mapping_path": "mapping.yaml", "csrf_token": _csrf(client, "/config")})
-
-    assert [r.keyword for r in load_rules(storage, "mapping.yaml")] == ["RE"]
-
-
 def test_reordering_without_a_csrf_token_is_refused(client, env):
     """The arrows go through a helper, so their CSRF check needs its own test."""
-    _, storage, _, config, _ = env
-    save_rules(storage, config.mapping_path, [Rule.create("A", "a"), Rule.create("B", "b")])
+    _, storage, _, config, runtime = env
+    runtime.mapping.save([Rule.create("A", "a"), Rule.create("B", "b")])
     _login(client)
 
     response = client.post("/mapping/up", data={"index": "1"})
 
     assert response.status_code == 400
-    assert _keywords(storage, config) == ["A", "B"]
+    assert _keywords(runtime) == ["A", "B"]
 
 
 def test_the_stored_account_password_is_never_sent_to_the_browser(client, env):
@@ -10269,7 +11731,7 @@ def test_a_rule_can_be_set_to_print_on_a_specific_printer(client, env):
         "keyword": "Rechnung", "new_folder": "rechnungen", "printer": str(printer_id),
         "csrf_token": _csrf(client, "/mapping")})
 
-    rule = load_rules(storage, config.mapping_path)[0]
+    rule = runtime.rule_store.load()[0]
     assert rule.print_attachments is True
     assert rule.printer == str(printer_id)
 
@@ -10283,7 +11745,7 @@ def test_a_rule_can_print_on_the_mailbox_printer(client, env):
         "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "account",
         "csrf_token": _csrf(client, "/mapping")})
 
-    rule = load_rules(storage, config.mapping_path)[0]
+    rule = runtime.rule_store.load()[0]
     assert rule.print_attachments is True
     assert rule.printer == ""
 
@@ -10297,21 +11759,20 @@ def test_a_rule_cannot_reference_an_unknown_printer(client, env):
         "keyword": "Rechnung", "new_folder": "rechnungen", "printer": "999",
         "csrf_token": _csrf(client, "/mapping")})
 
-    assert load_rules(storage, config.mapping_path) == []
+    assert runtime.rule_store.load() == []
 
 
 def test_changing_a_rules_folder_keeps_its_print_settings(client, env):
     _, storage, _, config, runtime = env
     printer_id = _add_printer(runtime)
-    save_rules(storage, config.mapping_path,
-               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    runtime.mapping.save([Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
     _login(client)
 
     client.post("/mapping/update", data={
         "index": "0", "folder": "belege", "print_fields": "1", "printer": str(printer_id),
         "csrf_token": _csrf(client, "/mapping")})
 
-    rule = load_rules(storage, config.mapping_path)[0]
+    rule = runtime.rule_store.load()[0]
     assert rule.folder == "belege"
     assert (rule.print_attachments, rule.printer) == (True, str(printer_id))
 
@@ -10319,15 +11780,14 @@ def test_changing_a_rules_folder_keeps_its_print_settings(client, env):
 def test_printing_can_be_switched_off_for_a_rule(client, env):
     _, storage, _, config, runtime = env
     printer_id = _add_printer(runtime)
-    save_rules(storage, config.mapping_path,
-               [Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
+    runtime.mapping.save([Rule.create("RE", "rechnungen", "all", True, str(printer_id))])
     _login(client)
 
     client.post("/mapping/update", data={
         "index": "0", "folder": "rechnungen", "print_fields": "1", "printer": "",
         "csrf_token": _csrf(client, "/mapping")})
 
-    rule = load_rules(storage, config.mapping_path)[0]
+    rule = runtime.rule_store.load()[0]
     assert rule.print_attachments is False
     assert rule.printer == ""
 
@@ -10589,7 +12049,9 @@ def test_creating_an_archive_through_the_form(client, env, tmp_path):
         "name": "NAS 2", "backend": "local", "path": str(tmp_path / "zwei"), "enabled": "1",
         "csrf_token": _csrf(client, "/config/archives/new")})
 
-    assert [(a.name, a.path) for a in runtime.archives.all()] == [("NAS 2", str(tmp_path / "zwei"))]
+    assert [(a.name, a.path) for a in runtime.archives.all()][1:] == [
+        ("NAS 2", str(tmp_path / "zwei"))
+    ]
 
 
 def test_an_smb_archive_without_credentials_is_rejected(client, env):
@@ -10601,7 +12063,7 @@ def test_an_smb_archive_without_credentials_is_rejected(client, env):
         "csrf_token": _csrf(client, "/config/archives/new")}, follow_redirects=True)
 
     assert "Benutzer" in response.get_data(as_text=True)
-    assert runtime.archives.all() == []
+    assert [a.name for a in runtime.archives.all()] == ["Test"]
 
 
 def test_editing_an_archive_keeps_the_password_when_left_empty(client, env):
@@ -10645,7 +12107,7 @@ def test_testing_an_unreachable_archive_reports_the_reason(client, env, tmp_path
 
 def test_the_last_archive_cannot_be_deleted(client, env):
     _, _, _, _, runtime = env
-    archive_id = _add_archive(runtime)
+    archive_id = runtime.archives.all()[0].id
     _login(client)
 
     client.post(f"/config/archives/{archive_id}/delete", data={
@@ -10662,7 +12124,7 @@ def test_deleting_an_archive(client, env):
 
     client.post(f"/config/archives/{second}/delete", data={"csrf_token": _csrf(client, "/config")})
 
-    assert [a.name for a in runtime.archives.all()] == ["Haupt"]
+    assert [a.name for a in runtime.archives.all()] == ["Test", "Haupt"]
 
 
 def test_a_rule_can_name_an_archive(client, env, tmp_path):
@@ -10675,7 +12137,7 @@ def test_a_rule_can_name_an_archive(client, env, tmp_path):
         "keyword": "Vertrag", "folder": "", "new_folder": "vertraege", "archive": str(second),
         "csrf_token": _csrf(client, "/mapping")})
 
-    rules = load_rules(runtime.storage, config.mapping_path)
+    rules = runtime.rule_store.load()
     assert [(r.keyword, r.archive) for r in rules] == [("Vertrag", str(second))]
 
 
@@ -10689,7 +12151,7 @@ def test_a_rule_cannot_name_an_archive_that_does_not_exist(client, env, config=N
         "csrf_token": _csrf(client, "/mapping")}, follow_redirects=True)
 
     assert "Archiv" in response.get_data(as_text=True)
-    assert load_rules(runtime.storage, config.mapping_path) == []
+    assert runtime.rule_store.load() == []
 
 
 # --- pickup folders ------------------------------------------------------------
@@ -10764,55 +12226,302 @@ def test_deleting_a_printer_stops_the_pickups_printing(client, env):
 # --- quarantine list and pickup timing ------------------------------------------
 
 
-def test_the_quarantine_list_can_be_edited(client, env):
+
+
+# --- the first password is generated, not required -------------------------------
+
+
+def test_without_any_password_a_random_one_is_generated(tmp_path):
+    from mail2nas.web import read_initial_password
+
+    settings = SettingsStore(str(tmp_path / "state.db"))
+
+    generated = ensure_password(settings, "", str(tmp_path))
+
+    assert generated and len(generated) >= 16
+    assert read_initial_password(str(tmp_path)) == generated
+    assert oct((tmp_path / "initial-password.txt").stat().st_mode & 0o777) == "0o600"
+    assert settings.get(SETTING_PASSWORD_HASH)
+
+
+def test_a_too_short_old_password_is_replaced_by_a_random_one(tmp_path):
+    settings = SettingsStore(str(tmp_path / "state.db"))
+
+    assert ensure_password(settings, "kurz", str(tmp_path)) is not None
+
+
+def test_changing_the_password_removes_the_generated_one(tmp_path):
+    from mail2nas.web import read_initial_password
+
+    runtime = _make_runtime(tmp_path)
+    generated = ensure_password(runtime.settings, "", runtime.config.data_dir)
+    app = create_app(runtime)
+    app.config.update(TESTING=True)
+    with app.test_client() as client:
+        _login(client, generated)
+        client.post("/password", data={
+            "current": generated, "new": "meinEigenes1", "confirm": "meinEigenes1",
+            "csrf_token": _csrf(client, "/password")})
+
+    assert read_initial_password(runtime.config.data_dir) is None
+
+
+# --- overview and first-time setup ----------------------------------------------
+
+
+def _fresh_client(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    ensure_password(runtime.settings, PASSWORD)
+    app = create_app(runtime)
+    app.config.update(TESTING=True)
+    return app.test_client(), runtime
+
+
+def test_after_login_the_overview_is_shown(client):
+    response = _login(client)
+
+    assert response.headers["Location"].endswith("/overview")
+
+
+def test_a_fresh_installation_is_walked_through_the_setup(tmp_path):
+    client, _ = _fresh_client(tmp_path)
+    _login(client)
+
+    html = client.get("/overview").get_data(as_text=True)
+
+    assert "Einrichtung" in html
+    assert "Archiv einrichten" in html
+    assert "Postfach anlegen" in html
+
+
+def test_every_page_says_that_no_archive_exists_yet(tmp_path):
+    client, _ = _fresh_client(tmp_path)
+    _login(client)
+
+    html = client.get("/mapping").get_data(as_text=True)
+
+    assert "Noch kein Archiv eingerichtet" in html
+
+
+def test_the_overview_shows_the_archive_status(client, env):
+    _, _, _, _, runtime = env
+    runtime.status.archive.ok = False
+    runtime.status.archive.detail = "Zugriff verweigert"
+    _login(client)
+
+    html = client.get("/overview").get_data(as_text=True)
+
+    assert "Zugriff verweigert" in html
+    assert "nicht bereit" in html
+
+
+def test_a_rule_can_be_added_before_any_archive_exists(tmp_path):
+    """The folder is created with the first attachment; the rule must not be lost."""
+    client, runtime = _fresh_client(tmp_path)
+    _login(client)
+
+    client.post("/mapping/add", data={
+        "keyword": "Rechnung", "new_folder": "rechnungen",
+        "csrf_token": _csrf(client, "/mapping")})
+
+    assert [r.keyword for r in runtime.rule_store.load()] == ["Rechnung"]
+
+
+# --- the settings page --------------------------------------------------------------
+
+
+def _settings_form(**overrides):
+    form = {
+        "fallback_folder": "unsorted", "quarantine_folder": "quarantaene",
+        "filename_prefix": "date_sender", "poll_interval": "300",
+        "max_attachment_size_mb": "25", "max_message_size_mb": "50",
+        "max_attachments_per_message": "20", "blocked_extensions": "exe, js",
+        "pickup_min_age": "20", "printing_enabled": "1", "print_timeout": "120",
+        "printable_extensions": "pdf",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_the_settings_are_saved_and_take_effect_at_once(client, env):
     _, _, _, _, runtime = env
     _login(client)
 
-    client.post("/config/settings", data={
-        "blocked_extensions": ".EXE, bat; com", "pickup_min_age": "45",
-        "csrf_token": _csrf(client, "/config")})
+    client.post("/settings", data={
+        **_settings_form(fallback_folder="sonstiges", poll_interval="60", match_body="1",
+                         blocked_extensions=".EXE, bat; com"),
+        "csrf_token": _csrf(client, "/settings")})
 
-    assert runtime.blocked_extensions == frozenset({"exe", "bat", "com"})
-    assert runtime.pickup_min_age == 45
+    options = runtime.options
+    assert options.fallback_folder == "sonstiges"
+    assert options.poll_interval == 60
+    assert options.match_body is True
+    assert options.blocked_extensions == {"exe", "bat", "com"}
+    assert runtime.mapping.resolve("Newsletter")[0] == "sonstiges"
+
+
+def test_settings_survive_a_restart(client, env, tmp_path):
+    _, _, _, _, runtime = env
+    _login(client)
+    client.post("/settings", data={
+        **_settings_form(quarantine_folder="gesperrt"), "csrf_token": _csrf(client, "/settings")})
+
+    from mail2nas.options import OptionsStore
+
+    assert OptionsStore(SettingsStore(str(tmp_path / "state.db"))).load().quarantine_folder == "gesperrt"
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("poll_interval", "sofort", "ganze Zahl"),
+        ("poll_interval", "1", "zwischen"),
+        ("fallback_folder", "../ausbruch", "Ordner"),
+        ("quarantine_folder", "unsorted", "verschieden"),
+    ],
+)
+def test_unusable_settings_are_refused_and_nothing_changes(client, env, field, value, message):
+    _, _, _, _, runtime = env
+    before = runtime.options
+    _login(client)
+
+    response = client.post("/settings", data={
+        **_settings_form(**{field: value}), "csrf_token": _csrf(client, "/settings")},
+        follow_redirects=True)
+
+    assert message in response.get_data(as_text=True)
+    assert runtime.options == before
 
 
 def test_emptying_the_quarantine_list_warns(client, env):
     _, _, _, _, runtime = env
     _login(client)
 
-    response = client.post("/config/settings", data={
-        "blocked_extensions": "", "pickup_min_age": "20",
-        "csrf_token": _csrf(client, "/config")}, follow_redirects=True)
+    response = client.post("/settings", data={
+        **_settings_form(blocked_extensions=""), "csrf_token": _csrf(client, "/settings")},
+        follow_redirects=True)
 
     assert "Achtung" in response.get_data(as_text=True)
     assert runtime.blocked_extensions == frozenset()
 
 
-def test_a_nonsense_waiting_time_is_refused_without_losing_the_list(client, env):
+def test_settings_changes_need_a_csrf_token(client):
+    _login(client)
+
+    assert client.post("/settings", data=_settings_form()).status_code == 400
+
+
+# --- export and import of the rules ---------------------------------------------
+
+
+def test_the_rules_can_be_exported(client, env):
+    _, _, _, _, runtime = env
+    runtime.mapping.save([Rule.create("RE", "rechnungen"), Rule.create("LS", "lieferscheine")])
+    _login(client)
+
+    response = client.get("/mapping/export")
+
+    assert response.headers["Content-Disposition"].startswith("attachment")
+    assert "keyword: RE" in response.get_data(as_text=True)
+
+
+def _upload(client, text, mode="append"):
+    import io
+
+    return client.post("/mapping/import", data={
+        "mode": mode, "csrf_token": _csrf(client, "/mapping"),
+        "rules_file": (io.BytesIO(text.encode("utf-8")), "mapping.yaml"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+
+def test_an_old_mapping_file_can_be_imported(client, env):
+    _, _, _, _, runtime = env
+    runtime.mapping.save([Rule.create("RE", "rechnungen")])
+    _login(client)
+
+    response = _upload(client, "re: doppelt\nLieferschein: lieferscheine\n")
+
+    assert [r.keyword for r in runtime.rule_store.load()] == ["RE", "Lieferschein"]
+    assert "uebersprungen" in response.get_data(as_text=True)
+
+
+def test_importing_can_replace_the_rules(client, env):
+    _, _, _, _, runtime = env
+    runtime.mapping.save([Rule.create("ALT", "alt")])
+    _login(client)
+
+    _upload(client, "NEU: neu\n", mode="replace")
+
+    assert [r.keyword for r in runtime.rule_store.load()] == ["NEU"]
+
+
+def test_an_import_with_an_unsafe_folder_changes_nothing(client, env):
+    _, _, _, _, runtime = env
+    runtime.mapping.save([Rule.create("ALT", "alt")])
+    _login(client)
+
+    response = _upload(client, "RE: ../../etc\n")
+
+    assert "Import abgebrochen" in response.get_data(as_text=True)
+    assert [r.keyword for r in runtime.rule_store.load()] == ["ALT"]
+
+
+def test_references_that_do_not_exist_here_are_reset_on_import(client, env):
     _, _, _, _, runtime = env
     _login(client)
 
-    client.post("/config/settings", data={
-        "blocked_extensions": "exe", "pickup_min_age": "sofort",
-        "csrf_token": _csrf(client, "/config")})
+    _upload(client, "version: 2\nrules:\n- keyword: RE\n  folder: r\n  account: '77'\n"
+                    "  printer: '5'\n  print: true\n  archive: '9'\n")
 
-    assert runtime.blocked_extensions == frozenset({"exe"})
-    assert runtime.pickup_min_age == 20
-
-
-def test_the_env_list_is_used_until_something_is_stored(client, env):
-    _, _, _, config, runtime = env
-
-    assert runtime.blocked_extensions == config.blocked_extensions
+    rule = runtime.rule_store.load()[0]
+    assert (rule.account, rule.printer, rule.archive) == ("all", "", "")
 
 
-def test_settings_changes_need_a_csrf_token(client, env):
-    _, _, _, _, runtime = env
+def test_the_migration_note_is_shown_once_and_can_be_dismissed(client, env):
+    from mail2nas.migrate import SETTING_RULES_NOTE
+
+    _, _, settings, _, _ = env
+    settings.set(SETTING_RULES_NOTE, "3 Zuordnung(en) aus mapping.yaml uebernommen.")
     _login(client)
 
-    response = client.post("/config/settings", data={"blocked_extensions": "exe"})
+    assert "uebernommen" in client.get("/mapping").get_data(as_text=True)
+    client.post("/mapping/note/dismiss", data={"csrf_token": _csrf(client, "/mapping")})
+    assert "uebernommen" not in client.get("/mapping").get_data(as_text=True)
 
-    assert response.status_code == 400
+
+# --- testing a mailbox ----------------------------------------------------------------
+
+
+def test_a_mailbox_can_be_tested_from_the_ui(client, env, monkeypatch):
+    from mail2nas import web as web_module
+
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+    monkeypatch.setattr(web_module, "test_imap", lambda account: 3)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}/test", data={
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
+
+    assert "3 ungelesene" in response.get_data(as_text=True)
+
+
+def test_a_failing_mailbox_test_says_why(client, env, monkeypatch):
+    from mail2nas import web as web_module
+
+    _, _, _, _, runtime = env
+    account_id = _add_account(runtime)
+
+    def refuse(account):
+        raise OSError("AUTHENTICATIONFAILED")
+
+    monkeypatch.setattr(web_module, "test_imap", refuse)
+    _login(client)
+
+    response = client.post(f"/config/accounts/{account_id}/test", data={
+        "csrf_token": _csrf(client, f"/config/accounts/{account_id}")}, follow_redirects=True)
+
+    assert "AUTHENTICATIONFAILED" in response.get_data(as_text=True)
 MAIL2NAS_EOF
 
 # --- tests/test_accounts.py ---
@@ -10823,7 +12532,7 @@ import pytest
 
 from mail2nas.accounts import SETTING_ACCOUNTS_SEEDED, AccountStore, seed_from_config
 from mail2nas.state import SettingsStore
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 @pytest.fixture
@@ -10897,7 +12606,7 @@ def test_renaming_does_not_restart_the_worker(store):
 
 
 def test_the_first_account_is_created_from_the_configuration(tmp_path):
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
 
@@ -10910,7 +12619,7 @@ def test_the_first_account_is_created_from_the_configuration(tmp_path):
 
 
 def test_seeding_happens_only_once(tmp_path):
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -10922,11 +12631,23 @@ def test_seeding_happens_only_once(tmp_path):
 
 def test_deleting_the_last_account_does_not_resurrect_it_from_the_env(tmp_path):
     """Otherwise removing a mailbox in the UI would silently come back."""
-    config = _make_config(tmp_path)
+    config = _seed_config(tmp_path)
     store = AccountStore(config.state_db_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
     store.delete(store.all()[0].id)
+
+    seed_from_config(store, settings, config)
+
+    assert store.all() == []
+    assert settings.get(SETTING_ACCOUNTS_SEEDED) == "1"
+
+
+def test_a_fresh_installation_gets_no_mailbox_from_the_env(tmp_path):
+    """Without IMAP_* in the .env the mailbox is set up in the web UI."""
+    config = _seed_config(tmp_path, imap_host="", imap_user="", imap_password="")
+    store = AccountStore(config.state_db_path)
+    settings = SettingsStore(config.state_db_path)
 
     seed_from_config(store, settings, config)
 
@@ -11196,7 +12917,7 @@ from mail2nas.archives import (
 )
 from mail2nas.state import SettingsStore
 from mail2nas.storage import LocalStorage, SmbStorage
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 def _store(tmp_path) -> ArchiveStore:
@@ -11310,7 +13031,7 @@ def test_by_key_survives_nonsense(tmp_path):
 
 
 def test_seeding_takes_the_smb_settings_from_the_env(tmp_path):
-    config = _make_config(
+    config = _seed_config(
         tmp_path, storage_backend="smb", smb_host="nas.lan", smb_share="Belege",
         smb_user="archiv", smb_password="geheim",
     )
@@ -11324,7 +13045,7 @@ def test_seeding_takes_the_smb_settings_from_the_env(tmp_path):
 
 
 def test_seeding_takes_the_mounted_directory_from_the_env(tmp_path):
-    config = _make_config(tmp_path, storage_backend="local")
+    config = _seed_config(tmp_path, storage_backend="local")
     store = _store(tmp_path)
 
     seed_from_config(store, SettingsStore(config.state_db_path), config)
@@ -11335,7 +13056,7 @@ def test_seeding_takes_the_mounted_directory_from_the_env(tmp_path):
 
 def test_seeding_happens_only_once(tmp_path):
     """Deleting the last archive in the UI must not resurrect it on restart."""
-    config = _make_config(tmp_path, storage_backend="local")
+    config = _seed_config(tmp_path, storage_backend="local")
     store = _store(tmp_path)
     settings = SettingsStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -11343,6 +13064,25 @@ def test_seeding_happens_only_once(tmp_path):
     for archive in store.all():
         store.delete(archive.id)
     seed_from_config(store, settings, config)
+
+    assert store.all() == []
+
+
+def test_a_fresh_installation_gets_no_archive_from_the_env(tmp_path):
+    config = _seed_config(tmp_path, storage_backend="")
+    store = _store(tmp_path)
+
+    seed_from_config(store, SettingsStore(config.state_db_path), config)
+
+    assert store.all() == []
+
+
+def test_an_incomplete_smb_archive_is_not_taken_over(tmp_path):
+    """Better no archive (the UI says so) than one that can never connect."""
+    config = _seed_config(tmp_path, storage_backend="smb", smb_host="nas", smb_share="x")
+    store = _store(tmp_path)
+
+    seed_from_config(store, SettingsStore(config.state_db_path), config)
 
     assert store.all() == []
 
@@ -11556,34 +13296,34 @@ import pytest
 
 from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.config import parse_extension_list
-from mail2nas.mapping import Mapping, Rule, save_rules
+from dataclasses import replace
+
+from mail2nas.mapping import Mapping, Rule, RuleStore
 from mail2nas.pickups import PickupStore
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import PrintService
 from mail2nas.scanning import PickupRunner
-from mail2nas.storage import LocalStorage
-from tests.test_archiver import RecordingSpooler, _make_config
+from tests.test_archiver import RecordingSpooler, _make_options
 
 
-def _env(tmp_path, rules=None, **config_overrides):
+def _env(tmp_path, rules=None, **option_overrides):
     """A runner over <tmp_path> as the default archive, plus a second one."""
     second = tmp_path / "nas2"
     second.mkdir(exist_ok=True)
 
-    config = _make_config(tmp_path, **config_overrides)
     archives = ArchiveStore(str(tmp_path / "state.db"))
     archives.add(name="Haupt", backend="local", path=str(tmp_path))
     second_id = archives.add(name="NAS 2", backend="local", path=str(second))
-    storages = StorageSet(archives, LocalStorage(config.storage_root))
+    storages = StorageSet(archives)
 
-    storage = LocalStorage(config.storage_root)
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    store = RuleStore(str(tmp_path / "state.db"))
     if rules:
-        save_rules(storage, config.mapping_path, rules)
-        mapping.reload(force=True)
+        store.save(rules)
+    mapping = Mapping(store)
 
     pickups = PickupStore(str(tmp_path / "state.db"))
-    runner = PickupRunner(config, mapping, storages, pickups, min_age_seconds=0)
+    options = _make_options(pickup_min_age=0, **option_overrides)
+    runner = PickupRunner(options, mapping, storages, pickups)
     return runner, pickups, second, str(second_id)
 
 
@@ -11655,7 +13395,7 @@ def test_two_scans_of_the_same_name_do_not_overwrite_each_other(tmp_path):
 
 def test_a_file_still_being_written_is_left_alone(tmp_path):
     runner, pickups, _, _ = _env(tmp_path)
-    runner.min_age_seconds = 30
+    runner._options = replace(runner.options, pickup_min_age=30)
     pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
     source = _drop(tmp_path / "scans", "halb.pdf", age=0)
 
@@ -11767,7 +13507,8 @@ def test_the_quarantine_list_is_read_live(tmp_path):
     """Editing it in the web UI has to take effect without a restart."""
     runner, pickups, _, _ = _env(tmp_path)
     blocked = {"value": parse_extension_list("exe")}
-    runner._blocked_extensions = lambda: blocked["value"]
+    base = runner.options
+    runner._options = lambda: replace(base, blocked_extensions=blocked["value"])
     pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
 
     blocked["value"] = parse_extension_list("pdf")
@@ -11895,7 +13636,7 @@ from mail2nas.printers import (
     seed_from_config,
 )
 from mail2nas.state import SettingsStore
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 @pytest.fixture
@@ -12000,7 +13741,7 @@ def test_the_name_defaults_to_the_queue(store):
 
 
 def _seed_env(tmp_path, **overrides):
-    config = _make_config(tmp_path, **overrides)
+    config = _seed_config(tmp_path, **overrides)
     settings = SettingsStore(config.state_db_path)
     store = PrinterStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -12022,7 +13763,7 @@ def test_nothing_is_created_without_a_configured_queue(tmp_path):
 
 
 def test_deleting_the_seeded_printer_does_not_resurrect_it(tmp_path):
-    config = _make_config(tmp_path, printer_destination="Kyocera_M2540")
+    config = _seed_config(tmp_path, printer_destination="Kyocera_M2540")
     settings = SettingsStore(config.state_db_path)
     store = PrinterStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -12618,13 +14359,8 @@ from __future__ import annotations
 
 import pytest
 
-from mail2nas.accounts import AccountStore
 from mail2nas.main import reconcile
-from mail2nas.mapping import Mapping
-from mail2nas.runtime import Runtime
-from mail2nas.state import ProcessedStore, SettingsStore
-from mail2nas.storage import LocalStorage
-from tests.test_archiver import _make_config
+from tests.test_archiver import _make_runtime
 
 
 class FakeWorker:
@@ -12648,16 +14384,7 @@ class FakeWorker:
 
 @pytest.fixture
 def runtime(tmp_path):
-    config = _make_config(tmp_path)
-    storage = LocalStorage(config.storage_root)
-    return Runtime(
-        config,
-        storage,
-        Mapping(storage, config.mapping_path, config.fallback_folder),
-        ProcessedStore(config.state_db_path),
-        SettingsStore(config.state_db_path),
-        AccountStore(config.state_db_path),
-    )
+    return _make_runtime(tmp_path)
 
 
 def _add(runtime, **fields):
@@ -12748,6 +14475,338 @@ def test_a_dead_worker_is_replaced(runtime):
     reconcile(runtime, workers, FakeWorker)
 
     assert workers[account_id].is_alive()
+
+
+# --- readiness: nothing is filed before there is somewhere to file to -----------
+
+
+def _supervisor(runtime):
+    from mail2nas.main import Supervisor
+
+    return Supervisor(runtime, FakeWorker)
+
+
+def test_without_an_archive_no_mailbox_is_watched(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert supervisor.workers == {}
+    assert runtime.status.archive.ok is False
+    assert "Kein Archiv" in runtime.status.archive.detail
+
+
+def test_an_archive_that_fails_its_write_test_stops_the_workers(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+    runtime.archives.add(name="Weg", backend="local", path=str(tmp_path / "gibt-es-nicht"))
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert supervisor.workers == {}
+    assert runtime.status.archive.ok is False
+
+
+def test_once_the_archive_works_the_mailboxes_are_watched(runtime):
+    _add(runtime)
+    supervisor = _supervisor(runtime)
+
+    supervisor.step()
+
+    assert len(supervisor.workers) == 1
+    assert runtime.status.archive.ok is True
+
+
+def test_an_archive_that_is_not_a_mount_point_is_flagged(runtime):
+    """A missing bind mount looks exactly like this - so it is said loudly."""
+    _supervisor(runtime).step()
+
+    assert "kein Mountpoint" in runtime.status.archive.detail
+
+
+def test_the_old_rule_file_is_taken_over_before_the_first_mail(tmp_path):
+    (tmp_path / "mapping.yaml").write_text("RE: rechnungen\nLieferschein: lieferscheine\n",
+                                           encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+    _add(runtime)
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["Lieferschein", "RE"]
+    assert not (tmp_path / "mapping.yaml").exists()
+    assert (tmp_path / "mapping.yaml.migriert").exists()
+
+
+def test_the_rule_file_is_found_where_the_old_env_said(tmp_path):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "regeln.yaml").write_text("RE: rechnungen\n", encoding="utf-8")
+    runtime = _make_runtime(tmp_path, environ={"MAPPING_PATH": "config/regeln.yaml"})
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["RE"]
+
+
+def test_a_broken_rule_file_is_left_alone_and_explained(tmp_path):
+    (tmp_path / "mapping.yaml").write_text("rules: [kaputt", encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+
+    _supervisor(runtime).step()
+
+    assert (tmp_path / "mapping.yaml").exists()
+    from mail2nas.migrate import SETTING_RULES_NOTE
+
+    assert "nicht uebernommen" in runtime.settings.get(SETTING_RULES_NOTE)
+
+
+def test_rules_already_in_the_database_are_not_overwritten(tmp_path):
+    from mail2nas.mapping import Rule
+
+    (tmp_path / "mapping.yaml").write_text("ALT: alt\n", encoding="utf-8")
+    runtime = _make_runtime(tmp_path)
+    runtime.mapping.save([Rule.create("NEU", "neu")])
+
+    _supervisor(runtime).step()
+
+    assert [r.keyword for r in runtime.mapping.rules] == ["NEU"]
+
+
+# --- IDLE reacts to a stop within seconds --------------------------------------
+
+
+class _IdleClient:
+    def __init__(self):
+        self.idle_calls = 0
+
+    def idle(self):
+        self.idle_calls += 1
+
+    def idle_check(self, timeout):
+        import time
+
+        time.sleep(0.01)
+        return []
+
+    def idle_done(self):
+        pass
+
+
+def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkeypatch):
+    import threading
+    import time
+
+    from mail2nas import main as main_module
+
+    monkeypatch.setattr(main_module, "IDLE_SLICE", 0.05)
+    account_id = _add(runtime, mode="idle")
+    worker = main_module._Worker(runtime, runtime.accounts.get(account_id))
+
+    class _Archiver:
+        def run_once(self, client):
+            return 0
+
+    thread = threading.Thread(
+        target=worker._run_idle, args=(_Archiver(), _IdleClient(), "test"), daemon=True
+    )
+    thread.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    worker.stop()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 1  # not the 300 s poll interval
+MAIL2NAS_EOF
+
+# --- tests/test_migrate.py ---
+cat > tests/test_migrate.py <<'MAIL2NAS_EOF'
+"""Coming from an older installation, and the commands the scripts use."""
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
+from mail2nas import cli
+from mail2nas.migrate import migration_status
+from mail2nas.options import Options, OptionsError, OptionsStore, as_form, validate
+from mail2nas.state import SettingsStore
+from tests.test_archiver import _make_runtime
+
+OLD_ENV = {
+    "IMAP_HOST": "imap.example.com", "IMAP_USER": "archiv@example.com",
+    "IMAP_PASSWORD": "geheim", "IMAP_MODE": "idle",
+    "STORAGE_BACKEND": "local", "STORAGE_ROOT": "/mnt/nas",
+    "FALLBACK_FOLDER": "sonstiges", "MATCH_BODY": "true", "POLL_INTERVAL_SECONDS": "120",
+    "BLOCKED_EXTENSIONS": "exe,js", "DRY_RUN": "true", "PRINTER_DESTINATION": "Buero",
+    "MAPPING_PATH": "config/regeln.yaml",
+}
+
+
+# --- the .env of an older version is carried over, once -------------------------
+
+
+def test_an_old_env_arrives_complete_in_the_database(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False, environ=OLD_ENV)
+
+    account = runtime.accounts.all()[0]
+    assert (account.host, account.user, account.mode) == ("imap.example.com", "archiv@example.com", "idle")
+    assert [(a.backend, a.path) for a in runtime.archives.all()] == [("local", "/mnt/nas")]
+    assert [p.destination for p in runtime.printers.all()] == ["Buero"]
+    options = runtime.options
+    assert options.fallback_folder == "sonstiges"
+    assert options.match_body is True
+    assert options.poll_interval == 120
+    assert options.blocked_extensions == {"exe", "js"}
+    assert options.dry_run is True
+    assert runtime.settings.get("mapping_path") == "config/regeln.yaml"
+
+
+def test_after_the_first_start_the_env_no_longer_matters(tmp_path):
+    _make_runtime(tmp_path, with_archive=False, environ=OLD_ENV)
+
+    runtime = _make_runtime(tmp_path, with_archive=False,
+                            environ={**OLD_ENV, "FALLBACK_FOLDER": "anders"})
+
+    assert runtime.options.fallback_folder == "sonstiges"
+    assert len(runtime.accounts.all()) == 1
+
+
+def test_values_edited_in_the_old_ui_beat_the_env(tmp_path):
+    """The quarantine list was editable before - that is the newer statement."""
+    settings = SettingsStore(str(tmp_path / "state.db"))
+    settings.set("blocked_extensions", "exe,scr")
+
+    runtime = _make_runtime(tmp_path, with_archive=False, environ=OLD_ENV)
+
+    assert runtime.options.blocked_extensions == {"exe", "scr"}
+
+
+def test_a_fresh_installation_starts_with_defaults_and_nothing_else(tmp_path):
+    runtime = _make_runtime(tmp_path, with_archive=False)
+
+    assert runtime.options == Options()
+    assert runtime.accounts.all() == []
+    assert runtime.archives.all() == []
+    assert all(migration_status(runtime)[key] for key in
+               ("options_seeded", "accounts_seeded", "archives_seeded", "printers_seeded"))
+
+
+# --- the settings themselves --------------------------------------------------
+
+
+def test_every_setting_round_trips_through_the_form():
+    options = Options(fallback_folder="a/b", match_body=True, dry_run=True,
+                      printable_extensions=frozenset({"pdf"}))
+
+    assert validate(as_form(options)) == options
+
+
+def test_a_value_broken_in_the_database_falls_back_to_its_default(tmp_path):
+    settings = SettingsStore(str(tmp_path / "state.db"))
+    settings.set("opt.poll_interval", "nie")
+
+    assert OptionsStore(settings).load().poll_interval == Options().poll_interval
+
+
+@pytest.mark.parametrize("prefix", ["", "datum"])
+def test_an_unknown_filename_prefix_is_refused(prefix):
+    form = as_form(Options())
+    form["filename_prefix"] = prefix or "x"
+
+    with pytest.raises(OptionsError):
+        validate(form)
+
+
+# --- the maintenance commands ------------------------------------------------------
+
+
+@pytest.fixture
+def container(tmp_path, monkeypatch):
+    """Point the CLI at a database in tmp_path, like STATE_DB_PATH in the container."""
+    for key in OLD_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "state.db"))
+    return tmp_path
+
+
+def test_status_reports_what_the_update_script_waits_for(container, capsys):
+    assert cli.main(["status"]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["options_seeded"] and status["rules_migrated"] is False
+    assert status["archives"] == 0
+
+
+def test_the_generated_password_can_be_shown_and_reset(container, capsys):
+    from mail2nas.web import SETTING_PASSWORD_HASH, ensure_password
+
+    settings = SettingsStore(str(container / "state.db"))
+    generated = ensure_password(settings, "", str(container))
+
+    assert cli.main(["password"]) == 0
+    assert capsys.readouterr().out.strip() == generated
+
+    before = settings.get(SETTING_PASSWORD_HASH)
+    assert cli.main(["reset-password"]) == 0
+    new = capsys.readouterr().out.strip()
+    assert new != generated
+    assert settings.get(SETTING_PASSWORD_HASH) != before
+
+
+def test_password_says_so_when_it_was_already_changed(container, capsys):
+    assert cli.main(["password"]) == 1
+
+
+def _archive_to_smb(monkeypatch, payload: dict, works: bool = True):
+    from mail2nas import storage as storage_module
+
+    class FakeSmb:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def check_writable(self):
+            if not works:
+                raise SystemExit("STATUS_LOGON_FAILURE")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(storage_module, "SmbStorage", FakeSmb)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    return cli.main(["archive-to-smb"])
+
+
+SMB = {"host": "nas.lan", "share": "Belege", "user": "archiv", "password": "geheim"}
+
+
+def test_a_host_mount_can_be_switched_to_direct_smb(container, monkeypatch):
+    runtime = _make_runtime(container, with_archive=False)
+    runtime.archives.add(name="Archiv", backend="local", path="/mnt/nas")
+
+    assert _archive_to_smb(monkeypatch, SMB) == 0
+
+    archive = runtime.archives.all()[0]
+    assert (archive.backend, archive.host, archive.share, archive.path) == ("smb", "nas.lan", "Belege", "")
+
+
+def test_a_failed_smb_test_leaves_the_mount_in_place(container, monkeypatch):
+    runtime = _make_runtime(container, with_archive=False)
+    runtime.archives.add(name="Archiv", backend="local", path="/mnt/nas")
+
+    assert _archive_to_smb(monkeypatch, SMB, works=False) == 1
+
+    assert runtime.archives.all()[0].backend == "local"
+
+
+def test_nothing_to_switch_is_reported_as_such(container, monkeypatch):
+    _make_runtime(container, with_archive=False)
+
+    assert _archive_to_smb(monkeypatch, SMB) == 2
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---
@@ -12758,6 +14817,7 @@ touch tests/__init__.py
 
 echo "Fertig: $TARGET enthaelt jetzt das komplette mail2nas-Projekt."
 echo "Naechste Schritte:"
-echo "  cd $TARGET"
-echo "  cp .env.example .env && \$EDITOR .env"
-echo "  # siehe README.md (Abschnitt 'Installation, Variante 2') fuer den Rest"
+echo "  Neuinstallation:  cd $TARGET && cp .env.example .env && docker compose up -d --build"
+echo "                    Startpasswort: docker compose exec mail2nas python -m mail2nas.cli password"
+echo "  Update:           MAIL2NAS_OFFLINE=1 bash $TARGET/scripts/proxmox/update.sh"
+echo "  Danach alles Weitere in der Weboberflaeche (http://<ip>:8080/)."

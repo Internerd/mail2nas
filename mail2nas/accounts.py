@@ -5,13 +5,12 @@ Editing it in the UI - and having more than one - means the configuration has
 to live somewhere writable, so it goes into the same SQLite file as the rest
 of the local state.
 
-The environment still seeds the first account on a fresh install, so an
-existing `.env` keeps working and nothing has to be re-entered. After that the
-database wins: changes made in the UI survive restarts and updates, and the
-IMAP_* variables are ignored.
+Mailboxes are created in the web UI. An installation updated from a version
+that configured its mailbox in the `.env` gets that one carried over once (see
+`migrate.py`); after that the `.env` is not read for it any more.
 
 Note this means the state database now holds IMAP passwords in clear text.
-It needs the same protection as the `.env` file - see the README.
+It is kept at mode 0600 in a Docker volume, never on the share - see the README.
 """
 from __future__ import annotations
 
@@ -240,7 +239,10 @@ def _defaults(fields: dict) -> dict:
 
 
 def seed_from_config(store: AccountStore, settings, config) -> None:
-    """Create the first account from the environment, once.
+    """Carry the mailbox of an older `.env` over, once.
+
+    `config` is a `LegacyEnv`. A fresh installation has no mailbox in its
+    `.env` - it is set up in the web UI - so nothing is created then.
 
     Guarded by a flag rather than by "is the table empty", so deleting the
     last account in the UI does not resurrect it from the .env on the next
@@ -248,7 +250,7 @@ def seed_from_config(store: AccountStore, settings, config) -> None:
     """
     if settings.get(SETTING_ACCOUNTS_SEEDED):
         return
-    if store.all():
+    if store.all() or not (config.imap_host and config.imap_user):
         settings.set(SETTING_ACCOUNTS_SEEDED, "1")
         return
 

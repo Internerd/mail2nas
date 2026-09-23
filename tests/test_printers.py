@@ -11,7 +11,7 @@ from mail2nas.printers import (
     seed_from_config,
 )
 from mail2nas.state import SettingsStore
-from tests.test_archiver import _make_config
+from tests.test_archiver import _seed_config
 
 
 @pytest.fixture
@@ -116,7 +116,7 @@ def test_the_name_defaults_to_the_queue(store):
 
 
 def _seed_env(tmp_path, **overrides):
-    config = _make_config(tmp_path, **overrides)
+    config = _seed_config(tmp_path, **overrides)
     settings = SettingsStore(config.state_db_path)
     store = PrinterStore(config.state_db_path)
     seed_from_config(store, settings, config)
@@ -138,7 +138,7 @@ def test_nothing_is_created_without_a_configured_queue(tmp_path):
 
 
 def test_deleting_the_seeded_printer_does_not_resurrect_it(tmp_path):
-    config = _make_config(tmp_path, printer_destination="Kyocera_M2540")
+    config = _seed_config(tmp_path, printer_destination="Kyocera_M2540")
     settings = SettingsStore(config.state_db_path)
     store = PrinterStore(config.state_db_path)
     seed_from_config(store, settings, config)

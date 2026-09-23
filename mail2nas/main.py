@@ -6,18 +6,17 @@ import sys
 import threading
 import time
 
-from . import printing as printing_module
-from . import storage as storage_module
-from .accounts import AccountStore, seed_from_config
+from .accounts import AccountStore
 from .addresses import AddressStore
 from .archiver import Archiver
 from .archives import ArchiveStore
-from .archives import seed_from_config as seed_archive_from_config
 from .config import Config
+from .legacy import LegacyEnv
+from .mapping import RuleStore
+from .migrate import migrate_rule_file, rules_settled, seed_from_legacy
 from .pickups import PICKUP_INTERVAL, PickupStore
 from .printers import PrinterStore
-from .printers import seed_from_config as seed_printer_from_config
-from .runtime import SETTING_MAPPING_PATH, Runtime
+from .runtime import Runtime
 from .scanning import PickupRunner
 from .state import ProcessedStore, SettingsStore
 
@@ -27,6 +26,34 @@ logger = logging.getLogger("mail2nas")
 # removed in the web UI. Short enough to feel immediate, long enough to be
 # free.
 SUPERVISOR_INTERVAL = 5
+# How often an archive that failed its write test is tried again.
+ARCHIVE_RETRY = 60
+# IMAP IDLE is waited on in short slices, so stopping a worker (because its
+# settings changed) takes a few seconds instead of up to a whole interval.
+IDLE_SLICE = 5
+# RFC 2177: re-issue IDLE before 29 minutes, or the server may drop us.
+MAX_IDLE = 29 * 60
+
+
+def build_runtime(config: Config, environ=None) -> Runtime:
+    """Open the database, bring an older installation up to date, wire it up."""
+    settings = SettingsStore(config.state_db_path)
+    # Before anything is written: the file holds IMAP and SMB passwords.
+    _protect_state_file(config.state_db_path)
+    printers = PrinterStore(config.state_db_path)
+    runtime = Runtime(
+        config,
+        settings,
+        AccountStore(config.state_db_path),
+        ProcessedStore(config.state_db_path),
+        RuleStore(config.state_db_path),
+        printers=printers,
+        addresses=AddressStore(config.state_db_path),
+        archives=ArchiveStore(config.state_db_path),
+        pickups=PickupStore(config.state_db_path),
+    )
+    seed_from_legacy(runtime, LegacyEnv.from_environ(environ))
+    return runtime
 
 
 def main() -> None:
@@ -37,96 +64,45 @@ def main() -> None:
     )
 
     config = Config.from_env()
-    env_storage = storage_module.from_config(config)
+    runtime = build_runtime(config)
 
-    settings = SettingsStore(config.state_db_path)
-    accounts = AccountStore(config.state_db_path)
-    # Before seeding: from here on the file contains IMAP passwords.
-    _protect_state_file(config.state_db_path)
-    seed_from_config(accounts, settings, config)
+    if os.environ.get("WEB_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
+        # The web UI is the only place left to configure anything, so it
+        # cannot be switched off any more. Say so instead of silently ignoring.
+        logger.warning("WEB_ENABLED=false is ignored - the web UI is where mail2nas is configured")
 
-    printers = PrinterStore(config.state_db_path)
-    seed_printer_from_config(printers, settings, config)
-    printing = printing_module.from_config(config, printers)
-    addresses = AddressStore(config.state_db_path)
-    archives = ArchiveStore(config.state_db_path)
-    seed_archive_from_config(archives, settings, config)
-    pickups = PickupStore(config.state_db_path)
+    # Imported here so the modules above stay importable without Flask.
+    from . import web
 
-    mapping_path = settings.get(SETTING_MAPPING_PATH) or config.mapping_path
-    store = ProcessedStore(config.state_db_path)
-    runtime = Runtime(
-        config,
-        env_storage,
-        None,  # the mapping needs the default archive, which Runtime resolves
-        store,
-        settings,
-        accounts,
-        printers=printers,
-        printing=printing,
-        addresses=addresses,
-        archives=archives,
-        pickups=pickups,
-    )
-    # Fail fast: an unreachable share is otherwise indistinguishable from an
-    # empty one, and attachments would land somewhere they silently vanish.
-    runtime.storage.check_writable()
-    runtime.attach_mapping(mapping_path)
-    _check_other_archives(runtime)
+    web.serve(runtime)
 
-    if config.web_enabled:
-        # Imported lazily so the archiver still runs if the web dependencies
-        # are missing (e.g. an older image built before the UI existed).
-        from . import web
-
-        web.serve(runtime)
-
+    options = runtime.options
     logger.info(
-        "Starting mail2nas: archive=%s mapping=%s archives=%d printers=%d addresses=%d "
+        "Starting mail2nas: mailboxes=%d archives=%d rules=%d printers=%d addresses=%d "
         "pickups=%d dry_run=%s",
-        runtime.storage.description,
-        mapping_path,
-        len(archives.enabled()) or 1,
-        len(printers.enabled()) if config.printing_enabled else 0,
-        len(addresses.enabled()),
-        len(pickups.enabled()),
-        config.dry_run,
+        len(runtime.accounts.enabled()),
+        len(runtime.archives.enabled()),
+        runtime.rule_store.count(),
+        len(runtime.printers.enabled()) if options.printing_enabled else 0,
+        len(runtime.addresses.enabled()),
+        len(runtime.pickups.enabled()),
+        options.dry_run,
     )
 
+    supervisor = Supervisor(runtime)
     try:
-        _supervise(runtime)
+        supervisor.run()
     finally:
-        store.close()
+        supervisor.stop_all()
+        runtime.store.close()
         runtime.storages.close()
-        env_storage.close()
-
-
-def _check_other_archives(runtime: Runtime) -> None:
-    """Report archives besides the default one, without refusing to start.
-
-    The default archive is fatal when it is unreachable - nothing can be
-    filed at all. A second NAS being down is different: everything else keeps
-    working, and the mails meant for it are simply retried until it is back.
-    """
-    if runtime.archives is None:
-        return
-    default = runtime.archives.default()
-    for archive in runtime.archives.enabled():
-        if default is not None and archive.id == default.id:
-            continue
-        try:
-            archive.to_storage().check_writable()
-        except SystemExit as exc:
-            logger.error("Archive %r is not usable: %s", archive.name, exc)
-        except Exception as exc:  # noqa: BLE001 - never fail startup over a second archive
-            logger.error("Archive %r is not usable: %s", archive.name, exc)
-        else:
-            logger.info("Archive %r -> %s", archive.name, archive.location())
 
 
 def _protect_state_file(path: str) -> None:
-    """The state database holds IMAP passwords, so nobody else may read it."""
+    """The state database holds passwords, so nobody else may read it."""
     try:
+        if not os.path.exists(path):
+            open(path, "a").close()
         os.chmod(path, 0o600)
     except OSError as exc:
         logger.warning("Could not restrict permissions on %s (%s)", path, exc)
@@ -143,6 +119,7 @@ class _Worker:
     def __init__(self, runtime: Runtime, account):
         self.account = account
         self.fingerprint = account.fingerprint()
+        self.key = f"account:{account.id}"
         self._runtime = runtime
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -150,6 +127,7 @@ class _Worker:
         )
 
     def start(self) -> None:
+        self._runtime.status.worker(self.key, self.account.name)
         self._thread.start()
 
     def stop(self) -> None:
@@ -158,19 +136,21 @@ class _Worker:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
+    def _interval(self) -> int:
+        return self._runtime.options.poll_interval
+
     def _run(self) -> None:
-        config = self._runtime.config
+        runtime = self._runtime
         archiver = Archiver(
-            config,
-            self._runtime.mapping,
-            self._runtime.store,
-            self._runtime.storage,
+            lambda: runtime.options,
+            runtime.mapping,
+            runtime.store,
+            runtime.storages,
             self.account,
-            self._runtime.printing,
-            self._runtime.addresses,
-            self._runtime.storages,
-            lambda: self._runtime.blocked_extensions,
+            runtime.printing,
+            runtime.addresses,
         )
+        status = runtime.status
         label = f"{self.account.name} <{self.account.user}>"
         logger.info(
             "Account %s: watching %s on %s (%s mode)",
@@ -181,15 +161,15 @@ class _Worker:
         )
 
         while not self._stop.is_set():
+            status.set(self.key, "verbindet")
             try:
                 client = archiver.connect()
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "Account %s: IMAP connection failed, retrying in %ss",
-                    label,
-                    config.poll_interval,
+                    "Account %s: IMAP connection failed, retrying in %ss", label, self._interval()
                 )
-                self._stop.wait(config.poll_interval)
+                status.error(self.key, f"Verbindung fehlgeschlagen: {exc}")
+                self._stop.wait(self._interval())
                 continue
 
             try:
@@ -197,41 +177,47 @@ class _Worker:
                     self._run_idle(archiver, client, label)
                 else:
                     self._run_poll(archiver, client, label)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "Account %s: IMAP session failed, reconnecting in %ss",
-                    label,
-                    config.poll_interval,
+                    "Account %s: IMAP session failed, reconnecting in %ss", label, self._interval()
                 )
+                status.error(self.key, f"Sitzung abgebrochen: {exc}")
             finally:
                 try:
                     client.logout()
                 except Exception:
                     pass
-            self._stop.wait(config.poll_interval)
+            self._stop.wait(self._interval())
 
+        status.set(self.key, "gestoppt")
         logger.info("Account %s: stopped", label)
 
     def _cycle(self, archiver: Archiver, client, label: str) -> None:
         count = archiver.run_once(client)
+        status = self._runtime.status
         if count:
             logger.info("Account %s: processed %d message(s)", label, count)
+            status.processed(self.key, count)
+        status.set(self.key, "verbunden", "IDLE" if self.account.mode == "idle" else "Polling")
 
     def _run_poll(self, archiver: Archiver, client, label: str) -> None:
         while not self._stop.is_set():
             self._cycle(archiver, client, label)
-            self._stop.wait(self._runtime.config.poll_interval)
+            self._stop.wait(self._interval())
 
     def _run_idle(self, archiver: Archiver, client, label: str) -> None:
         self._cycle(archiver, client, label)
-        idle_timeout = self._runtime.config.poll_interval or 300
         while not self._stop.is_set():
+            deadline = time.monotonic() + min(max(self._interval(), IDLE_SLICE), MAX_IDLE)
             client.idle()
             try:
-                client.idle_check(timeout=idle_timeout)
+                while not self._stop.is_set() and time.monotonic() < deadline:
+                    if client.idle_check(timeout=IDLE_SLICE):
+                        break
             finally:
                 client.idle_done()
-            self._cycle(archiver, client, label)
+            if not self._stop.is_set():
+                self._cycle(archiver, client, label)
 
 
 def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
@@ -246,13 +232,14 @@ def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
     for account_id, worker in list(workers.items()):
         account = wanted.get(account_id)
         if account is None or account.fingerprint() != worker.fingerprint:
-            # Settings changed or the account is gone. The worker notices at
-            # the end of its current cycle, so a reconnect can lag by up to
-            # one poll interval.
+            # Settings changed or the account is gone. The worker notices
+            # within a few seconds (see IDLE_SLICE).
             if account is not None:
                 logger.info("Account %s: configuration changed, restarting", account.name)
             worker.stop()
             del workers[account_id]
+            if account is None:
+                runtime.status.forget(f"account:{account_id}")
         elif not worker.is_alive():
             del workers[account_id]
 
@@ -265,58 +252,139 @@ def reconcile(runtime: Runtime, workers: dict, factory=None) -> dict:
     return workers
 
 
-def _make_pickup_runner(runtime: Runtime) -> PickupRunner | None:
-    if runtime.pickups is None:
-        return None
-    return PickupRunner(
-        runtime.config,
-        runtime.mapping,
-        runtime.storages,
-        runtime.pickups,
-        printing=runtime.printing,
-        blocked_extensions=lambda: runtime.blocked_extensions,
-        min_age_seconds=runtime.pickup_min_age,
-    )
+class Supervisor:
+    """Keeps the workers in line with what is configured in the UI.
 
+    Nothing is started before the service is *ready*: an archive exists and
+    passed its write test, and the rules of an older installation have been
+    taken over. Filing mail before that would put it into a directory that
+    may not be the share, or file it without its rules.
+    """
 
-def _supervise(runtime: Runtime) -> None:
-    """Keep one worker per enabled account, following changes made in the UI."""
-    workers: dict[int, _Worker] = {}
-    idle_warning_shown = False
-    pickup = _make_pickup_runner(runtime)
-    next_pickup = 0.0
-    try:
-        while True:
-            reconcile(runtime, workers)
+    def __init__(self, runtime: Runtime, factory=None):
+        self.runtime = runtime
+        self.workers: dict[int, object] = {}
+        self._factory = factory
+        self._pickup = (
+            PickupRunner(
+                lambda: runtime.options,
+                runtime.mapping,
+                runtime.storages,
+                runtime.pickups,
+                printing=runtime.printing,
+            )
+            if runtime.pickups is not None
+            else None
+        )
+        self._next_pickup = 0.0
+        self._was_ready: bool | None = None
 
-            # Folders are walked on their own schedule: the supervisor wakes
-            # up every few seconds to notice UI changes, which is far more
-            # often than a share should be listed over SMB.
-            if pickup is not None and time.monotonic() >= next_pickup:
-                pickup.min_age_seconds = runtime.pickup_min_age
-                try:
-                    filed = pickup.run_once()
-                    if filed:
-                        logger.info("Picked up %d document(s) from the watched folders", filed)
-                except Exception:  # noqa: BLE001 - never let this stop the supervisor
-                    logger.exception("Pickup cycle failed")
-                next_pickup = time.monotonic() + PICKUP_INTERVAL
+    # --- readiness -------------------------------------------------------------
 
-            if not workers and not idle_warning_shown:
-                # Once, not on every pass - this loop runs every few seconds.
+    def check_archive(self) -> bool:
+        """Write-test the default archive when it changed, or retry a failure."""
+        runtime = self.runtime
+        status = runtime.status.archive
+        archive = runtime.default_archive()
+        if archive is None:
+            status.ok, status.detail, status.fingerprint = False, "Kein Archiv eingerichtet.", ()
+            return False
+
+        fingerprint = (archive.id, *archive.fingerprint())
+        due = status.checked_at is None or (
+            not status.ok and time.time() - status.checked_at >= ARCHIVE_RETRY
+        )
+        if fingerprint == status.fingerprint and not due:
+            return bool(status.ok)
+
+        status.fingerprint = fingerprint
+        status.checked_at = time.time()
+        try:
+            runtime.storages.get(archive.key).check_writable()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit is how check_writable reports
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            status.ok, status.detail = False, str(exc) or exc.__class__.__name__
+            logger.error("Archive %r is not usable: %s", archive.name, status.detail)
+            return False
+
+        status.ok = True
+        status.detail = f"{archive.location()} ist erreichbar und beschreibbar."
+        if archive.backend == "local" and not os.path.ismount(archive.path):
+            # Not fatal - a directory on the container's own disk is a valid
+            # (if unusual) choice - but it is exactly what a missing bind mount
+            # looks like, and then every attachment would vanish with the next
+            # rebuild. So it is said loudly.
+            status.detail += (
+                " Achtung: das Verzeichnis ist kein Mountpoint - ist das Share "
+                "wirklich eingebunden?"
+            )
+            logger.warning("Archive %r: %s is not a mount point", archive.name, archive.path)
+        logger.info("Archive %r -> %s", archive.name, archive.location())
+        return True
+
+    def ready(self) -> bool:
+        runtime = self.runtime
+        if not self.check_archive():
+            return False
+        if not rules_settled(runtime.settings):
+            migrate_rule_file(runtime.settings, runtime.rule_store, runtime.storage)
+            runtime.mapping.reload()
+        return rules_settled(runtime.settings)
+
+    # --- the loop ----------------------------------------------------------------
+
+    def step(self) -> None:
+        runtime = self.runtime
+        ready = self.ready()
+        if ready != self._was_ready:
+            if ready:
+                logger.info("Ready - watching the configured mailboxes and folders")
+            else:
                 logger.warning(
-                    "No enabled IMAP account configured - nothing is being watched. "
-                    "Add one in the web UI."
+                    "Not ready yet (%s) - nothing is archived until the web UI shows an "
+                    "archive that works",
+                    runtime.status.archive.detail or "rules not taken over yet",
                 )
-            idle_warning_shown = bool(not workers)
+            self._was_ready = ready
 
-            runtime.mapping_path_changed.wait(SUPERVISOR_INTERVAL)
-            if runtime.mapping_path_changed.is_set():
-                runtime.mapping_path_changed.clear()
-                runtime.apply_mapping_path()
-    finally:
-        for worker in workers.values():
+        if not ready:
+            self.stop_all()
+            return
+
+        reconcile(runtime, self.workers, self._factory)
+
+        # Folders are walked on their own schedule: the supervisor wakes up
+        # every few seconds to notice UI changes, which is far more often than
+        # a share should be listed over SMB.
+        if self._pickup is not None and time.monotonic() >= self._next_pickup:
+            try:
+                filed = self._pickup.run_once()
+                if filed:
+                    logger.info("Picked up %d document(s) from the watched folders", filed)
+                    runtime.status.processed("pickups", filed)
+            except Exception:  # noqa: BLE001 - never let this stop the supervisor
+                logger.exception("Pickup cycle failed")
+            self._next_pickup = time.monotonic() + PICKUP_INTERVAL
+
+    def pickup_problems(self) -> dict[int, str]:
+        return self._pickup.problems() if self._pickup is not None else {}
+
+    def run(self) -> None:
+        runtime = self.runtime
+        runtime.supervisor = self
+        while True:
+            self.step()
+            runtime.changed.wait(SUPERVISOR_INTERVAL)
+            if runtime.changed.is_set():
+                runtime.changed.clear()
+                # An archive may have been edited: test it again right away.
+                runtime.status.archive.checked_at = None
+
+    def stop_all(self) -> None:
+        for worker in self.workers.values():
             worker.stop()
+        self.workers.clear()
 
 
 if __name__ == "__main__":

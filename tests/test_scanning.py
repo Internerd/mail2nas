@@ -8,34 +8,34 @@ import pytest
 
 from mail2nas.archives import ArchiveStore, StorageSet
 from mail2nas.config import parse_extension_list
-from mail2nas.mapping import Mapping, Rule, save_rules
+from dataclasses import replace
+
+from mail2nas.mapping import Mapping, Rule, RuleStore
 from mail2nas.pickups import PickupStore
 from mail2nas.printers import PrinterStore
 from mail2nas.printing import PrintService
 from mail2nas.scanning import PickupRunner
-from mail2nas.storage import LocalStorage
-from tests.test_archiver import RecordingSpooler, _make_config
+from tests.test_archiver import RecordingSpooler, _make_options
 
 
-def _env(tmp_path, rules=None, **config_overrides):
+def _env(tmp_path, rules=None, **option_overrides):
     """A runner over <tmp_path> as the default archive, plus a second one."""
     second = tmp_path / "nas2"
     second.mkdir(exist_ok=True)
 
-    config = _make_config(tmp_path, **config_overrides)
     archives = ArchiveStore(str(tmp_path / "state.db"))
     archives.add(name="Haupt", backend="local", path=str(tmp_path))
     second_id = archives.add(name="NAS 2", backend="local", path=str(second))
-    storages = StorageSet(archives, LocalStorage(config.storage_root))
+    storages = StorageSet(archives)
 
-    storage = LocalStorage(config.storage_root)
-    mapping = Mapping(storage, config.mapping_path, config.fallback_folder)
+    store = RuleStore(str(tmp_path / "state.db"))
     if rules:
-        save_rules(storage, config.mapping_path, rules)
-        mapping.reload(force=True)
+        store.save(rules)
+    mapping = Mapping(store)
 
     pickups = PickupStore(str(tmp_path / "state.db"))
-    runner = PickupRunner(config, mapping, storages, pickups, min_age_seconds=0)
+    options = _make_options(pickup_min_age=0, **option_overrides)
+    runner = PickupRunner(options, mapping, storages, pickups)
     return runner, pickups, second, str(second_id)
 
 
@@ -107,7 +107,7 @@ def test_two_scans_of_the_same_name_do_not_overwrite_each_other(tmp_path):
 
 def test_a_file_still_being_written_is_left_alone(tmp_path):
     runner, pickups, _, _ = _env(tmp_path)
-    runner.min_age_seconds = 30
+    runner._options = replace(runner.options, pickup_min_age=30)
     pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
     source = _drop(tmp_path / "scans", "halb.pdf", age=0)
 
@@ -219,7 +219,8 @@ def test_the_quarantine_list_is_read_live(tmp_path):
     """Editing it in the web UI has to take effect without a restart."""
     runner, pickups, _, _ = _env(tmp_path)
     blocked = {"value": parse_extension_list("exe")}
-    runner._blocked_extensions = lambda: blocked["value"]
+    base = runner.options
+    runner._options = lambda: replace(base, blocked_extensions=blocked["value"])
     pickups.add(name="Kopierer", folder="scans", target_folder="eingang")
 
     blocked["value"] = parse_extension_list("pdf")

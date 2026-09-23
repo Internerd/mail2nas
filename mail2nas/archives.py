@@ -43,6 +43,10 @@ class ArchiveError(ValueError):
     """An archive the user tried to save is not usable."""
 
 
+class NoArchiveError(RuntimeError):
+    """Nothing to file into yet - no archive is configured (or all are paused)."""
+
+
 @dataclass(frozen=True)
 class Archive:
     """One place to file into: an SMB share, or a directory on this machine."""
@@ -296,7 +300,11 @@ def validate(fields: dict) -> dict:
 
 
 def seed_from_config(store: ArchiveStore, settings, config) -> None:
-    """Create the first archive from the environment, once.
+    """Carry the archive of an older `.env` over, once.
+
+    `config` is a `LegacyEnv`, which has already worked out which generation
+    of installation this is (see `legacy.py`). A fresh installation describes
+    no archive at all - it is set up in the web UI - so nothing is created.
 
     Guarded by a flag rather than by "is the table empty", so deleting the
     last archive in the UI does not resurrect it from the .env on the next
@@ -304,27 +312,32 @@ def seed_from_config(store: ArchiveStore, settings, config) -> None:
     """
     if settings.get(SETTING_ARCHIVES_SEEDED):
         return
-    if store.all():
+    if store.all() or config.storage_backend not in BACKENDS:
         settings.set(SETTING_ARCHIVES_SEEDED, "1")
         return
 
-    if config.storage_backend == "smb":
-        store.add(
-            name=config.smb_share or config.smb_host,
-            backend="smb",
-            host=config.smb_host,
-            share=config.smb_share,
-            user=config.smb_user,
-            password=config.smb_password,
-            domain=config.smb_domain,
-            port=config.smb_port,
-            root=config.smb_root,
-            encrypt=config.smb_encrypt,
-        )
-    else:
-        store.add(name="Archiv", backend="local", path=config.storage_root)
+    try:
+        if config.storage_backend == "smb":
+            store.add(
+                name=config.smb_share or config.smb_host,
+                backend="smb",
+                host=config.smb_host,
+                share=config.smb_share,
+                user=config.smb_user,
+                password=config.smb_password,
+                domain=config.smb_domain,
+                port=config.smb_port,
+                root=config.smb_root,
+                encrypt=config.smb_encrypt,
+            )
+        else:
+            store.add(name="Archiv", backend="local", path=config.storage_root)
+    except ArchiveError as exc:
+        # E.g. an SMB password that was never filled in. The UI shows that no
+        # archive exists; better than a half-configured one.
+        logger.error("The archive from the .env is not usable (%s) - set it up in the web UI", exc)
     settings.set(SETTING_ARCHIVES_SEEDED, "1")
-    logger.info("Created the first archive from the configuration")
+    logger.info("Took the archive over from the .env")
 
 
 class StorageSet:
@@ -336,15 +349,15 @@ class StorageSet:
     restart.
     """
 
-    def __init__(self, archives: ArchiveStore | None, fallback: Storage):
+    def __init__(self, archives: ArchiveStore | None, fallback: Storage | None = None):
         self._archives = archives
         self._fallback = fallback
         self._cache: dict[str, tuple[tuple, Storage]] = {}
         self._lock = threading.Lock()
 
     @property
-    def fallback(self) -> Storage:
-        """The archive from the .env - used when nothing is configured yet."""
+    def fallback(self) -> Storage | None:
+        """A fixed storage used when no archive store is attached (tests)."""
         return self._fallback
 
     def archive_for(self, key: str) -> Archive | None:
@@ -365,6 +378,8 @@ class StorageSet:
         """The storage behind `key`, falling back to the default archive."""
         archive = self.archive_for(key)
         if archive is None:
+            if self._fallback is None:
+                raise NoArchiveError("Es ist noch kein (aktives) Archiv eingerichtet.")
             return self._fallback
         with self._lock:
             cached = self._cache.get(archive.key)
@@ -382,7 +397,9 @@ class StorageSet:
 
     def label_for(self, key: str) -> str:
         archive = self.archive_for(key)
-        return archive.name if archive is not None else self._fallback.description
+        if archive is not None:
+            return archive.name
+        return self._fallback.description if self._fallback is not None else "-"
 
     def close(self) -> None:
         with self._lock:
