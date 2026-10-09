@@ -107,10 +107,25 @@ Im Menue **"Neu installieren"** waehlen. Das Skript
 
 1. fragt nur die Container-Ressourcen ab (Standard: 1 Kern, 512 MB RAM, 4 GB
    Disk, DHCP auf `vmbr0`, unprivilegiert - oder erweitert mit eigener CTID,
-   Bridge, Port),
-2. legt eine Debian-12-LXC mit `nesting=1,keyctl=1` an (noetig fuer Docker),
-3. installiert darin Docker und mail2nas nach `/opt/mail2nas`,
-4. zeigt am Ende **Adresse und Startpasswort** der Weboberflaeche.
+   Bridge, statischer IP/Gateway, Port),
+2. fragt **immer** nach dem **VLAN-Tag** der LXC (leer = untagged). Liegt das
+   Netz, in dem die LXC DHCP und Internet bekommt, in einem VLAN, muss der
+   Tag hier stehen - sonst bekommt der Container keine Adresse und die
+   Installation (apt, Docker, git) scheitert. Bei einer VLAN-aware Bridge
+   muss das VLAN dort ausserdem erlaubt sein (`bridge-vids`),
+3. prueft die Eingaben (CTID frei, Bridge vorhanden, VLAN 1-4094, ...) und
+   legt eine Debian-12-LXC mit `nesting=1,keyctl=1` (noetig fuer Docker) und
+   `tag=<VLAN>` an `net0` an. Kommt der Container danach nicht ins Internet,
+   bietet das Skript an, den VLAN-Tag zu korrigieren und es erneut zu
+   versuchen,
+4. installiert darin Docker und mail2nas nach `/opt/mail2nas`,
+5. zeigt am Ende **Adresse und Startpasswort** der Weboberflaeche.
+
+VLAN einer bestehenden LXC nachtraeglich aendern (auf dem Proxmox-Host):
+
+```bash
+pct set <CTID> --net0 name=eth0,bridge=vmbr0,ip=dhcp,tag=<VLAN> && pct reboot <CTID>
+```
 
 Dasselbe Skript aktualisiert spaeter auch - siehe [Updates](#updates).
 Ohne Menue: `... mail2nas.sh install` bzw. `... mail2nas.sh update [CTID]`.
@@ -131,7 +146,9 @@ aktualisiert - ein erneuter Aufruf ist also gefahrlos.
 Optional: `WEB_PORT=9090 TZ=Europe/Vienna bash -c "$(curl ...)"`.
 
 Bei einer selbst angelegten LXC muessen unter *Optionen -> Features*
-`nesting` und `keyctl` aktiv sein, sonst startet Docker nicht.
+`nesting` und `keyctl` aktiv sein, sonst startet Docker nicht. Haengt das
+Netz in einem VLAN, unter *Netzwerk -> net0* den **VLAN-Tag** setzen - ohne
+ihn bekommt der Container keine Adresse und die Installation scheitert.
 
 ### Variante 3: Ohne Zugriff auf GitHub (Bootstrap)
 

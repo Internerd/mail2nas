@@ -55,6 +55,45 @@ fi
 msg() { whiptail --title "mail2nas" --msgbox "$1" 22 78; }
 yesno() { whiptail --title "mail2nas" --yesno "$1" 18 78; }
 input() { whiptail --title "mail2nas" --inputbox "$1" 10 76 "$2" 3>&1 1>&2 2>&3; }
+die() { echo "FEHLER: $*" >&2; exit 1; }
+
+# Ganzzahl im Bereich min..max erzwingen - lieber vor dem Anlegen abbrechen
+# als mit einer kryptischen pct-Fehlermeldung mittendrin.
+require_int() {
+  local name="$1" value="$2" min="$3" max="$4"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name muss eine ganze Zahl sein, eingegeben: '$value'"
+  { [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]; } \
+    || die "$name muss zwischen $min und $max liegen, eingegeben: $value"
+}
+
+# net0 fuer pct: Bridge, IP (dhcp oder CIDR), optional Gateway und VLAN-Tag.
+net0_spec() {
+  local bridge="$1" ip="$2" gw="$3" vlan="$4" spec
+  spec="name=eth0,bridge=${bridge},ip=${ip}"
+  [ -z "$gw" ] || spec="${spec},gw=${gw}"
+  [ -z "$vlan" ] || spec="${spec},tag=${vlan}"
+  echo "$spec"
+}
+
+ask_vlan() {
+  local vlan
+  vlan="$(whiptail --title "mail2nas" --inputbox "VLAN-Tag fuer die LXC (1-4094). Leer lassen = kein VLAN (untagged).
+
+Liegt das Netz, in dem die LXC DHCP und Internet bekommt, in einem VLAN, muss
+der Tag hier stehen - sonst scheitert die Installation." 14 78 "$1" 3>&1 1>&2 2>&3)"
+  vlan="${vlan//[[:space:]]/}"
+  [ -z "$vlan" ] || require_int "VLAN-Tag" "$vlan" 1 4094
+  echo "$vlan"
+}
+
+container_online() {
+  local _
+  for _ in $(seq 1 30); do
+    if pct exec "$1" -- getent hosts github.com >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
 
 # Befehl im mail2nas-Container einer LXC ausfuehren.
 in_app() {
@@ -228,8 +267,11 @@ Zuordnungen und Drucker richtest du danach in der Weboberflaeche ein - die
 Adresse und das Startpasswort stehen am Ende hier auf dem Bildschirm."
 
   local default_ctid ctid ct_hostname cores ram_mb disk_gb bridge unprivileged web_port
+  local ct_ip ct_gw vlan net0
   default_ctid="$(pvesh get /cluster/nextid)"
   web_port=8080
+  ct_ip="dhcp"
+  ct_gw=""
 
   if yesno "Standard-Einstellungen fuer den Container verwenden?
 
@@ -237,6 +279,7 @@ CTID: ${default_ctid} (naechste freie ID)
 Hostname: mail2nas
 CPU: 1 Kern, RAM: 512 MB, Disk: 4 GB
 Netzwerk: vmbr0, DHCP, unprivilegiert
+  (der VLAN-Tag wird danach in jedem Fall abgefragt)
 Weboberflaeche auf Port 8080
 
 'Nein' fuehrt durch erweiterte Einstellungen."; then
@@ -249,6 +292,10 @@ Weboberflaeche auf Port 8080
     ram_mb="$(input 'RAM in MB' '512')"
     disk_gb="$(input 'Disk in GB' '4')"
     bridge="$(input 'Netzwerk-Bridge' 'vmbr0')"
+    ct_ip="$(input 'IPv4-Adresse mit Praefix (z. B. 192.168.20.50/24) oder dhcp' 'dhcp')"
+    if [ "$ct_ip" != "dhcp" ]; then
+      ct_gw="$(input 'Gateway (IPv4)' '')"
+    fi
     web_port="$(input 'Port der Weboberflaeche' '8080')"
     if yesno "Unprivilegierten Container erstellen? (empfohlen)"; then
       unprivileged=1
@@ -256,6 +303,31 @@ Weboberflaeche auf Port 8080
       unprivileged=0
     fi
   fi
+
+  # Immer fragen, nicht nur im erweiterten Modus: ohne den richtigen Tag
+  # landet die LXC im falschen (untagged) Netz, bekommt keine Adresse und
+  # apt/Docker/git clone schlagen fehl.
+  vlan="$(ask_vlan '')"
+
+  # --- Eingaben pruefen, bevor irgendetwas angelegt wird ---
+  require_int "CTID" "$ctid" 100 999999999
+  require_int "CPU-Kerne" "$cores" 1 512
+  require_int "RAM (MB)" "$ram_mb" 128 4194304
+  require_int "Disk (GB)" "$disk_gb" 1 65536
+  require_int "Port der Weboberflaeche" "$web_port" 1 65535
+  [[ "$ct_hostname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
+    || die "Ungueltiger Hostname '$ct_hostname' (erlaubt: Buchstaben, Ziffern, Bindestrich)."
+  pvesh get /cluster/nextid --vmid "$ctid" >/dev/null 2>&1 \
+    || die "CTID $ctid ist bereits vergeben."
+  ip link show "$bridge" >/dev/null 2>&1 \
+    || die "Netzwerk-Bridge '$bridge' gibt es auf diesem Host nicht (siehe: ip -br link)."
+  if [ "$ct_ip" != "dhcp" ]; then
+    [[ "$ct_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] \
+      || die "IP '$ct_ip' bitte als a.b.c.d/praefix angeben (oder dhcp)."
+    [ -z "$ct_gw" ] || [[ "$ct_gw" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+      || die "Gateway '$ct_gw' ist keine gueltige IPv4-Adresse."
+  fi
+  net0="$(net0_spec "$bridge" "$ct_ip" "$ct_gw" "$vlan")"
 
   local ct_storage template_storage template tz
   ct_storage="$(pvesm status -content rootdir | awk 'NR>1{print $1; exit}')"
@@ -279,19 +351,40 @@ Weboberflaeche auf Port 8080
     --memory "$ram_mb" \
     --swap 0 \
     --rootfs "${ct_storage}:${disk_gb}" \
-    --net0 "name=eth0,bridge=${bridge},ip=dhcp" \
+    --net0 "$net0" \
     --unprivileged "$unprivileged" \
     --features "nesting=1,keyctl=1" \
     --onboot 1 \
     --start 1
 
-  echo "==> Warte auf Netzwerk in Container $ctid ..."
-  local up=0
-  for _ in $(seq 1 30); do
-    if pct exec "$ctid" -- getent hosts github.com >/dev/null 2>&1; then up=1; break; fi
-    sleep 2
+  # Ohne Netz scheitert install.sh ohnehin an apt/Docker/git. Die haeufigste
+  # Ursache ist ein fehlender oder falscher VLAN-Tag - also direkt anbieten,
+  # ihn zu korrigieren, statt eine halbe Installation zu hinterlassen.
+  echo "==> Warte auf Netzwerk in Container $ctid ($net0) ..."
+  until container_online "$ctid"; do
+    if yesno "Container $ctid hat nach 60s keine Internetverbindung (DNS-Test auf github.com).
+
+Netzwerk: $net0
+
+Haeufige Ursachen:
+  - fehlender oder falscher VLAN-Tag
+  - kein DHCP-Server in diesem VLAN (dann statische IP im erweiterten Modus)
+  - VLAN-aware Bridge, auf der das VLAN nicht erlaubt ist (bridge-vids)
+
+VLAN-Tag aendern und erneut versuchen?"; then
+      vlan="$(ask_vlan "$vlan")"
+      net0="$(net0_spec "$bridge" "$ct_ip" "$ct_gw" "$vlan")"
+      echo "==> Netzwerk auf $net0 umstellen und Container neu starten ..."
+      pct set "$ctid" --net0 "$net0"
+      pct reboot "$ctid"
+    else
+      echo >&2
+      echo "FEHLER: Container $ctid hat kein Netzwerk ($net0) - Abbruch." >&2
+      echo "Pruefen:    pct exec $ctid -- ip -br addr" >&2
+      echo "Aufraeumen: pct destroy $ctid --purge   - danach dieses Skript erneut starten." >&2
+      exit 1
+    fi
   done
-  [ "$up" -eq 1 ] || echo "Warnung: nach 60s noch keine Internetverbindung im Container - fahre fort." >&2
 
   local env_file install_script
   env_file="$(mktemp)"
@@ -314,7 +407,7 @@ ENVEOF
   ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
   password="$(in_app "$ctid" "docker compose exec -T mail2nas python -m mail2nas.cli password" 2>/dev/null || true)"
 
-  local final="Fertig! Container $ctid ($ct_hostname) laeuft.
+  local final="Fertig! Container $ctid ($ct_hostname) laeuft${vlan:+ (VLAN $vlan)}.
 
   Weboberflaeche:  http://${ip:-<container-ip>}:${web_port}/
   Startpasswort:   ${password:-<noch nicht bereit - spaeter: pct exec $ctid -- bash -c 'cd $APP_DIR && docker compose exec mail2nas python -m mail2nas.cli password'>}
