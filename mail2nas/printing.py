@@ -104,6 +104,14 @@ def print_direct(printer: Printer, data: bytes, extension: str, title: str,
     best of them (PDF if possible, else PWG raster or URF) and sends it.
     """
     uri = printer.destination
+    # A raster is written to a file here and streamed from it, never held in
+    # memory as a whole.
+    with tempfile.TemporaryDirectory(prefix="mail2nas-ipp-") as workdir:
+        return _print_direct(printer, data, extension, title, timeout, gs_binary, uri,
+                             os.path.join(workdir, "job"))
+
+
+def _print_direct(printer, data, extension, title, timeout, gs_binary, uri, job_path) -> str:
     try:
         attributes = ipp.printer_attributes(uri, timeout=min(timeout, 20))
         formats = {str(f).lower() for f in attributes.attributes.get("document-format-supported", [])
@@ -128,11 +136,12 @@ def print_direct(printer: Printer, data: bytes, extension: str, title: str,
                 color = False
             resolutions = attributes.attributes.get("pwg-raster-document-resolution-supported", [])
             dpi = _pick_dpi([r.dpi[0] for r in resolutions if isinstance(r, ipp.Resolution)])
-            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout)
+            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout,
+                                            output=job_path)
             document_format = "image/pwg-raster"
         elif "image/urf" in formats:
             dpi = _pick_dpi(_urf_dpis(attributes.attributes.get("urf-supported")))
-            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout)
+            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout, output=job_path)
             document_format = "image/urf"
         else:
             raise PrintError(

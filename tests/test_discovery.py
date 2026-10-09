@@ -354,6 +354,23 @@ def test_ipp_device_tries_the_usual_paths(monkeypatch):
     assert "image/pwg-raster" in device.detail
 
 
+def test_an_address_with_a_path_tries_that_path_first(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def attributes(uri, timeout=10):
+        tried.append(uri)
+        return ipp.Response(0, {"printer-make-and-model": ["X"]})
+
+    monkeypatch.setattr(ipp, "printer_attributes", attributes)
+
+    device = discovery.ipp_device("10.0.0.7/ipp/port1")
+
+    assert tried == ["ipp://10.0.0.7/ipp/port1"]
+    assert device.destination == "ipp://10.0.0.7/ipp/port1"
+
+
 def test_ipp_device_gives_up_when_nothing_listens(monkeypatch):
     from mail2nas import ipp
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import http.client
 import itertools
 import logging
+import os
 import ssl
 import struct
 from dataclasses import dataclass, field
@@ -234,7 +235,16 @@ def split_uri(uri: str) -> tuple[str, str, int, str]:
     return scheme, parts.hostname, parts.port or 631, parts.path or "/"
 
 
-def _post(uri: str, body: bytes, timeout: float) -> bytes:
+def _chunks(head: bytes, path: str, size: int = 64 * 1024):
+    yield head
+    with open(path, "rb") as fh:
+        while chunk := fh.read(size):
+            yield chunk
+
+
+def _post(uri: str, body: bytes, timeout: float, document_path: str | None = None) -> bytes:
+    """POST one IPP request. With `document_path`, the document is streamed
+    from that file after `body` instead of being joined in memory."""
     scheme, host, port, path = split_uri(uri)
     if scheme == "ipps":
         # Printers ship self-signed certificates; there is nothing to verify
@@ -245,11 +255,13 @@ def _post(uri: str, body: bytes, timeout: float) -> bytes:
         connection = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
     else:
         connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    headers = {"Content-Type": "application/ipp", "Accept": "application/ipp"}
+    payload = body
+    if document_path is not None:
+        headers["Content-Length"] = str(len(body) + os.path.getsize(document_path))
+        payload = _chunks(body, document_path)
     try:
-        connection.request(
-            "POST", path, body=body,
-            headers={"Content-Type": "application/ipp", "Accept": "application/ipp"},
-        )
+        connection.request("POST", path, body=payload, headers=headers)
         reply = connection.getresponse()
         data = reply.read()
         if reply.status != 200:
@@ -262,11 +274,17 @@ def _post(uri: str, body: bytes, timeout: float) -> bytes:
 
 
 def _call(uri: str, operation: int, timeout: float, operation_attributes=(),
-          job_attributes=(), document: bytes = b"") -> Response:
-    """Send one request; retry as IPP/1.1 for printers that only speak that."""
+          job_attributes=(), document: bytes | str = b"") -> Response:
+    """Send one request; retry as IPP/1.1 for printers that only speak that.
+
+    `document` is the data itself, or the path of a file holding it."""
     for version in ((2, 0), (1, 1)):
         body = encode_request(operation, uri, operation_attributes, job_attributes, version)
-        response = decode_response(_post(uri, body + document, timeout))
+        if isinstance(document, (str, os.PathLike)):
+            reply = _post(uri, body, timeout, document_path=str(document))
+        else:
+            reply = _post(uri, body + document, timeout)
+        response = decode_response(reply)
         if response.status != STATUS_VERSION_NOT_SUPPORTED:
             return response
     return response
@@ -287,13 +305,13 @@ def printer_attributes(uri: str, timeout: float = 10) -> Response:
 
 def print_job(
     uri: str,
-    document: bytes,
+    document: bytes | str,
     document_format: str,
     job_name: str,
     job_attributes: list[tuple[int, str, object]] = (),
     timeout: float = 120,
 ) -> int | None:
-    """Send one document. Returns the job id the printer assigned."""
+    """Send one document (bytes, or the path of a file). Returns the job id."""
     response = _call(
         uri, PRINT_JOB, timeout,
         operation_attributes=[

@@ -28,6 +28,12 @@ IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"}
 # Page sizes in PostScript points, and the names Ghostscript uses for them.
 PAGE_SIZES = {"a4": (595, 842), "letter": (612, 792)}
 
+# Only TIFF is a multi-page document; the frames of a GIF/PNG are an
+# animation (think of a spinning logo in a mail signature) and would each
+# become a printed page.
+MULTIPAGE_IMAGE_FORMATS = {"TIFF"}
+MAX_IMAGE_PAGES = 50
+
 # Plain text layout: Courier 10 pt, 2 cm margins.
 _FONT_SIZE = 10
 _LINE_HEIGHT = 12
@@ -52,8 +58,32 @@ def to_pdf(data: bytes, extension: str, paper: str = "a4", gs_binary: str = "gs"
     if extension in IMAGE_EXTENSIONS:
         return image_to_pdf(data, paper)
     if extension in TEXT_EXTENSIONS:
-        return text_to_pdf(data.decode("utf-8", "replace"), paper)
+        return text_to_pdf(decode_text(data), paper)
     raise RenderError(f"Dateityp .{extension or '?'} kann nicht direkt gedruckt werden.")
+
+
+def decode_text(data: bytes) -> str:
+    """UTF-8 if it is, otherwise Windows-1252 - what a German CSV export or
+    an older .txt usually is - instead of turning every umlaut into "?"."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", "replace")
+
+
+def _flatten(frame):
+    """RGB on white. Converting a transparent image straight to RGB turns the
+    transparent area black - a page full of toner for a logo."""
+    from PIL import Image
+
+    if frame.mode in ("RGBA", "LA") or (frame.mode == "P" and "transparency" in frame.info):
+        rgba = frame.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return frame.convert("RGB")
 
 
 def image_to_pdf(data: bytes, paper: str = "a4") -> bytes:
@@ -66,7 +96,11 @@ def image_to_pdf(data: bytes, paper: str = "a4") -> bytes:
     width_pt, height_pt = PAGE_SIZES.get(paper, PAGE_SIZES["a4"])
     try:
         image = Image.open(io.BytesIO(data))
-        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(image)]
+        if image.format in MULTIPAGE_IMAGE_FORMATS:
+            frames = [_flatten(frame) for _, frame in
+                      zip(range(MAX_IMAGE_PAGES), ImageSequence.Iterator(image))]
+        else:
+            frames = [_flatten(image)]
     except Exception as exc:  # noqa: BLE001 - Pillow raises many types for broken files
         raise RenderError(f"Bild nicht lesbar: {exc}") from exc
     if not frames:
@@ -150,24 +184,28 @@ def text_to_pdf(text: str, paper: str = "a4") -> bytes:
 
 
 def to_pwg_raster(pdf: bytes, dpi: int = 300, color: bool = False, paper: str = "a4",
-                  gs_binary: str = "gs", timeout: int = 120) -> bytes:
+                  gs_binary: str = "gs", timeout: int = 120, output: str | None = None):
     # cupsColorSpace 18 = sGray, 19 = sRGB; 8 bits per colour are what IPP
     # Everywhere requires every printer to accept (sgray_8 / srgb_8).
     args = ["-sDEVICE=pwgraster", f"-r{dpi}", f"-dcupsColorSpace={19 if color else 18}",
             "-dcupsBitsPerColor=8"]
-    return _ghostscript(pdf, "pdf", args, paper, gs_binary, timeout)
+    return _ghostscript(pdf, "pdf", args, paper, gs_binary, timeout, output)
 
 
 def to_urf(pdf: bytes, dpi: int = 300, paper: str = "a4", gs_binary: str = "gs",
-           timeout: int = 120) -> bytes:
-    return _ghostscript(pdf, "pdf", ["-sDEVICE=urf", f"-r{dpi}"], paper, gs_binary, timeout)
+           timeout: int = 120, output: str | None = None):
+    return _ghostscript(pdf, "pdf", ["-sDEVICE=urf", f"-r{dpi}"], paper, gs_binary, timeout,
+                        output)
 
 
 def _ghostscript(data: bytes, suffix: str, device_args: list[str], paper: str,
-                 gs_binary: str, timeout: int) -> bytes:
+                 gs_binary: str, timeout: int, output: str | None = None):
+    """Run Ghostscript. Returns the result as bytes - or, with `output`, writes
+    it to that path and returns the path: a raster of a long document runs to
+    hundreds of megabytes and must not be held in memory on a small LXC."""
     with tempfile.TemporaryDirectory(prefix="mail2nas-render-") as workdir:
         source = os.path.join(workdir, f"in.{suffix}")
-        target = os.path.join(workdir, "out")
+        target = output or os.path.join(workdir, "out")
         with open(source, "wb") as fh:
             fh.write(data)
         command = [
@@ -187,5 +225,7 @@ def _ghostscript(data: bytes, suffix: str, device_args: list[str], paper: str,
             message = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
             raise RenderError(f"Ghostscript konnte das Dokument nicht aufbereiten: "
                               f"{message[-300:] or result.returncode}")
+        if output:
+            return output
         with open(target, "rb") as fh:
             return fh.read()

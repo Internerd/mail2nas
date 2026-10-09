@@ -255,9 +255,28 @@ class BackupStatus:
     failing_since: float | None = None
 
 
+INTERNAL_REFUSED = (
+    "Das Archiv liegt im Container, im selben Docker-Volume wie die Datenbank - eine "
+    "Sicherung dorthin ginge mit ihr zusammen verloren. Bitte ein Archiv auf einem NAS "
+    "waehlen oder die Sicherung herunterladen."
+)
+
+
+def _target_archive(runtime, key: str):
+    archives = getattr(runtime, "archives", None)
+    if archives is None:
+        return None
+    if key:
+        return next((a for a in archives.all() if a.key == key), None)
+    return runtime.default_archive()
+
+
 def write_to_archive(runtime, settings: BackupSettings | None = None) -> str:
     """Write one backup into the configured archive folder and rotate. Returns the path."""
     settings = settings or BackupStore(runtime.settings).load()
+    target = _target_archive(runtime, settings.archive)
+    if target is not None and target.backend == "internal":
+        raise BackupError(INTERNAL_REFUSED)
     storage = runtime.storages.get(settings.archive) if settings.archive else runtime.storages.default()
     parts = safe_relative_parts(settings.folder)
     path = storage.save_unique(parts, backup_name(), dump(runtime.config.state_db_path))

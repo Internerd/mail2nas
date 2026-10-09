@@ -319,7 +319,11 @@ def ipp_device(address: str, timeout: float = 4.0) -> Found | None:
         candidates = [address]
     else:
         host = address.split("://", 1)[-1]
-        candidates = [f"ipp://{host}/{path}" for path in IPP_PATHS]
+        host, slash, path = host.partition("/")
+        candidates = [f"ipp://{host}/{p}" for p in IPP_PATHS]
+        if slash and path:
+            # "10.0.0.5/ipp/port1" - the path was given, try it first.
+            candidates.insert(0, f"ipp://{host}/{path}")
 
     for uri in candidates:
         try:

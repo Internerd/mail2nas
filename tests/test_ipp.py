@@ -139,6 +139,39 @@ def test_a_job_really_goes_over_http():
     assert b"application/pdf" in received["body"] and b"copies" in received["body"]
 
 
+def test_a_document_file_is_streamed_with_the_right_length(tmp_path, monkeypatch):
+    import http.client
+
+    document = tmp_path / "job.pwg"
+    document.write_bytes(b"RaS2" + b"\x00" * 200_000)
+    seen = {}
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, method, path, body, headers):
+            seen["length"] = int(headers["Content-Length"])
+            seen["sent"] = b"".join(body)
+
+        def getresponse(self):
+            class Reply:
+                status, reason = 200, "OK"
+
+                def read(self):
+                    return _response_bytes(0, [(ipp.VALUE_INTEGER, "job-id", [5])])
+            return Reply()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+
+    assert ipp.print_job("ipp://h/ipp/print", str(document), "image/pwg-raster", "t") == 5
+    assert seen["length"] == len(seen["sent"])
+    assert seen["sent"].endswith(document.read_bytes())
+
+
 def test_a_refused_job_raises_with_the_status():
     reply = _response_bytes(0x040A, [])  # client-error-document-format-not-supported
     with pytest.raises(ipp.IppError, match="0x040a"):
@@ -181,6 +214,50 @@ def test_an_image_becomes_a_pdf():
     Image.new("RGB", (400, 300), "white").save(png, "PNG")
 
     assert render.to_pdf(png.getvalue(), "png").startswith(b"%PDF")
+
+
+def test_an_animated_gif_is_one_page_not_one_per_frame():
+    """A spinning logo in a signature must not come out as forty sheets."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    frames = [Image.new("RGB", (60, 60), color) for color in ("red", "green", "blue") * 10]
+    gif = BytesIO()
+    frames[0].save(gif, "GIF", save_all=True, append_images=frames[1:])
+
+    pdf = render.to_pdf(gif.getvalue(), "gif")
+
+    assert b"/Count 1\n" in pdf or b"/Count 1 " in pdf or b"/Count 1>" in pdf
+
+
+def test_a_multipage_tiff_keeps_its_pages():
+    from io import BytesIO
+
+    from PIL import Image
+
+    pages = [Image.new("RGB", (60, 60), color) for color in ("red", "green", "blue")]
+    tiff = BytesIO()
+    pages[0].save(tiff, "TIFF", save_all=True, append_images=pages[1:])
+
+    assert b"/Count 3" in render.to_pdf(tiff.getvalue(), "tif")
+
+
+def test_transparency_becomes_white_not_black():
+    from io import BytesIO
+
+    from PIL import Image
+
+    image = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    assert render._flatten(image).getpixel((5, 5)) == (255, 255, 255)
+    png = BytesIO()
+    image.save(png, "PNG")
+    assert render.to_pdf(png.getvalue(), "png").startswith(b"%PDF")
+
+
+def test_a_windows_text_file_keeps_its_umlauts():
+    assert render.decode_text("Grüße".encode("cp1252")) == "Grüße"
+    assert render.decode_text("\ufeffGrüße".encode("utf-8")) == "Grüße"
 
 
 def test_unknown_types_are_refused():
@@ -241,21 +318,25 @@ def test_a_raster_only_printer_gets_pwg_raster_at_a_supported_resolution(monkeyp
            "pwg-raster-document-type-supported": ["black_1", "sgray_8"]},
     )
     calls = {}
-    monkeypatch.setattr(render, "to_pwg_raster",
-                        lambda pdf, dpi, color, paper, gs, timeout: calls.update(
-                            dpi=dpi, color=color, paper=paper) or b"RaS2")
+    def fake_raster(pdf, dpi, color, paper, gs, timeout, output=None):
+        calls.update(dpi=dpi, color=color, paper=paper, to_file=output is not None)
+        return output
+
+    monkeypatch.setattr(render, "to_pwg_raster", fake_raster)
 
     printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
 
     assert sent["format"] == "image/pwg-raster"
-    assert calls == {"dpi": 600, "color": False, "paper": "a4"}
+    # the raster is handed over as a file, not as one big bytes object
+    assert calls == {"dpi": 600, "color": False, "paper": "a4", "to_file": True}
+    assert isinstance(sent["document"], str)
 
 
 def test_urf_is_the_last_resort(monkeypatch):
     sent = _fake_printer(monkeypatch, ["image/urf"], **{"urf-supported": ["W8", "RS300-600"]})
     calls = {}
-    monkeypatch.setattr(render, "to_urf", lambda pdf, dpi, paper, gs, timeout: calls.update(
-        dpi=dpi) or b"UNIRAST")
+    monkeypatch.setattr(render, "to_urf", lambda pdf, dpi, paper, gs, timeout, output=None:
+                        calls.update(dpi=dpi) or output)
 
     printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
 

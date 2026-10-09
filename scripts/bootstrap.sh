@@ -3209,6 +3209,14 @@ def print_direct(printer: Printer, data: bytes, extension: str, title: str,
     best of them (PDF if possible, else PWG raster or URF) and sends it.
     """
     uri = printer.destination
+    # A raster is written to a file here and streamed from it, never held in
+    # memory as a whole.
+    with tempfile.TemporaryDirectory(prefix="mail2nas-ipp-") as workdir:
+        return _print_direct(printer, data, extension, title, timeout, gs_binary, uri,
+                             os.path.join(workdir, "job"))
+
+
+def _print_direct(printer, data, extension, title, timeout, gs_binary, uri, job_path) -> str:
     try:
         attributes = ipp.printer_attributes(uri, timeout=min(timeout, 20))
         formats = {str(f).lower() for f in attributes.attributes.get("document-format-supported", [])
@@ -3233,11 +3241,12 @@ def print_direct(printer: Printer, data: bytes, extension: str, title: str,
                 color = False
             resolutions = attributes.attributes.get("pwg-raster-document-resolution-supported", [])
             dpi = _pick_dpi([r.dpi[0] for r in resolutions if isinstance(r, ipp.Resolution)])
-            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout)
+            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout,
+                                            output=job_path)
             document_format = "image/pwg-raster"
         elif "image/urf" in formats:
             dpi = _pick_dpi(_urf_dpis(attributes.attributes.get("urf-supported")))
-            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout)
+            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout, output=job_path)
             document_format = "image/urf"
         else:
             raise PrintError(
@@ -3764,7 +3773,11 @@ def ipp_device(address: str, timeout: float = 4.0) -> Found | None:
         candidates = [address]
     else:
         host = address.split("://", 1)[-1]
-        candidates = [f"ipp://{host}/{path}" for path in IPP_PATHS]
+        host, slash, path = host.partition("/")
+        candidates = [f"ipp://{host}/{p}" for p in IPP_PATHS]
+        if slash and path:
+            # "10.0.0.5/ipp/port1" - the path was given, try it first.
+            candidates.insert(0, f"ipp://{host}/{path}")
 
     for uri in candidates:
         try:
@@ -3881,6 +3894,7 @@ from __future__ import annotations
 import http.client
 import itertools
 import logging
+import os
 import ssl
 import struct
 from dataclasses import dataclass, field
@@ -4095,7 +4109,16 @@ def split_uri(uri: str) -> tuple[str, str, int, str]:
     return scheme, parts.hostname, parts.port or 631, parts.path or "/"
 
 
-def _post(uri: str, body: bytes, timeout: float) -> bytes:
+def _chunks(head: bytes, path: str, size: int = 64 * 1024):
+    yield head
+    with open(path, "rb") as fh:
+        while chunk := fh.read(size):
+            yield chunk
+
+
+def _post(uri: str, body: bytes, timeout: float, document_path: str | None = None) -> bytes:
+    """POST one IPP request. With `document_path`, the document is streamed
+    from that file after `body` instead of being joined in memory."""
     scheme, host, port, path = split_uri(uri)
     if scheme == "ipps":
         # Printers ship self-signed certificates; there is nothing to verify
@@ -4106,11 +4129,13 @@ def _post(uri: str, body: bytes, timeout: float) -> bytes:
         connection = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
     else:
         connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    headers = {"Content-Type": "application/ipp", "Accept": "application/ipp"}
+    payload = body
+    if document_path is not None:
+        headers["Content-Length"] = str(len(body) + os.path.getsize(document_path))
+        payload = _chunks(body, document_path)
     try:
-        connection.request(
-            "POST", path, body=body,
-            headers={"Content-Type": "application/ipp", "Accept": "application/ipp"},
-        )
+        connection.request("POST", path, body=payload, headers=headers)
         reply = connection.getresponse()
         data = reply.read()
         if reply.status != 200:
@@ -4123,11 +4148,17 @@ def _post(uri: str, body: bytes, timeout: float) -> bytes:
 
 
 def _call(uri: str, operation: int, timeout: float, operation_attributes=(),
-          job_attributes=(), document: bytes = b"") -> Response:
-    """Send one request; retry as IPP/1.1 for printers that only speak that."""
+          job_attributes=(), document: bytes | str = b"") -> Response:
+    """Send one request; retry as IPP/1.1 for printers that only speak that.
+
+    `document` is the data itself, or the path of a file holding it."""
     for version in ((2, 0), (1, 1)):
         body = encode_request(operation, uri, operation_attributes, job_attributes, version)
-        response = decode_response(_post(uri, body + document, timeout))
+        if isinstance(document, (str, os.PathLike)):
+            reply = _post(uri, body, timeout, document_path=str(document))
+        else:
+            reply = _post(uri, body + document, timeout)
+        response = decode_response(reply)
         if response.status != STATUS_VERSION_NOT_SUPPORTED:
             return response
     return response
@@ -4148,13 +4179,13 @@ def printer_attributes(uri: str, timeout: float = 10) -> Response:
 
 def print_job(
     uri: str,
-    document: bytes,
+    document: bytes | str,
     document_format: str,
     job_name: str,
     job_attributes: list[tuple[int, str, object]] = (),
     timeout: float = 120,
 ) -> int | None:
-    """Send one document. Returns the job id the printer assigned."""
+    """Send one document (bytes, or the path of a file). Returns the job id."""
     response = _call(
         uri, PRINT_JOB, timeout,
         operation_attributes=[
@@ -4206,6 +4237,12 @@ IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"}
 # Page sizes in PostScript points, and the names Ghostscript uses for them.
 PAGE_SIZES = {"a4": (595, 842), "letter": (612, 792)}
 
+# Only TIFF is a multi-page document; the frames of a GIF/PNG are an
+# animation (think of a spinning logo in a mail signature) and would each
+# become a printed page.
+MULTIPAGE_IMAGE_FORMATS = {"TIFF"}
+MAX_IMAGE_PAGES = 50
+
 # Plain text layout: Courier 10 pt, 2 cm margins.
 _FONT_SIZE = 10
 _LINE_HEIGHT = 12
@@ -4230,8 +4267,32 @@ def to_pdf(data: bytes, extension: str, paper: str = "a4", gs_binary: str = "gs"
     if extension in IMAGE_EXTENSIONS:
         return image_to_pdf(data, paper)
     if extension in TEXT_EXTENSIONS:
-        return text_to_pdf(data.decode("utf-8", "replace"), paper)
+        return text_to_pdf(decode_text(data), paper)
     raise RenderError(f"Dateityp .{extension or '?'} kann nicht direkt gedruckt werden.")
+
+
+def decode_text(data: bytes) -> str:
+    """UTF-8 if it is, otherwise Windows-1252 - what a German CSV export or
+    an older .txt usually is - instead of turning every umlaut into "?"."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", "replace")
+
+
+def _flatten(frame):
+    """RGB on white. Converting a transparent image straight to RGB turns the
+    transparent area black - a page full of toner for a logo."""
+    from PIL import Image
+
+    if frame.mode in ("RGBA", "LA") or (frame.mode == "P" and "transparency" in frame.info):
+        rgba = frame.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return frame.convert("RGB")
 
 
 def image_to_pdf(data: bytes, paper: str = "a4") -> bytes:
@@ -4244,7 +4305,11 @@ def image_to_pdf(data: bytes, paper: str = "a4") -> bytes:
     width_pt, height_pt = PAGE_SIZES.get(paper, PAGE_SIZES["a4"])
     try:
         image = Image.open(io.BytesIO(data))
-        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(image)]
+        if image.format in MULTIPAGE_IMAGE_FORMATS:
+            frames = [_flatten(frame) for _, frame in
+                      zip(range(MAX_IMAGE_PAGES), ImageSequence.Iterator(image))]
+        else:
+            frames = [_flatten(image)]
     except Exception as exc:  # noqa: BLE001 - Pillow raises many types for broken files
         raise RenderError(f"Bild nicht lesbar: {exc}") from exc
     if not frames:
@@ -4328,24 +4393,28 @@ def text_to_pdf(text: str, paper: str = "a4") -> bytes:
 
 
 def to_pwg_raster(pdf: bytes, dpi: int = 300, color: bool = False, paper: str = "a4",
-                  gs_binary: str = "gs", timeout: int = 120) -> bytes:
+                  gs_binary: str = "gs", timeout: int = 120, output: str | None = None):
     # cupsColorSpace 18 = sGray, 19 = sRGB; 8 bits per colour are what IPP
     # Everywhere requires every printer to accept (sgray_8 / srgb_8).
     args = ["-sDEVICE=pwgraster", f"-r{dpi}", f"-dcupsColorSpace={19 if color else 18}",
             "-dcupsBitsPerColor=8"]
-    return _ghostscript(pdf, "pdf", args, paper, gs_binary, timeout)
+    return _ghostscript(pdf, "pdf", args, paper, gs_binary, timeout, output)
 
 
 def to_urf(pdf: bytes, dpi: int = 300, paper: str = "a4", gs_binary: str = "gs",
-           timeout: int = 120) -> bytes:
-    return _ghostscript(pdf, "pdf", ["-sDEVICE=urf", f"-r{dpi}"], paper, gs_binary, timeout)
+           timeout: int = 120, output: str | None = None):
+    return _ghostscript(pdf, "pdf", ["-sDEVICE=urf", f"-r{dpi}"], paper, gs_binary, timeout,
+                        output)
 
 
 def _ghostscript(data: bytes, suffix: str, device_args: list[str], paper: str,
-                 gs_binary: str, timeout: int) -> bytes:
+                 gs_binary: str, timeout: int, output: str | None = None):
+    """Run Ghostscript. Returns the result as bytes - or, with `output`, writes
+    it to that path and returns the path: a raster of a long document runs to
+    hundreds of megabytes and must not be held in memory on a small LXC."""
     with tempfile.TemporaryDirectory(prefix="mail2nas-render-") as workdir:
         source = os.path.join(workdir, f"in.{suffix}")
-        target = os.path.join(workdir, "out")
+        target = output or os.path.join(workdir, "out")
         with open(source, "wb") as fh:
             fh.write(data)
         command = [
@@ -4365,6 +4434,8 @@ def _ghostscript(data: bytes, suffix: str, device_args: list[str], paper: str,
             message = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
             raise RenderError(f"Ghostscript konnte das Dokument nicht aufbereiten: "
                               f"{message[-300:] or result.returncode}")
+        if output:
+            return output
         with open(target, "rb") as fh:
             return fh.read()
 MAIL2NAS_EOF
@@ -6608,9 +6679,28 @@ class BackupStatus:
     failing_since: float | None = None
 
 
+INTERNAL_REFUSED = (
+    "Das Archiv liegt im Container, im selben Docker-Volume wie die Datenbank - eine "
+    "Sicherung dorthin ginge mit ihr zusammen verloren. Bitte ein Archiv auf einem NAS "
+    "waehlen oder die Sicherung herunterladen."
+)
+
+
+def _target_archive(runtime, key: str):
+    archives = getattr(runtime, "archives", None)
+    if archives is None:
+        return None
+    if key:
+        return next((a for a in archives.all() if a.key == key), None)
+    return runtime.default_archive()
+
+
 def write_to_archive(runtime, settings: BackupSettings | None = None) -> str:
     """Write one backup into the configured archive folder and rotate. Returns the path."""
     settings = settings or BackupStore(runtime.settings).load()
+    target = _target_archive(runtime, settings.archive)
+    if target is not None and target.backend == "internal":
+        raise BackupError(INTERNAL_REFUSED)
     storage = runtime.storages.get(settings.archive) if settings.archive else runtime.storages.default()
     parts = safe_relative_parts(settings.folder)
     path = storage.save_unique(parts, backup_name(), dump(runtime.config.state_db_path))
@@ -11166,6 +11256,9 @@ def create_app(runtime) -> Flask:
         require_csrf()
         try:
             value = backup.validate(request.form, [a.key for a in _archives()])
+            target = backup._target_archive(runtime, value.archive)
+            if value.enabled and target is not None and target.backend == "internal":
+                raise backup.BackupError(backup.INTERNAL_REFUSED)
         except backup.BackupError as exc:
             flash(str(exc), "error")
         else:
@@ -17719,6 +17812,23 @@ def test_ipp_device_tries_the_usual_paths(monkeypatch):
     assert "image/pwg-raster" in device.detail
 
 
+def test_an_address_with_a_path_tries_that_path_first(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def attributes(uri, timeout=10):
+        tried.append(uri)
+        return ipp.Response(0, {"printer-make-and-model": ["X"]})
+
+    monkeypatch.setattr(ipp, "printer_attributes", attributes)
+
+    device = discovery.ipp_device("10.0.0.7/ipp/port1")
+
+    assert tried == ["ipp://10.0.0.7/ipp/port1"]
+    assert device.destination == "ipp://10.0.0.7/ipp/port1"
+
+
 def test_ipp_device_gives_up_when_nothing_listens(monkeypatch):
     from mail2nas import ipp
 
@@ -17877,6 +17987,39 @@ def test_a_job_really_goes_over_http():
     assert b"application/pdf" in received["body"] and b"copies" in received["body"]
 
 
+def test_a_document_file_is_streamed_with_the_right_length(tmp_path, monkeypatch):
+    import http.client
+
+    document = tmp_path / "job.pwg"
+    document.write_bytes(b"RaS2" + b"\x00" * 200_000)
+    seen = {}
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, method, path, body, headers):
+            seen["length"] = int(headers["Content-Length"])
+            seen["sent"] = b"".join(body)
+
+        def getresponse(self):
+            class Reply:
+                status, reason = 200, "OK"
+
+                def read(self):
+                    return _response_bytes(0, [(ipp.VALUE_INTEGER, "job-id", [5])])
+            return Reply()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+
+    assert ipp.print_job("ipp://h/ipp/print", str(document), "image/pwg-raster", "t") == 5
+    assert seen["length"] == len(seen["sent"])
+    assert seen["sent"].endswith(document.read_bytes())
+
+
 def test_a_refused_job_raises_with_the_status():
     reply = _response_bytes(0x040A, [])  # client-error-document-format-not-supported
     with pytest.raises(ipp.IppError, match="0x040a"):
@@ -17919,6 +18062,50 @@ def test_an_image_becomes_a_pdf():
     Image.new("RGB", (400, 300), "white").save(png, "PNG")
 
     assert render.to_pdf(png.getvalue(), "png").startswith(b"%PDF")
+
+
+def test_an_animated_gif_is_one_page_not_one_per_frame():
+    """A spinning logo in a signature must not come out as forty sheets."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    frames = [Image.new("RGB", (60, 60), color) for color in ("red", "green", "blue") * 10]
+    gif = BytesIO()
+    frames[0].save(gif, "GIF", save_all=True, append_images=frames[1:])
+
+    pdf = render.to_pdf(gif.getvalue(), "gif")
+
+    assert b"/Count 1\n" in pdf or b"/Count 1 " in pdf or b"/Count 1>" in pdf
+
+
+def test_a_multipage_tiff_keeps_its_pages():
+    from io import BytesIO
+
+    from PIL import Image
+
+    pages = [Image.new("RGB", (60, 60), color) for color in ("red", "green", "blue")]
+    tiff = BytesIO()
+    pages[0].save(tiff, "TIFF", save_all=True, append_images=pages[1:])
+
+    assert b"/Count 3" in render.to_pdf(tiff.getvalue(), "tif")
+
+
+def test_transparency_becomes_white_not_black():
+    from io import BytesIO
+
+    from PIL import Image
+
+    image = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    assert render._flatten(image).getpixel((5, 5)) == (255, 255, 255)
+    png = BytesIO()
+    image.save(png, "PNG")
+    assert render.to_pdf(png.getvalue(), "png").startswith(b"%PDF")
+
+
+def test_a_windows_text_file_keeps_its_umlauts():
+    assert render.decode_text("Grüße".encode("cp1252")) == "Grüße"
+    assert render.decode_text("\ufeffGrüße".encode("utf-8")) == "Grüße"
 
 
 def test_unknown_types_are_refused():
@@ -17979,21 +18166,25 @@ def test_a_raster_only_printer_gets_pwg_raster_at_a_supported_resolution(monkeyp
            "pwg-raster-document-type-supported": ["black_1", "sgray_8"]},
     )
     calls = {}
-    monkeypatch.setattr(render, "to_pwg_raster",
-                        lambda pdf, dpi, color, paper, gs, timeout: calls.update(
-                            dpi=dpi, color=color, paper=paper) or b"RaS2")
+    def fake_raster(pdf, dpi, color, paper, gs, timeout, output=None):
+        calls.update(dpi=dpi, color=color, paper=paper, to_file=output is not None)
+        return output
+
+    monkeypatch.setattr(render, "to_pwg_raster", fake_raster)
 
     printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
 
     assert sent["format"] == "image/pwg-raster"
-    assert calls == {"dpi": 600, "color": False, "paper": "a4"}
+    # the raster is handed over as a file, not as one big bytes object
+    assert calls == {"dpi": 600, "color": False, "paper": "a4", "to_file": True}
+    assert isinstance(sent["document"], str)
 
 
 def test_urf_is_the_last_resort(monkeypatch):
     sent = _fake_printer(monkeypatch, ["image/urf"], **{"urf-supported": ["W8", "RS300-600"]})
     calls = {}
-    monkeypatch.setattr(render, "to_urf", lambda pdf, dpi, paper, gs, timeout: calls.update(
-        dpi=dpi) or b"UNIRAST")
+    monkeypatch.setattr(render, "to_urf", lambda pdf, dpi, paper, gs, timeout, output=None:
+                        calls.update(dpi=dpi) or output)
 
     printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
 
@@ -19382,6 +19573,20 @@ def test_nothing_is_due_while_switched_off(tmp_path):
 
     assert not backup.BackupScheduler(runtime).due()
     assert runtime.backup_status.ok is None
+
+
+def test_no_automatic_backup_into_the_container_volume(tmp_path, monkeypatch):
+    """An archive "Im Container" lives in the same volume as the database -
+    a backup there would be lost together with it."""
+    import mail2nas.archives as archives_module
+
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(tmp_path / "ablage"))
+    runtime = _make_runtime(tmp_path / "a", with_archive=False)
+    runtime.archives.add(name="Im Container", backend="internal")
+
+    with pytest.raises(backup.BackupError, match="selben Docker-Volume"):
+        backup.write_to_archive(runtime, backup.BackupSettings(enabled=True))
+    assert not (tmp_path / "ablage" / "mail2nas-sicherung").exists()
 MAIL2NAS_EOF
 
 # --- mail2nas/__init__.py ---

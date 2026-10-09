@@ -187,3 +187,17 @@ def test_nothing_is_due_while_switched_off(tmp_path):
 
     assert not backup.BackupScheduler(runtime).due()
     assert runtime.backup_status.ok is None
+
+
+def test_no_automatic_backup_into_the_container_volume(tmp_path, monkeypatch):
+    """An archive "Im Container" lives in the same volume as the database -
+    a backup there would be lost together with it."""
+    import mail2nas.archives as archives_module
+
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(tmp_path / "ablage"))
+    runtime = _make_runtime(tmp_path / "a", with_archive=False)
+    runtime.archives.add(name="Im Container", backend="internal")
+
+    with pytest.raises(backup.BackupError, match="selben Docker-Volume"):
+        backup.write_to_archive(runtime, backup.BackupSettings(enabled=True))
+    assert not (tmp_path / "ablage" / "mail2nas-sicherung").exists()

@@ -3116,6 +3116,9 @@ def create_app(runtime) -> Flask:
         require_csrf()
         try:
             value = backup.validate(request.form, [a.key for a in _archives()])
+            target = backup._target_archive(runtime, value.archive)
+            if value.enabled and target is not None and target.backend == "internal":
+                raise backup.BackupError(backup.INTERNAL_REFUSED)
         except backup.BackupError as exc:
             flash(str(exc), "error")
         else:
