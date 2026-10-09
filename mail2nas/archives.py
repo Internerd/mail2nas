@@ -18,6 +18,7 @@ they are built on demand and rebuilt when the entry behind them changes.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -36,7 +37,12 @@ SETTING_ARCHIVES_SEEDED = "archives_seeded"
 DEFAULT_ARCHIVE = ""
 
 MAX_NAME_LENGTH = 80
-BACKENDS = ("smb", "local")
+BACKENDS = ("smb", "local", "internal")
+
+# Where an archive of the kind "internal" keeps its files: inside the Docker
+# volume, next to the database. For installations without a NAS - mail2print
+# only - which still need somewhere for the fallback and the quarantine.
+INTERNAL_ROOT = os.environ.get("MAIL2NAS_INTERNAL_ROOT", "/data/ablage")
 
 
 class ArchiveError(ValueError):
@@ -53,7 +59,7 @@ class Archive:
 
     id: int
     name: str
-    backend: str  # "smb" or "local"
+    backend: str  # "smb", "local" or "internal" (inside the container, no NAS)
     host: str
     share: str
     user: str
@@ -73,6 +79,8 @@ class Archive:
     def location(self) -> str:
         if self.backend == "local":
             return self.path
+        if self.backend == "internal":
+            return f"im Container ({INTERNAL_ROOT})"
         where = f"//{self.host}/{self.share}"
         return f"{where}/{self.root}" if self.root else where
 
@@ -97,6 +105,15 @@ class Archive:
     def to_storage(self) -> Storage:
         if self.backend == "local":
             return LocalStorage(self.path)
+        if self.backend == "internal":
+            # Our own directory in our own volume - creating it is always
+            # right (unlike a mount point, where a missing directory means a
+            # missing mount).
+            try:
+                Path(INTERNAL_ROOT).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.error("Could not create %s: %s", INTERNAL_ROOT, exc)
+            return LocalStorage(INTERNAL_ROOT)
         return SmbStorage(
             host=self.host,
             share=self.share,
@@ -276,13 +293,17 @@ def validate(fields: dict) -> dict:
             raise ArchiveError("Bitte den SMB-Benutzer angeben.")
         if not password:
             raise ArchiveError("Bitte das SMB-Passwort angeben.")
+    elif backend == "internal":
+        path = ""
     else:
         if not path:
             raise ArchiveError("Bitte das Verzeichnis angeben, in dem das Share gemountet ist.")
         if not path.startswith("/"):
             raise ArchiveError("Das Verzeichnis muss ein absoluter Pfad sein (z. B. /mnt/nas).")
 
-    default_name = share or Path(path).name or host or "Archiv"
+    default_name = (
+        "Im Container" if backend == "internal" else share or Path(path).name or host or "Archiv"
+    )
     return {
         "name": name or default_name,
         "backend": backend,

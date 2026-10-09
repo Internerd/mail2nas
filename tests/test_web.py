@@ -901,6 +901,37 @@ def test_changes_to_addresses_need_a_csrf_token(client, env):
     assert runtime.addresses.all() == []
 
 
+# --- naming: Einrichtung vs. Optionen -----------------------------------------
+
+
+def test_the_menu_names_setup_and_options_differently(client, env):
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert ">Einrichtung</a>" in html and ">Optionen</a>" in html
+    assert ">Konfiguration</a>" not in html and ">Einstellungen</a>" not in html
+
+
+def test_an_archive_inside_the_container_needs_no_nas(client, env, tmp_path, monkeypatch):
+    from mail2nas import archives as archives_module
+
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(tmp_path / "ablage"))
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post(
+        "/config/archives/new",
+        data={"backend": "internal", "enabled": "1",
+              "csrf_token": _csrf(client, "/config/archives/new")},
+    )
+
+    archive = [a for a in runtime.archives.all() if a.backend == "internal"][0]
+    assert archive.name == "Im Container"
+    archive.to_storage().check_writable()
+    assert (tmp_path / "ablage").is_dir()
+
+
 # --- finding printers on the network -----------------------------------------
 
 
@@ -930,7 +961,8 @@ def test_searching_lists_what_was_found(client, env, monkeypatch):
         lambda server, **kwargs: (
             [
                 Found("Buero_MFP", "Buero_MFP", "cups.lan", "cups", "ipp://10.0.0.5/ipp/print"),
-                Found("Kyocera M2540", "ipp/print", "10.0.0.6", "mdns", "ipp://10.0.0.6/ipp/print"),
+                Found("Brother MFC-L2710DW series", "ipp://10.0.0.6/ipp/print", "", "ipp",
+                      "Formate: image/pwg-raster"),
             ],
             [],
         ),
@@ -943,9 +975,11 @@ def test_searching_lists_what_was_found(client, env, monkeypatch):
     ).get_data(as_text=True)
 
     assert "Buero_MFP" in html
-    assert "Kyocera M2540" in html
-    # the device without a queue comes with the command that creates one
-    assert "lpadmin -p Kyocera_M2540" in html
+    assert "Brother MFC-L2710DW series" in html
+    # a device is taken over with its address, ready to print on directly
+    assert "direkt (IPP)" in html
+    assert "destination=ipp://10.0.0.6/ipp/print" in html.replace("%3A", ":").replace("%2F", "/")
+    assert "lpadmin" not in html
 
 
 def test_a_failing_search_reports_instead_of_crashing(client, env, monkeypatch):

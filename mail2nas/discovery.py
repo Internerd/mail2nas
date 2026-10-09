@@ -1,14 +1,15 @@
 """Finding printers that are already on the network.
 
-Two sources, because there are two kinds of "printer" in this context:
+Three sources, because there are two kinds of "printer" in this context:
 
-* **Queues on a CUPS server** (`lpstat -v`). These are ready to use: their
-  name is exactly what goes into a printer's "Warteschlange", and printing
-  works the moment it is saved.
+* **Queues on a CUPS server** (`lpstat -v`). Their name is exactly what goes
+  into a printer's "Warteschlange".
+* **A device asked directly** over IPP, when an address is typed into the
+  search field: a printer that speaks IPP (AirPrint, Mopria, IPP Everywhere -
+  nearly every network printer) answers with its model and formats, and can
+  be printed on directly as `ipp://<address>/...` (see `ipp.py`).
 * **Devices advertising themselves via mDNS/DNS-SD** (`_ipp._tcp` and
-  friends), which is how AirPrint/driverless printers announce their
-  presence. These are found even when nothing has been set up yet - but a
-  raw device is not a CUPS queue, so the UI says how to turn it into one.
+  friends). Usable directly the same way.
 
 Everything here is best-effort and bounded: discovery runs inside a web
 request, and an unreachable CUPS server or a network that swallows multicast
@@ -47,21 +48,15 @@ class Found:
     """One discovered printer, in the terms the printer form needs."""
 
     name: str
-    destination: str  # queue name / IPP resource
-    server: str  # "host" or "host:port"; empty = the local CUPS server
-    source: str  # "cups" or "mdns"
+    destination: str  # CUPS queue name, or the device address ipp://...
+    server: str  # CUPS server "host" or "host:port"; empty = local / direct
+    source: str  # "cups", "ipp" (asked directly) or "mdns"
     detail: str = ""  # device URI or model, shown to the user
 
     @property
-    def ready_to_use(self) -> bool:
-        """True if this can be printed on as-is (a real CUPS queue)."""
-        return self.source == "cups"
-
-    def lpadmin_command(self) -> str:
-        """How to turn a discovered device into a CUPS queue, for copy & paste."""
-        uri = self.detail or f"ipp://{self.server}/{self.destination}"
-        queue = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.name) or "drucker"
-        return f"lpadmin -p {queue} -v {uri} -E -m everywhere"
+    def direct(self) -> bool:
+        """Printed on directly over IPP, without a CUPS server."""
+        return self.source in ("ipp", "mdns")
 
 
 # --- CUPS ------------------------------------------------------------------
@@ -251,14 +246,15 @@ def parse_responses(packets: list[bytes]) -> list[Found]:
         instance = service_name.split("._")[0].replace("\\032", " ")
         label = txt.get("ty") or txt.get("product", "").strip("()") or instance
         queue = (txt.get("rp") or "ipp/print").lstrip("/")
-        server = address if port in (631, 0) else f"{address}:{port}"
+        scheme = "ipps" if "._ipps." in service_name else "ipp"
+        where = address if port in (631, 0) else f"{address}:{port}"
         found.append(
             Found(
                 name=label or instance,
-                destination=queue,
-                server=server,
+                destination=f"{scheme}://{where}/{queue}",
+                server="",
                 source="mdns",
-                detail=f"ipp://{address}:{port}/{queue}",
+                detail=txt.get("ty") or "",
             )
         )
     return found
@@ -306,7 +302,58 @@ def mdns_printers(timeout: float = 3.0) -> list[Found]:
     return parse_responses(packets)
 
 
-# --- both -------------------------------------------------------------------
+# --- a device, asked directly -------------------------------------------------
+
+# Where printers listen for IPP. ipp/print is what IPP Everywhere, AirPrint and
+# Mopria prescribe; the others are what older Brother, HP and Epson firmware use.
+IPP_PATHS = ("ipp/print", "ipp/port1", "ipp", "ipp/printer", "printer")
+
+
+def ipp_device(address: str, timeout: float = 4.0) -> Found | None:
+    """Ask `address` (host, host:port or a full ipp:// URI) whether it is an
+    IPP printer. Returns it ready to use, or None."""
+    from . import ipp
+
+    address = address.strip().rstrip("/")
+    if address.lower().startswith(("ipp://", "ipps://")):
+        candidates = [address]
+    else:
+        host = address.split("://", 1)[-1]
+        candidates = [f"ipp://{host}/{path}" for path in IPP_PATHS]
+
+    for uri in candidates:
+        try:
+            response = ipp.printer_attributes(uri, timeout=timeout)
+        except ipp.IppError as exc:
+            if "nicht erreichbar" in str(exc):
+                # Nobody listening on the IPP port at all - other paths on
+                # the same port will not answer either.
+                logger.info("No IPP printer at %s: %s", address, exc)
+                return None
+            continue
+        model = response.first("printer-make-and-model") or response.first("printer-info") or ""
+        formats = [f for f in response.attributes.get("document-format-supported", []) if f]
+        usable = [f for f in formats if f in ("application/pdf", "image/pwg-raster", "image/urf")]
+        return Found(
+            name=str(model or response.first("printer-name") or address),
+            destination=uri,
+            server="",
+            source="ipp",
+            detail="Formate: " + (", ".join(usable) or ", ".join(formats[:6]) or "unbekannt"),
+        )
+    return None
+
+
+# --- all of it ----------------------------------------------------------------
+
+
+def _same_device(uri: str) -> str:
+    """Comparable form of a device URI: ipps -> ipp, default port dropped."""
+    uri = (uri or "").strip().lower().rstrip("/")
+    if uri.startswith("ipps://"):
+        uri = "ipp://" + uri[len("ipps://"):]
+    return uri.replace(":631/", "/")
+
 
 
 def discover(
@@ -324,23 +371,42 @@ def discover(
     """
     found: list[Found] = []
     problems: list[str] = []
+    server = server.strip()
 
-    try:
-        found.extend(cups_queues(server, lpstat_binary=lpstat_binary, timeout=timeout))
-    except DiscoveryError as exc:
-        problems.append(f"CUPS ({server or 'lokal'}): {exc}")
+    cups_problem = None
+    if not server.lower().startswith(("ipp://", "ipps://")):
+        try:
+            found.extend(cups_queues(server, lpstat_binary=lpstat_binary, timeout=timeout))
+        except DiscoveryError as exc:
+            cups_problem = f"CUPS ({server or 'lokal'}): {exc}"
+
+    if server and not found:
+        # Very often what was typed in is the printer itself, not a CUPS
+        # server - which then answers "operation not supported" to lpstat.
+        device = ipp_device(server)
+        if device is not None:
+            found.append(device)
+            cups_problem = None
+        elif cups_problem is None:
+            cups_problem = f"{server}: weder CUPS-Server noch IPP-Drucker gefunden."
+        else:
+            cups_problem += " - und auch kein IPP-Drucker unter dieser Adresse."
+    if cups_problem and (server or not found):
+        problems.append(cups_problem)
 
     if include_mdns:
-        known = {(entry.detail or "").lower() for entry in found}
+        known = {_same_device(entry.destination) for entry in found} | {
+            _same_device(entry.detail) for entry in found
+        }
         for entry in mdns_printers(timeout=mdns_timeout):
-            if entry.detail.lower() in known:
+            if _same_device(entry.destination) in known:
                 continue
             found.append(entry)
         if not any(entry.source == "mdns" for entry in found):
             problems.append(
                 "Per mDNS wurde nichts gefunden. In einem Docker-Netz ist Multicast "
-                "normalerweise nicht erreichbar - dann hilft nur der CUPS-Server oben "
-                "oder das Geraet von Hand einzutragen."
+                "normalerweise nicht erreichbar - dann oben die IP-Adresse des Druckers "
+                "eingeben."
             )
 
     return found, problems

@@ -27,6 +27,23 @@ def _local(tmp_path, **fields) -> int:
 # --- validation ---------------------------------------------------------------
 
 
+def test_an_internal_archive_needs_nothing_and_lives_in_the_volume(tmp_path, monkeypatch):
+    import mail2nas.archives as archives_module
+
+    root = tmp_path / "data" / "ablage"
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(root))
+    store = _store(tmp_path)
+
+    archive = store.get(store.add(backend="internal", path="/somewhere/else"))
+
+    assert archive.name == "Im Container"
+    assert archive.path == ""  # the location is fixed, not configurable
+    assert str(root) in archive.location()
+    storage = archive.to_storage()
+    storage.check_writable()
+    assert storage.save_unique(("quarantaene",), "x.exe", b"MZ").startswith(str(root))
+
+
 def test_an_smb_archive_needs_server_share_and_credentials(tmp_path):
     store = _store(tmp_path)
 

@@ -33,7 +33,7 @@ def test_parse_lpstat_reads_queue_and_device():
         ("Lager", "Lager", "cups.lan"),
     ]
     assert found[0].detail == "ipp://192.168.1.50:631/ipp/print"
-    assert found[0].ready_to_use is True
+    assert found[0].direct is False
 
 
 def test_parse_lpstat_survives_a_localised_prefix():
@@ -143,22 +143,22 @@ def test_parse_responses_builds_a_printer():
     assert len(found) == 1
     printer = found[0]
     assert printer.name == "Kyocera ECOSYS M2540"
-    assert printer.destination == "ipp/print"
-    assert printer.server == "192.168.1.50"
-    assert printer.detail == "ipp://192.168.1.50:631/ipp/print"
-    assert printer.ready_to_use is False
+    # Usable as it is: the device address, printed on directly over IPP.
+    assert printer.destination == "ipp://192.168.1.50/ipp/print"
+    assert printer.server == ""
+    assert printer.direct is True
 
 
-def test_a_non_standard_port_stays_in_the_server():
+def test_a_non_standard_port_stays_in_the_address():
     found = parse_responses([_response(port=6310, rp="ipp/print")])
 
-    assert found[0].server == "192.168.1.50:6310"
+    assert found[0].destination == "ipp://192.168.1.50:6310/ipp/print"
 
 
 def test_without_a_queue_in_the_txt_record_the_default_is_used():
     found = parse_responses([_response(ty="Drucker")])
 
-    assert found[0].destination == "ipp/print"
+    assert found[0].destination.endswith("/ipp/print")
 
 
 def test_the_instance_name_is_used_when_the_txt_record_has_no_model():
@@ -187,7 +187,7 @@ def test_compressed_names_are_followed():
 
     found = parse_responses([header + first + second])
 
-    assert [f.server for f in found] == ["drucker.local"]
+    assert [f.destination for f in found] == ["ipp://drucker.local/ipp/print"]
 
 
 @pytest.mark.parametrize(
@@ -228,7 +228,7 @@ def test_discover_merges_both_sources(monkeypatch):
     monkeypatch.setattr(
         discovery,
         "mdns_printers",
-        lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")],
+        lambda **k: [Found("B", "ipp://10.0.0.2/ipp/print", "", "mdns")],
     )
 
     found, problems = discover("cups.lan")
@@ -243,7 +243,9 @@ def test_a_device_that_already_has_a_queue_is_not_listed_twice(monkeypatch):
         discovery, "cups_queues", lambda *a, **k: [Found("A", "A", "cups.lan", "cups", uri)]
     )
     monkeypatch.setattr(
-        discovery, "mdns_printers", lambda **k: [Found("A", "ipp/print", "10.0.0.1", "mdns", uri)]
+        discovery,
+        "mdns_printers",
+        lambda **k: [Found("A", "ipp://10.0.0.1/ipp/print", "", "mdns")],
     )
 
     found, _ = discover("cups.lan")
@@ -256,8 +258,9 @@ def test_a_broken_cups_server_still_leaves_the_mdns_results(monkeypatch):
         raise DiscoveryError("Server nicht erreichbar")
 
     monkeypatch.setattr(discovery, "cups_queues", boom)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: None)
     monkeypatch.setattr(
-        discovery, "mdns_printers", lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns")]
+        discovery, "mdns_printers", lambda **k: [Found("B", "ipp://10.0.0.2/ipp/print", "", "mdns")]
     )
 
     found, problems = discover("cups.lan")
@@ -276,10 +279,91 @@ def test_finding_nothing_explains_why(monkeypatch):
     assert any("Multicast" in problem for problem in problems)
 
 
-def test_the_lpadmin_hint_is_a_usable_command():
-    entry = Found("Kyocera M2540", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")
+# --- a printer's own address typed in -------------------------------------------
 
-    command = entry.lpadmin_command()
 
-    assert command.startswith("lpadmin -p Kyocera_M2540 -v ipp://10.0.0.2:631/ipp/print")
-    assert " -m everywhere" in command
+def test_an_address_that_is_a_printer_and_not_a_cups_server_is_found(monkeypatch):
+    """What happened with a Brother MFC-L2710DW: its IP was typed in as the
+    CUPS server, lpstat answered "operation not supported" and nothing was
+    found. The device itself is asked over IPP instead."""
+
+    def not_cups(*args, **kwargs):
+        raise DiscoveryError("lpstat: server-error-operation-not-supported")
+
+    device = Found("Brother MFC-L2710DW series", "ipp://10.10.112.160/ipp/print", "", "ipp")
+    asked = []
+    monkeypatch.setattr(discovery, "cups_queues", not_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: asked.append(address) or device)
+    monkeypatch.setattr(discovery, "mdns_printers", lambda **k: [])
+
+    found, problems = discover("10.10.112.160")
+
+    assert asked == ["10.10.112.160"]
+    assert found == [device]
+    assert not any("operation-not-supported" in problem for problem in problems)
+
+
+def test_a_full_device_address_is_not_asked_as_cups_server(monkeypatch):
+    def no_cups(*args, **kwargs):
+        raise AssertionError("lpstat must not be called for an ipp:// address")
+
+    device = Found("Drucker", "ipp://10.0.0.5/ipp/print", "", "ipp")
+    monkeypatch.setattr(discovery, "cups_queues", no_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: device)
+
+    found, _ = discover("ipp://10.0.0.5/ipp/print", include_mdns=False)
+
+    assert found == [device]
+
+
+def test_neither_cups_nor_printer_says_both(monkeypatch):
+    def not_cups(*args, **kwargs):
+        raise DiscoveryError("Verbindung abgelehnt")
+
+    monkeypatch.setattr(discovery, "cups_queues", not_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: None)
+
+    found, problems = discover("10.0.0.9", include_mdns=False)
+
+    assert found == []
+    assert any("kein IPP-Drucker" in problem for problem in problems)
+
+
+def test_ipp_device_tries_the_usual_paths(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def attributes(uri, timeout=10):
+        tried.append(uri)
+        if not uri.endswith("/ipp/port1"):
+            raise ipp.IppError("Drucker antwortet mit HTTP 404 Not Found")
+        return ipp.Response(0, {
+            "printer-make-and-model": ["Brother MFC-L2710DW series"],
+            "document-format-supported": ["application/octet-stream", "image/urf",
+                                          "image/pwg-raster"],
+        })
+
+    monkeypatch.setattr(ipp, "printer_attributes", attributes)
+
+    device = discovery.ipp_device("10.0.0.7")
+
+    assert tried[:2] == ["ipp://10.0.0.7/ipp/print", "ipp://10.0.0.7/ipp/port1"]
+    assert device.destination == "ipp://10.0.0.7/ipp/port1"
+    assert device.name == "Brother MFC-L2710DW series"
+    assert "image/pwg-raster" in device.detail
+
+
+def test_ipp_device_gives_up_when_nothing_listens(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def refused(uri, timeout=10):
+        tried.append(uri)
+        raise ipp.IppError("Drucker 10.0.0.8:631 nicht erreichbar: Connection refused")
+
+    monkeypatch.setattr(ipp, "printer_attributes", refused)
+
+    assert discovery.ipp_device("10.0.0.8") is None
+    assert len(tried) == 1

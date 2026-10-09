@@ -214,8 +214,8 @@ BASE_TEMPLATE = """
     <nav>
       <a href="{{ url_for('overview_page') }}">Uebersicht</a> &middot;
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
-      <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
-      <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
+      <a href="{{ url_for('config_page') }}">Einrichtung</a> &middot;
+      <a href="{{ url_for('settings_page') }}">Optionen</a> &middot;
       <a href="{{ url_for('log_page') }}">Protokoll</a> &middot;
       <a href="{{ url_for('backup_page') }}">Sicherung</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
@@ -335,7 +335,7 @@ MAPPING_BODY = """
   <p class="hint">Mit <em>Drucken</em> wird jeder Anhang, den diese Zuordnung trifft,
   zusaetzlich ausgedruckt - z. B. nur Rechnungen. Gedruckt wird erst, nachdem der
   Anhang abgelegt wurde. Drucker werden unter
-  <a href="{{ url_for('config_page') }}">Konfiguration</a> angelegt.</p>
+  <a href="{{ url_for('config_page') }}">Einrichtung</a> angelegt.</p>
   {% endif %}
 </div>
 
@@ -504,7 +504,7 @@ CONFIG_BODY = """
   {% if printers %}
   <div class="table-wrap">
   <table>
-    <tr><th>Name</th><th>Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
+    <tr><th>Name</th><th>Adresse / Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
     {% for printer in printers %}
     <tr>
       <td class="keyword">{{ printer.name }}</td>
@@ -523,10 +523,11 @@ CONFIG_BODY = """
   <p class="hint">Einmal angelegt, dann ueberall per Auswahlfeld verwendbar: je
   Postfach (alles drucken) und je Zuordnung (z. B. nur Rechnungen).</p>
   {% elif printing_enabled %}
-  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
-  CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
+  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Netzwerkdrucker
+  laesst sich direkt ueber seine IP-Adresse einbinden („Im Netzwerk suchen"), ein
+  CUPS-Server wird dafuer nicht gebraucht.</p>
   {% else %}
-  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Einstellungen</a>
+  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Optionen</a>
   abgeschaltet.</p>
   {% endif %}
   <p style="margin-bottom:0">
@@ -548,7 +549,7 @@ CONFIG_BODY = """
       <td class="keyword">{{ entry.name }}{% if loop.first %}
         <span class="hint">Standard</span>{% endif %}</td>
       <td>{{ entry.location() }}</td>
-      <td>{% if entry.backend == 'smb' %}SMB{% else %}gemountet{% endif %}</td>
+      <td>{% if entry.backend == 'smb' %}SMB{% elif entry.backend == 'internal' %}im Container{% else %}gemountet{% endif %}</td>
       <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('edit_archive', archive_id=entry.id) }}">Bearbeiten</a>
@@ -563,7 +564,7 @@ CONFIG_BODY = """
   {% else %}
   <p class="hint"><strong>Noch kein Archiv eingerichtet</strong> - solange wird nichts
   abgeholt. Meist ist das eine SMB-Freigabe auf dem NAS; gemountet werden muss dafuer
-  nichts.</p>
+  nichts. Ohne NAS - etwa nur fuer Mail-to-Print - die Art „Im Container" waehlen.</p>
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
     <button type="button">Archiv hinzufuegen</button></a></p>
@@ -653,9 +654,10 @@ CONFIG_BODY = """
     <button type="button">Benachrichtigungen einrichten</button></a></p>
 </div>
 
-<p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
-Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
-<a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
+<p class="hint">Hier wird eingerichtet, <em>was</em> angeschlossen ist. Wie mail2nas
+arbeitet - Ordner fuer Unsortiertes und Quarantaene, Grenzwerte, gesperrte Dateitypen,
+Abrufintervall, Drucken an/aus, Testmodus - steht unter
+<a href="{{ url_for('settings_page') }}">Optionen</a>.</p>
 """
 
 ACCOUNT_BODY = """
@@ -739,7 +741,7 @@ ACCOUNT_BODY = """
     die jemand schon geoeffnet hat - etwa in Outlook, bevor mail2nas an der Reihe war.
     Jede Mail wird trotzdem nur einmal verarbeitet. Beruecksichtigt werden Mails ab dem
     Datum, hoechstens so weit zurueck, wie das Protokoll aufbewahrt wird
-    ({{ retention_days }} Tage, unter Einstellungen).</p>
+    ({{ retention_days }} Tage, unter Optionen).</p>
 
     {% if printers %}
     <input type="hidden" name="print_fields" value="1">
@@ -819,17 +821,17 @@ PRINTER_BODY = """
                placeholder="z. B. Buero EG" required>
       </div>
       <div class="field">
-        <label for="destination">Warteschlange in CUPS</label>
+        <label for="destination">Druckeradresse oder CUPS-Warteschlange</label>
         <input id="destination" name="destination" type="text"
                value="{{ printer.destination if printer else '' }}"
-               placeholder="z. B. Kyocera_M2540" required>
+               placeholder="z. B. ipp://192.168.1.50/ipp/print" required>
       </div>
     </div>
     <div class="row" style="margin-top:.6rem">
       <div class="field">
         <label for="server">CUPS-Server (optional)</label>
         <input id="server" name="server" type="text" value="{{ printer.server if printer else '' }}"
-               placeholder="leer = lokaler cupsd, sonst z. B. cups.lan:631">
+               placeholder="nur fuer eine CUPS-Warteschlange, z. B. cups.lan:631">
       </div>
       <div class="field">
         <label for="copies">Kopien</label>
@@ -853,8 +855,14 @@ PRINTER_BODY = """
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
     </div>
   </form>
-  <p class="hint">Die Warteschlange ist der Name, unter dem der Drucker in CUPS
-  bekannt ist (<code>lpstat -p</code>). Die Optionen sind genau die, die
+  <p class="hint"><strong>Direkt, ohne CUPS</strong> (empfohlen fuer einen einzelnen
+  Netzwerkdrucker): die Adresse <code>ipp://&lt;IP-des-Druckers&gt;/ipp/print</code>
+  eintragen und das Feld CUPS-Server leer lassen. Das klappt mit praktisch jedem
+  Drucker, der AirPrint, Mopria oder IPP Everywhere kann - am einfachsten ueber
+  „Im Netzwerk suchen" mit der IP-Adresse. Optionen dann: <code>media=A4</code>,
+  <code>sides=two-sided-long-edge</code>, <code>print-color-mode=monochrome</code>.</p>
+  <p class="hint"><strong>Ueber einen CUPS-Server</strong>: der Name der Warteschlange
+  (<code>lpstat -p</code>) plus der Server. Die Optionen sind dann genau die, die
   <code>lp -o</code> versteht - jeweils ohne <code>-o</code>, mehrere durch
   Leerzeichen getrennt.</p>
 </div>
@@ -866,8 +874,8 @@ PRINTER_BODY = """
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button class="secondary" type="submit">Testseite drucken</button>
     <p class="hint">Druckt eine Seite mit den Einstellungen dieses Druckers - so
-    laesst sich pruefen, ob die Warteschlange stimmt, bevor die erste Rechnung
-    ankommt.</p>
+    laesst sich pruefen, ob Adresse bzw. Warteschlange stimmen, bevor die erste
+    Rechnung ankommt.</p>
   </form>
 </div>
 
@@ -993,15 +1001,17 @@ DISCOVERY_BODY = """
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="row">
       <div class="field">
-        <label for="server">CUPS-Server abfragen (optional)</label>
+        <label for="server">IP-Adresse des Druckers oder CUPS-Server</label>
         <input id="server" name="server" type="text" value="{{ server }}"
-               placeholder="z. B. cups.lan:631 - leer = lokaler cupsd">
+               placeholder="z. B. 192.168.1.50 oder cups.lan:631">
       </div>
       <button type="submit">Suchen</button>
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
     </div>
-    <p class="hint" style="margin-bottom:0">Gefragt werden die Warteschlangen des
-    CUPS-Servers und - per mDNS - Geraete, die sich im Netz selbst ankuendigen.</p>
+    <p class="hint" style="margin-bottom:0">Ist die Adresse ein Drucker, wird er direkt
+    gefragt (IPP - AirPrint, Mopria, IPP Everywhere); ist sie ein CUPS-Server, werden
+    seine Warteschlangen gelistet. Dazu kommen Geraete, die sich per mDNS selbst
+    ankuendigen.</p>
   </form>
 </div>
 
@@ -1011,22 +1021,18 @@ DISCOVERY_BODY = """
   {% if found %}
   <div class="table-wrap">
   <table>
-    <tr><th>Name</th><th>Warteschlange</th><th>Server</th><th>Quelle</th><th></th></tr>
+    <tr><th>Name</th><th>Adresse / Warteschlange</th><th>Server</th><th>Art</th><th></th></tr>
     {% for item in found %}
     <tr>
       <td class="keyword">{{ item.name }}</td>
       <td>{{ item.destination }}<br><span class="hint">{{ item.detail }}</span></td>
-      <td>{{ item.server or 'lokal' }}</td>
-      <td>{% if item.ready_to_use %}CUPS-Warteschlange{% else %}im Netz gefunden{% endif %}</td>
+      <td>{% if item.direct %}-{% else %}{{ item.server or 'lokal' }}{% endif %}</td>
+      <td>{% if item.direct %}direkt (IPP){% else %}CUPS-Warteschlange{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('new_printer', name=item.name, destination=item.destination,
                             server=item.server) }}">Uebernehmen</a>
       </td>
     </tr>
-    {% if not item.ready_to_use %}
-    <tr><td colspan="5" class="hint">Noch keine Warteschlange. Zuverlaessig wird daraus
-      eine mit:<br><code>{{ item.lpadmin_command() }}</code></td></tr>
-    {% endif %}
     {% endfor %}
   </table>
   </div>
@@ -1060,6 +1066,8 @@ ARCHIVE_BODY = """
             SMB-Freigabe (nichts gemountet)</option>
           <option value="local" {% if archive and archive.backend == 'local' %}selected{% endif %}>
             Gemountetes Verzeichnis</option>
+          <option value="internal" {% if archive and archive.backend == 'internal' %}selected{% endif %}>
+            Im Container - ohne NAS (z. B. nur Mail-to-Print)</option>
         </select>
       </div>
     </div>
@@ -1129,6 +1137,11 @@ ARCHIVE_BODY = """
   Quarantaene-Ordner.
   Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
   mountet nichts.</p>
+  <p class="hint"><strong>Ohne NAS</strong> (nur drucken): Art „Im Container" waehlen.
+  Gedruckt wird dann wie eingerichtet; nur was nicht gedruckt werden konnte, was in
+  Quarantaene muss oder fuer das ein Postfach auf „ablegen" steht, landet im
+  Docker-Volume (<code>/data/ablage</code>) - herunterladen z. B. mit
+  <code>docker compose cp mail2nas:/data/ablage .</code></p>
 </div>
 
 {% if archive %}
@@ -1343,6 +1356,9 @@ OVERVIEW_BODY = """
 """
 
 SETTINGS_BODY = """
+<p class="hint">Wie mail2nas arbeitet - fuer alle Postfaecher, Archive und Drucker
+gemeinsam. Diese selbst werden unter <a href="{{ url_for('config_page') }}">Einrichtung</a>
+angelegt.</p>
 <form method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
@@ -1470,7 +1486,7 @@ SETTINGS_BODY = """
     Mail bei jedem Durchlauf erneut geprueft.</p>
   </div>
 
-  <button type="submit">Einstellungen speichern</button>
+  <button type="submit">Optionen speichern</button>
   <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
 </form>
 """
@@ -1574,7 +1590,7 @@ LOG_BODY = """
 </div>
 {% endif %}
 <p class="hint">Aufbewahrt werden {{ retention_days }} Tage (einstellbar unter
-<a href="{{ url_for('settings_page') }}">Einstellungen</a>). Vollstaendige Fehlermeldungen
+<a href="{{ url_for('settings_page') }}">Optionen</a>). Vollstaendige Fehlermeldungen
 mit Stacktrace stehen zusaetzlich im Container-Log (<code>docker compose logs</code>).</p>
 """
 
@@ -1594,7 +1610,7 @@ BACKUP_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Sicherung herunterladen</h2>
   <p style="margin-top:0">Die komplette Konfiguration in einer Datei: Postfaecher, Archive,
-  Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Benachrichtigungen,
+  Zuordnungen, Drucker, Zustelladressen, Abholordner, Optionen, Benachrichtigungen,
   Passwort der Oberflaeche und das Protokoll.</p>
   <p><a href="{{ url_for('download_backup') }}"><button type="button">Jetzt sichern und
     herunterladen</button></a></p>
@@ -1928,7 +1944,8 @@ def create_app(runtime) -> Flask:
     def _setup_hint() -> str:
         """One line on every page while something essential is missing."""
         if runtime.default_archive() is None:
-            return "Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt."
+            return ("Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt. "
+                    "Ohne NAS (nur drucken): ein Archiv der Art „Im Container\" anlegen.")
         if runtime.status.archive.ok is False:
             return "Das Standard-Archiv ist nicht bereit: " + runtime.status.archive.detail
         if not runtime.accounts.enabled() and not (runtime.pickups and runtime.pickups.enabled()):
@@ -2212,7 +2229,7 @@ def create_app(runtime) -> Flask:
     def config_page():
         return render(
             CONFIG_BODY,
-            "Konfiguration",
+            "Einrichtung",
             accounts=runtime.accounts.all(),
             printers=_printers(),
             address_rules=_address_rules(),
@@ -2245,11 +2262,11 @@ def create_app(runtime) -> Flask:
                     flash("Gespeichert. Der Testmodus ist jetzt an - es wird nichts abgelegt.",
                           "error")
                 else:
-                    flash("Einstellungen gespeichert.", "ok")
+                    flash("Optionen gespeichert.", "ok")
                 return redirect(url_for("settings_page"))
         return render(
             SETTINGS_BODY,
-            "Einstellungen",
+            "Optionen",
             o=options,
             prefixes=FILENAME_PREFIXES,
             limits=LIMITS,
@@ -2899,7 +2916,7 @@ def create_app(runtime) -> Flask:
             logger.exception("Web UI: test print failed")
             flash(f"Testdruck fehlgeschlagen: {exc}", "error")
         else:
-            flash("Testseite an die Warteschlange uebergeben.", "ok")
+            flash("Testseite an den Drucker uebergeben.", "ok")
         return redirect(url_for("edit_printer", printer_id=printer_id))
 
     @app.route("/config/printers/discover", methods=["GET", "POST"])

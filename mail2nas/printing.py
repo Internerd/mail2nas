@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
+from . import ipp, render
 from .config import DEFAULT_PRINTABLE_EXTENSIONS
 from .filenames import extension_of, sanitize_filename
 from .printers import Printer, PrinterStore
@@ -68,8 +70,98 @@ def build_command(printer: Printer, path: str, title: str, lp_binary: str = "lp"
     return [*command, "--", path]
 
 
+# Printer options understood when printing directly over IPP, and how the
+# usual CUPS spellings map onto IPP values.
+MEDIA_KEYWORDS = {"a4": "iso_a4_210x297mm", "letter": "na_letter_8.5x11in"}
+
+
+def _direct_options(printer: Printer) -> dict[str, str]:
+    options = {}
+    for option in printer.option_list:
+        key, _, value = option.partition("=")
+        options[key.strip().lower()] = value.strip()
+    return options
+
+
+def _pick_dpi(available: list[int], wanted: int = 300) -> int:
+    """The supported resolution closest to `wanted` (300 dpi is plenty for
+    documents and keeps the raster - and the transfer - small)."""
+    return min(available, key=lambda dpi: (abs(dpi - wanted), dpi)) if available else wanted
+
+
+def _urf_dpis(values) -> list[int]:
+    for value in values or ():
+        if isinstance(value, str) and value.upper().startswith("RS"):
+            return [int(part) for part in re.findall(r"\d+", value)]
+    return []
+
+
+def print_direct(printer: Printer, data: bytes, extension: str, title: str,
+                 timeout: int = 120, gs_binary: str = "gs") -> str:
+    """Print on a device addressed as ipp://..., without a CUPS server.
+
+    Asks the printer which formats it takes, prepares the document in the
+    best of them (PDF if possible, else PWG raster or URF) and sends it.
+    """
+    uri = printer.destination
+    try:
+        attributes = ipp.printer_attributes(uri, timeout=min(timeout, 20))
+        formats = {str(f).lower() for f in attributes.attributes.get("document-format-supported", [])
+                   if f}
+        options = _direct_options(printer)
+
+        media = options.get("media", "").lower()
+        default_media = str(attributes.first("media-default") or "").lower()
+        paper = "letter" if "letter" in (media or default_media) else "a4"
+        color = bool(attributes.first("color-supported", False)) and (
+            options.get("print-color-mode", "").lower() != "monochrome"
+        )
+
+        pdf = render.to_pdf(data, extension, paper, gs_binary, timeout)
+        if "application/pdf" in formats:
+            document, document_format = pdf, "application/pdf"
+        elif "image/pwg-raster" in formats:
+            types = {str(t) for t in attributes.attributes.get("pwg-raster-document-type-supported", [])}
+            if types and "sgray_8" not in types:
+                color = True  # only colour offered
+            elif "srgb_8" not in types:
+                color = False
+            resolutions = attributes.attributes.get("pwg-raster-document-resolution-supported", [])
+            dpi = _pick_dpi([r.dpi[0] for r in resolutions if isinstance(r, ipp.Resolution)])
+            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout)
+            document_format = "image/pwg-raster"
+        elif "image/urf" in formats:
+            dpi = _pick_dpi(_urf_dpis(attributes.attributes.get("urf-supported")))
+            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout)
+            document_format = "image/urf"
+        else:
+            raise PrintError(
+                "Der Drucker nennt kein Format, das mail2nas erzeugen kann (PDF, PWG-Raster "
+                f"oder URF). Er kann: {', '.join(sorted(formats)) or 'nichts angegeben'}. "
+                "Dann bitte ueber einen CUPS-Server mit passendem Treiber drucken."
+            )
+
+        job = []
+        if printer.copies > 1:
+            job.append((ipp.VALUE_INTEGER, "copies", printer.copies))
+        sides = options.get("sides", "")
+        if sides and sides in attributes.attributes.get("sides-supported", [sides]):
+            job.append((ipp.VALUE_KEYWORD, "sides", sides))
+        media_keyword = MEDIA_KEYWORDS.get(media, media)
+        if media and media_keyword in attributes.attributes.get("media-supported", [media_keyword]):
+            job.append((ipp.VALUE_KEYWORD, "media", media_keyword))
+        if "print-color-mode" in options:
+            job.append((ipp.VALUE_KEYWORD, "print-color-mode", options["print-color-mode"]))
+
+        job_id = ipp.print_job(uri, document, document_format, title, job, timeout)
+    except (ipp.IppError, render.RenderError) as exc:
+        raise PrintError(str(exc)) from exc
+    return f"Auftrag {job_id} angenommen ({document_format})" if job_id else "angenommen"
+
+
 class Spooler:
-    """Hands bytes to CUPS, one temporary file per job."""
+    """Hands bytes to CUPS, one temporary file per job - or, for a printer
+    addressed as ipp://..., straight to the device."""
 
     def __init__(
         self,
@@ -78,8 +170,10 @@ class Spooler:
         printable_extensions: frozenset[str] = frozenset(),
         dry_run: bool = False,
         options=None,
+        gs_binary: str = "gs",
     ):
         self._lp_binary = lp_binary
+        self._gs_binary = gs_binary
         self._timeout_value = timeout
         self._printable_value = printable_extensions
         self._dry_run_value = dry_run
@@ -133,6 +227,9 @@ class Spooler:
         if self._dry_run:
             logger.info("[dry-run] would print %r on %s", title, printer.label())
             return "dry-run"
+
+        if printer.is_direct:
+            return print_direct(printer, data, extension, title, self._timeout, self._gs_binary)
 
         suffix = f".{extension}" if extension else ""
         handle, path = tempfile.mkstemp(prefix="mail2nas-print-", suffix=suffix)

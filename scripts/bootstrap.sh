@@ -31,6 +31,7 @@ PyYAML>=6.0,<7.0
 smbprotocol>=1.15,<2.0
 Flask>=3.1,<4.0
 waitress>=3.0,<4.0
+Pillow>=10.0,<12.0
 MAIL2NAS_EOF
 
 # --- requirements-dev.txt ---
@@ -100,12 +101,14 @@ MAIL2NAS_EOF
 cat > Dockerfile <<'MAIL2NAS_EOF'
 FROM python:3.12-slim
 
-# cups-client provides `lp`, which is how attachments are printed. It is a
-# client only - no printing daemon runs in this container; it talks to the
-# CUPS server named per printer (or to the host's, via CUPS_SERVER).
+# cups-client provides `lp`, for printers that are a queue on a CUPS server.
+# It is a client only - no printing daemon runs in this container.
+# ghostscript renders documents for printers addressed directly over IPP
+# (ipp://...) that do not take PDF: PWG raster / URF, see render.py.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     cups-client \
+    ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -2154,6 +2157,7 @@ they are built on demand and rebuilt when the entry behind them changes.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -2172,7 +2176,12 @@ SETTING_ARCHIVES_SEEDED = "archives_seeded"
 DEFAULT_ARCHIVE = ""
 
 MAX_NAME_LENGTH = 80
-BACKENDS = ("smb", "local")
+BACKENDS = ("smb", "local", "internal")
+
+# Where an archive of the kind "internal" keeps its files: inside the Docker
+# volume, next to the database. For installations without a NAS - mail2print
+# only - which still need somewhere for the fallback and the quarantine.
+INTERNAL_ROOT = os.environ.get("MAIL2NAS_INTERNAL_ROOT", "/data/ablage")
 
 
 class ArchiveError(ValueError):
@@ -2189,7 +2198,7 @@ class Archive:
 
     id: int
     name: str
-    backend: str  # "smb" or "local"
+    backend: str  # "smb", "local" or "internal" (inside the container, no NAS)
     host: str
     share: str
     user: str
@@ -2209,6 +2218,8 @@ class Archive:
     def location(self) -> str:
         if self.backend == "local":
             return self.path
+        if self.backend == "internal":
+            return f"im Container ({INTERNAL_ROOT})"
         where = f"//{self.host}/{self.share}"
         return f"{where}/{self.root}" if self.root else where
 
@@ -2233,6 +2244,15 @@ class Archive:
     def to_storage(self) -> Storage:
         if self.backend == "local":
             return LocalStorage(self.path)
+        if self.backend == "internal":
+            # Our own directory in our own volume - creating it is always
+            # right (unlike a mount point, where a missing directory means a
+            # missing mount).
+            try:
+                Path(INTERNAL_ROOT).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.error("Could not create %s: %s", INTERNAL_ROOT, exc)
+            return LocalStorage(INTERNAL_ROOT)
         return SmbStorage(
             host=self.host,
             share=self.share,
@@ -2412,13 +2432,17 @@ def validate(fields: dict) -> dict:
             raise ArchiveError("Bitte den SMB-Benutzer angeben.")
         if not password:
             raise ArchiveError("Bitte das SMB-Passwort angeben.")
+    elif backend == "internal":
+        path = ""
     else:
         if not path:
             raise ArchiveError("Bitte das Verzeichnis angeben, in dem das Share gemountet ist.")
         if not path.startswith("/"):
             raise ArchiveError("Das Verzeichnis muss ein absoluter Pfad sein (z. B. /mnt/nas).")
 
-    default_name = share or Path(path).name or host or "Archiv"
+    default_name = (
+        "Im Container" if backend == "internal" else share or Path(path).name or host or "Archiv"
+    )
     return {
         "name": name or default_name,
         "backend": backend,
@@ -2858,6 +2882,11 @@ class Printer:
         return str(self.id)
 
     @property
+    def is_direct(self) -> bool:
+        """Addressed as ipp://... - printed on directly, no CUPS server involved."""
+        return self.destination.lower().startswith(("ipp://", "ipps://"))
+
+    @property
     def option_list(self) -> list[str]:
         """The options as separate `-o` arguments."""
         return shlex.split(self.options) if self.options.strip() else []
@@ -2984,7 +3013,9 @@ def validate(fields: dict) -> dict:
     options = " ".join(str(fields.get("options") or "").split())
 
     if not destination:
-        raise PrinterError("Bitte den Namen der Druckerwarteschlange angeben.")
+        raise PrinterError(
+            "Bitte die Druckeradresse (ipp://...) oder den Namen der CUPS-Warteschlange angeben."
+        )
     if len(destination) > MAX_DESTINATION_LENGTH:
         raise PrinterError(f"Die Warteschlange darf hoechstens {MAX_DESTINATION_LENGTH} Zeichen lang sein.")
     if any(char.isspace() for char in destination) or destination.startswith("-"):
@@ -2992,6 +3023,21 @@ def validate(fields: dict) -> dict:
             "Die Warteschlange darf keine Leerzeichen enthalten und nicht mit '-' beginnen "
             "(so heisst sie auch in CUPS)."
         )
+    if destination.lower().startswith(("ipp://", "ipps://")):
+        from urllib.parse import urlsplit
+
+        try:
+            host = urlsplit(destination).hostname
+            urlsplit(destination).port  # noqa: B018 - raises on a bad port
+        except ValueError:
+            host = None
+        if not host:
+            raise PrinterError("Die Druckeradresse ist nicht lesbar - Form: ipp://192.168.1.50/ipp/print")
+        if server:
+            raise PrinterError(
+                "Bei einer Druckeradresse (ipp://...) wird direkt gedruckt - "
+                "das Feld CUPS-Server bitte leer lassen."
+            )
     if len(name) > MAX_NAME_LENGTH:
         raise PrinterError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
     if any(char.isspace() for char in server) or server.startswith("-"):
@@ -3080,9 +3126,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
+from . import ipp, render
 from .config import DEFAULT_PRINTABLE_EXTENSIONS
 from .filenames import extension_of, sanitize_filename
 from .printers import Printer, PrinterStore
@@ -3127,8 +3175,98 @@ def build_command(printer: Printer, path: str, title: str, lp_binary: str = "lp"
     return [*command, "--", path]
 
 
+# Printer options understood when printing directly over IPP, and how the
+# usual CUPS spellings map onto IPP values.
+MEDIA_KEYWORDS = {"a4": "iso_a4_210x297mm", "letter": "na_letter_8.5x11in"}
+
+
+def _direct_options(printer: Printer) -> dict[str, str]:
+    options = {}
+    for option in printer.option_list:
+        key, _, value = option.partition("=")
+        options[key.strip().lower()] = value.strip()
+    return options
+
+
+def _pick_dpi(available: list[int], wanted: int = 300) -> int:
+    """The supported resolution closest to `wanted` (300 dpi is plenty for
+    documents and keeps the raster - and the transfer - small)."""
+    return min(available, key=lambda dpi: (abs(dpi - wanted), dpi)) if available else wanted
+
+
+def _urf_dpis(values) -> list[int]:
+    for value in values or ():
+        if isinstance(value, str) and value.upper().startswith("RS"):
+            return [int(part) for part in re.findall(r"\d+", value)]
+    return []
+
+
+def print_direct(printer: Printer, data: bytes, extension: str, title: str,
+                 timeout: int = 120, gs_binary: str = "gs") -> str:
+    """Print on a device addressed as ipp://..., without a CUPS server.
+
+    Asks the printer which formats it takes, prepares the document in the
+    best of them (PDF if possible, else PWG raster or URF) and sends it.
+    """
+    uri = printer.destination
+    try:
+        attributes = ipp.printer_attributes(uri, timeout=min(timeout, 20))
+        formats = {str(f).lower() for f in attributes.attributes.get("document-format-supported", [])
+                   if f}
+        options = _direct_options(printer)
+
+        media = options.get("media", "").lower()
+        default_media = str(attributes.first("media-default") or "").lower()
+        paper = "letter" if "letter" in (media or default_media) else "a4"
+        color = bool(attributes.first("color-supported", False)) and (
+            options.get("print-color-mode", "").lower() != "monochrome"
+        )
+
+        pdf = render.to_pdf(data, extension, paper, gs_binary, timeout)
+        if "application/pdf" in formats:
+            document, document_format = pdf, "application/pdf"
+        elif "image/pwg-raster" in formats:
+            types = {str(t) for t in attributes.attributes.get("pwg-raster-document-type-supported", [])}
+            if types and "sgray_8" not in types:
+                color = True  # only colour offered
+            elif "srgb_8" not in types:
+                color = False
+            resolutions = attributes.attributes.get("pwg-raster-document-resolution-supported", [])
+            dpi = _pick_dpi([r.dpi[0] for r in resolutions if isinstance(r, ipp.Resolution)])
+            document = render.to_pwg_raster(pdf, dpi, color, paper, gs_binary, timeout)
+            document_format = "image/pwg-raster"
+        elif "image/urf" in formats:
+            dpi = _pick_dpi(_urf_dpis(attributes.attributes.get("urf-supported")))
+            document = render.to_urf(pdf, dpi, paper, gs_binary, timeout)
+            document_format = "image/urf"
+        else:
+            raise PrintError(
+                "Der Drucker nennt kein Format, das mail2nas erzeugen kann (PDF, PWG-Raster "
+                f"oder URF). Er kann: {', '.join(sorted(formats)) or 'nichts angegeben'}. "
+                "Dann bitte ueber einen CUPS-Server mit passendem Treiber drucken."
+            )
+
+        job = []
+        if printer.copies > 1:
+            job.append((ipp.VALUE_INTEGER, "copies", printer.copies))
+        sides = options.get("sides", "")
+        if sides and sides in attributes.attributes.get("sides-supported", [sides]):
+            job.append((ipp.VALUE_KEYWORD, "sides", sides))
+        media_keyword = MEDIA_KEYWORDS.get(media, media)
+        if media and media_keyword in attributes.attributes.get("media-supported", [media_keyword]):
+            job.append((ipp.VALUE_KEYWORD, "media", media_keyword))
+        if "print-color-mode" in options:
+            job.append((ipp.VALUE_KEYWORD, "print-color-mode", options["print-color-mode"]))
+
+        job_id = ipp.print_job(uri, document, document_format, title, job, timeout)
+    except (ipp.IppError, render.RenderError) as exc:
+        raise PrintError(str(exc)) from exc
+    return f"Auftrag {job_id} angenommen ({document_format})" if job_id else "angenommen"
+
+
 class Spooler:
-    """Hands bytes to CUPS, one temporary file per job."""
+    """Hands bytes to CUPS, one temporary file per job - or, for a printer
+    addressed as ipp://..., straight to the device."""
 
     def __init__(
         self,
@@ -3137,8 +3275,10 @@ class Spooler:
         printable_extensions: frozenset[str] = frozenset(),
         dry_run: bool = False,
         options=None,
+        gs_binary: str = "gs",
     ):
         self._lp_binary = lp_binary
+        self._gs_binary = gs_binary
         self._timeout_value = timeout
         self._printable_value = printable_extensions
         self._dry_run_value = dry_run
@@ -3192,6 +3332,9 @@ class Spooler:
         if self._dry_run:
             logger.info("[dry-run] would print %r on %s", title, printer.label())
             return "dry-run"
+
+        if printer.is_direct:
+            return print_direct(printer, data, extension, title, self._timeout, self._gs_binary)
 
         suffix = f".{extension}" if extension else ""
         handle, path = tempfile.mkstemp(prefix="mail2nas-print-", suffix=suffix)
@@ -3302,15 +3445,16 @@ MAIL2NAS_EOF
 cat > mail2nas/discovery.py <<'MAIL2NAS_EOF'
 """Finding printers that are already on the network.
 
-Two sources, because there are two kinds of "printer" in this context:
+Three sources, because there are two kinds of "printer" in this context:
 
-* **Queues on a CUPS server** (`lpstat -v`). These are ready to use: their
-  name is exactly what goes into a printer's "Warteschlange", and printing
-  works the moment it is saved.
+* **Queues on a CUPS server** (`lpstat -v`). Their name is exactly what goes
+  into a printer's "Warteschlange".
+* **A device asked directly** over IPP, when an address is typed into the
+  search field: a printer that speaks IPP (AirPrint, Mopria, IPP Everywhere -
+  nearly every network printer) answers with its model and formats, and can
+  be printed on directly as `ipp://<address>/...` (see `ipp.py`).
 * **Devices advertising themselves via mDNS/DNS-SD** (`_ipp._tcp` and
-  friends), which is how AirPrint/driverless printers announce their
-  presence. These are found even when nothing has been set up yet - but a
-  raw device is not a CUPS queue, so the UI says how to turn it into one.
+  friends). Usable directly the same way.
 
 Everything here is best-effort and bounded: discovery runs inside a web
 request, and an unreachable CUPS server or a network that swallows multicast
@@ -3349,21 +3493,15 @@ class Found:
     """One discovered printer, in the terms the printer form needs."""
 
     name: str
-    destination: str  # queue name / IPP resource
-    server: str  # "host" or "host:port"; empty = the local CUPS server
-    source: str  # "cups" or "mdns"
+    destination: str  # CUPS queue name, or the device address ipp://...
+    server: str  # CUPS server "host" or "host:port"; empty = local / direct
+    source: str  # "cups", "ipp" (asked directly) or "mdns"
     detail: str = ""  # device URI or model, shown to the user
 
     @property
-    def ready_to_use(self) -> bool:
-        """True if this can be printed on as-is (a real CUPS queue)."""
-        return self.source == "cups"
-
-    def lpadmin_command(self) -> str:
-        """How to turn a discovered device into a CUPS queue, for copy & paste."""
-        uri = self.detail or f"ipp://{self.server}/{self.destination}"
-        queue = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.name) or "drucker"
-        return f"lpadmin -p {queue} -v {uri} -E -m everywhere"
+    def direct(self) -> bool:
+        """Printed on directly over IPP, without a CUPS server."""
+        return self.source in ("ipp", "mdns")
 
 
 # --- CUPS ------------------------------------------------------------------
@@ -3553,14 +3691,15 @@ def parse_responses(packets: list[bytes]) -> list[Found]:
         instance = service_name.split("._")[0].replace("\\032", " ")
         label = txt.get("ty") or txt.get("product", "").strip("()") or instance
         queue = (txt.get("rp") or "ipp/print").lstrip("/")
-        server = address if port in (631, 0) else f"{address}:{port}"
+        scheme = "ipps" if "._ipps." in service_name else "ipp"
+        where = address if port in (631, 0) else f"{address}:{port}"
         found.append(
             Found(
                 name=label or instance,
-                destination=queue,
-                server=server,
+                destination=f"{scheme}://{where}/{queue}",
+                server="",
                 source="mdns",
-                detail=f"ipp://{address}:{port}/{queue}",
+                detail=txt.get("ty") or "",
             )
         )
     return found
@@ -3608,7 +3747,58 @@ def mdns_printers(timeout: float = 3.0) -> list[Found]:
     return parse_responses(packets)
 
 
-# --- both -------------------------------------------------------------------
+# --- a device, asked directly -------------------------------------------------
+
+# Where printers listen for IPP. ipp/print is what IPP Everywhere, AirPrint and
+# Mopria prescribe; the others are what older Brother, HP and Epson firmware use.
+IPP_PATHS = ("ipp/print", "ipp/port1", "ipp", "ipp/printer", "printer")
+
+
+def ipp_device(address: str, timeout: float = 4.0) -> Found | None:
+    """Ask `address` (host, host:port or a full ipp:// URI) whether it is an
+    IPP printer. Returns it ready to use, or None."""
+    from . import ipp
+
+    address = address.strip().rstrip("/")
+    if address.lower().startswith(("ipp://", "ipps://")):
+        candidates = [address]
+    else:
+        host = address.split("://", 1)[-1]
+        candidates = [f"ipp://{host}/{path}" for path in IPP_PATHS]
+
+    for uri in candidates:
+        try:
+            response = ipp.printer_attributes(uri, timeout=timeout)
+        except ipp.IppError as exc:
+            if "nicht erreichbar" in str(exc):
+                # Nobody listening on the IPP port at all - other paths on
+                # the same port will not answer either.
+                logger.info("No IPP printer at %s: %s", address, exc)
+                return None
+            continue
+        model = response.first("printer-make-and-model") or response.first("printer-info") or ""
+        formats = [f for f in response.attributes.get("document-format-supported", []) if f]
+        usable = [f for f in formats if f in ("application/pdf", "image/pwg-raster", "image/urf")]
+        return Found(
+            name=str(model or response.first("printer-name") or address),
+            destination=uri,
+            server="",
+            source="ipp",
+            detail="Formate: " + (", ".join(usable) or ", ".join(formats[:6]) or "unbekannt"),
+        )
+    return None
+
+
+# --- all of it ----------------------------------------------------------------
+
+
+def _same_device(uri: str) -> str:
+    """Comparable form of a device URI: ipps -> ipp, default port dropped."""
+    uri = (uri or "").strip().lower().rstrip("/")
+    if uri.startswith("ipps://"):
+        uri = "ipp://" + uri[len("ipps://"):]
+    return uri.replace(":631/", "/")
+
 
 
 def discover(
@@ -3626,26 +3816,557 @@ def discover(
     """
     found: list[Found] = []
     problems: list[str] = []
+    server = server.strip()
 
-    try:
-        found.extend(cups_queues(server, lpstat_binary=lpstat_binary, timeout=timeout))
-    except DiscoveryError as exc:
-        problems.append(f"CUPS ({server or 'lokal'}): {exc}")
+    cups_problem = None
+    if not server.lower().startswith(("ipp://", "ipps://")):
+        try:
+            found.extend(cups_queues(server, lpstat_binary=lpstat_binary, timeout=timeout))
+        except DiscoveryError as exc:
+            cups_problem = f"CUPS ({server or 'lokal'}): {exc}"
+
+    if server and not found:
+        # Very often what was typed in is the printer itself, not a CUPS
+        # server - which then answers "operation not supported" to lpstat.
+        device = ipp_device(server)
+        if device is not None:
+            found.append(device)
+            cups_problem = None
+        elif cups_problem is None:
+            cups_problem = f"{server}: weder CUPS-Server noch IPP-Drucker gefunden."
+        else:
+            cups_problem += " - und auch kein IPP-Drucker unter dieser Adresse."
+    if cups_problem and (server or not found):
+        problems.append(cups_problem)
 
     if include_mdns:
-        known = {(entry.detail or "").lower() for entry in found}
+        known = {_same_device(entry.destination) for entry in found} | {
+            _same_device(entry.detail) for entry in found
+        }
         for entry in mdns_printers(timeout=mdns_timeout):
-            if entry.detail.lower() in known:
+            if _same_device(entry.destination) in known:
                 continue
             found.append(entry)
         if not any(entry.source == "mdns" for entry in found):
             problems.append(
                 "Per mDNS wurde nichts gefunden. In einem Docker-Netz ist Multicast "
-                "normalerweise nicht erreichbar - dann hilft nur der CUPS-Server oben "
-                "oder das Geraet von Hand einzutragen."
+                "normalerweise nicht erreichbar - dann oben die IP-Adresse des Druckers "
+                "eingeben."
             )
 
     return found, problems
+MAIL2NAS_EOF
+
+# --- mail2nas/ipp.py ---
+cat > mail2nas/ipp.py <<'MAIL2NAS_EOF'
+"""Printing straight to a network printer over IPP - no CUPS server needed.
+
+Almost every network printer sold in the last ten years speaks IPP: it is
+what AirPrint and Mopria are built on. Such a printer can be addressed as
+`ipp://<address>/ipp/print` and accepts a job directly - which means a
+household with one Brother on the shelf does not need a CUPS server just so
+mail2nas can print an invoice.
+
+The catch is the document format. Many small printers do not understand PDF
+at all; what they are guaranteed to accept is a raster format (PWG raster for
+IPP Everywhere/Mopria, URF for AirPrint). So a document is turned into PDF
+first (`render.py`) and then, if the printer cannot take PDF, rasterised with
+Ghostscript in the format and resolution the printer says it supports.
+
+The protocol part is small and implemented here directly (RFC 8010/8011):
+one request to ask the printer what it can do, one to send the job.
+"""
+from __future__ import annotations
+
+import http.client
+import itertools
+import logging
+import ssl
+import struct
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
+
+PRINT_JOB = 0x0002
+GET_PRINTER_ATTRIBUTES = 0x000B
+
+TAG_OPERATION = 0x01
+TAG_JOB = 0x02
+TAG_END = 0x03
+
+VALUE_INTEGER = 0x21
+VALUE_BOOLEAN = 0x22
+VALUE_ENUM = 0x23
+VALUE_RESOLUTION = 0x32
+VALUE_RANGE = 0x33
+VALUE_BEGIN_COLLECTION = 0x34
+VALUE_TEXT_LANG = 0x35
+VALUE_NAME_LANG = 0x36
+VALUE_END_COLLECTION = 0x37
+VALUE_NAME = 0x42
+VALUE_KEYWORD = 0x44
+VALUE_URI = 0x45
+VALUE_CHARSET = 0x47
+VALUE_LANGUAGE = 0x48
+VALUE_MIME = 0x49
+
+STATUS_VERSION_NOT_SUPPORTED = 0x0503
+
+# Asked for when looking at a printer: what it accepts, and in which raster
+# variants. Asking for specific attributes keeps the answer small.
+WANTED_ATTRIBUTES = (
+    "printer-make-and-model",
+    "printer-info",
+    "printer-name",
+    "printer-state",
+    "document-format-supported",
+    "pwg-raster-document-resolution-supported",
+    "pwg-raster-document-type-supported",
+    "urf-supported",
+    "color-supported",
+    "sides-supported",
+    "media-default",
+    "media-supported",
+)
+
+_request_ids = itertools.count(1)
+
+
+class IppError(RuntimeError):
+    """The printer could not be reached or refused the request."""
+
+
+@dataclass(frozen=True)
+class Resolution:
+    x: int
+    y: int
+    units: int  # 3 = dots per inch, 4 = dots per centimetre
+
+    @property
+    def dpi(self) -> tuple[int, int]:
+        if self.units == 4:
+            return round(self.x * 2.54), round(self.y * 2.54)
+        return self.x, self.y
+
+
+@dataclass
+class Response:
+    status: int
+    attributes: dict[str, list] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        # 0x0000-0x00FF are the successful status codes.
+        return self.status < 0x0100
+
+    def first(self, name: str, default=None):
+        values = self.attributes.get(name)
+        return values[0] if values else default
+
+
+# --- encoding ------------------------------------------------------------------
+
+
+def _attribute(tag: int, name: str, values) -> bytes:
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    out = b""
+    for index, value in enumerate(values):
+        if tag in (VALUE_INTEGER, VALUE_ENUM):
+            encoded = struct.pack(">i", int(value))
+        elif tag == VALUE_BOOLEAN:
+            encoded = b"\x01" if value else b"\x00"
+        else:
+            encoded = str(value).encode("utf-8")
+        label = name.encode("ascii") if index == 0 else b""
+        out += struct.pack(">BH", tag, len(label)) + label
+        out += struct.pack(">H", len(encoded)) + encoded
+    return out
+
+
+def encode_request(
+    operation: int,
+    printer_uri: str,
+    operation_attributes: list[tuple[int, str, object]] = (),
+    job_attributes: list[tuple[int, str, object]] = (),
+    version: tuple[int, int] = (2, 0),
+    request_id: int | None = None,
+) -> bytes:
+    request_id = request_id if request_id is not None else next(_request_ids)
+    body = struct.pack(">BBHI", version[0], version[1], operation, request_id)
+    body += bytes([TAG_OPERATION])
+    # These three must come first, in this order (RFC 8011 4.1.4).
+    body += _attribute(VALUE_CHARSET, "attributes-charset", "utf-8")
+    body += _attribute(VALUE_LANGUAGE, "attributes-natural-language", "en")
+    body += _attribute(VALUE_URI, "printer-uri", printer_uri)
+    for tag, name, value in operation_attributes:
+        body += _attribute(tag, name, value)
+    if job_attributes:
+        body += bytes([TAG_JOB])
+        for tag, name, value in job_attributes:
+            body += _attribute(tag, name, value)
+    return body + bytes([TAG_END])
+
+
+# --- decoding ------------------------------------------------------------------
+
+
+def _decode_value(tag: int, raw: bytes):
+    if tag in (VALUE_INTEGER, VALUE_ENUM) and len(raw) == 4:
+        return struct.unpack(">i", raw)[0]
+    if tag == VALUE_BOOLEAN and len(raw) == 1:
+        return raw != b"\x00"
+    if tag == VALUE_RESOLUTION and len(raw) == 9:
+        x, y, units = struct.unpack(">iiB", raw)
+        return Resolution(x, y, units)
+    if tag == VALUE_RANGE and len(raw) == 8:
+        return struct.unpack(">ii", raw)
+    if tag in (VALUE_TEXT_LANG, VALUE_NAME_LANG) and len(raw) >= 4:
+        lang_length = struct.unpack(">H", raw[:2])[0]
+        start = 2 + lang_length + 2
+        return raw[start:].decode("utf-8", "replace")
+    if tag < 0x20:  # out-of-band: unknown, no-value, ...
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def decode_response(data: bytes) -> Response:
+    """Parse an IPP response into status and a flat attribute dictionary.
+
+    Collections (media-col and friends) are skipped: nothing here needs them,
+    and parsing them correctly is most of the complexity of the format.
+    """
+    if len(data) < 9:
+        raise IppError("Antwort des Druckers ist zu kurz - ist das wirklich ein IPP-Drucker?")
+    _version, status, _request_id = struct.unpack(">HHI", data[:8])
+    response = Response(status=status)
+    offset = 8
+    current: str | None = None
+    depth = 0
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        if tag == TAG_END:
+            break
+        if tag < 0x10:  # a new attribute group
+            current = None
+            continue
+        if offset + 2 > len(data):
+            break
+        name_length = struct.unpack(">H", data[offset : offset + 2])[0]
+        offset += 2
+        name = data[offset : offset + name_length].decode("utf-8", "replace")
+        offset += name_length
+        if offset + 2 > len(data):
+            break
+        value_length = struct.unpack(">H", data[offset : offset + 2])[0]
+        offset += 2
+        raw = data[offset : offset + value_length]
+        offset += value_length
+
+        if tag == VALUE_BEGIN_COLLECTION:
+            if depth == 0 and name:
+                response.attributes.setdefault(name, []).append(None)
+            depth += 1
+            continue
+        if tag == VALUE_END_COLLECTION:
+            depth = max(0, depth - 1)
+            continue
+        if depth:
+            continue
+        if name:
+            current = name
+        if current is None:
+            continue
+        response.attributes.setdefault(current, []).append(_decode_value(tag, raw))
+    return response
+
+
+# --- transport -----------------------------------------------------------------
+
+
+def split_uri(uri: str) -> tuple[str, str, int, str]:
+    """(scheme, host, port, path) of an ipp:// or ipps:// address."""
+    parts = urlsplit(uri.strip())
+    scheme = parts.scheme.lower()
+    if scheme not in ("ipp", "ipps") or not parts.hostname:
+        raise IppError(f"{uri!r} ist keine Druckeradresse der Form ipp://<adresse>/ipp/print")
+    return scheme, parts.hostname, parts.port or 631, parts.path or "/"
+
+
+def _post(uri: str, body: bytes, timeout: float) -> bytes:
+    scheme, host, port, path = split_uri(uri)
+    if scheme == "ipps":
+        # Printers ship self-signed certificates; there is nothing to verify
+        # them against. The connection is still encrypted.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+    else:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request(
+            "POST", path, body=body,
+            headers={"Content-Type": "application/ipp", "Accept": "application/ipp"},
+        )
+        reply = connection.getresponse()
+        data = reply.read()
+        if reply.status != 200:
+            raise IppError(f"Drucker antwortet mit HTTP {reply.status} {reply.reason}")
+        return data
+    except (OSError, http.client.HTTPException) as exc:
+        raise IppError(f"Drucker {host}:{port} nicht erreichbar: {exc}") from exc
+    finally:
+        connection.close()
+
+
+def _call(uri: str, operation: int, timeout: float, operation_attributes=(),
+          job_attributes=(), document: bytes = b"") -> Response:
+    """Send one request; retry as IPP/1.1 for printers that only speak that."""
+    for version in ((2, 0), (1, 1)):
+        body = encode_request(operation, uri, operation_attributes, job_attributes, version)
+        response = decode_response(_post(uri, body + document, timeout))
+        if response.status != STATUS_VERSION_NOT_SUPPORTED:
+            return response
+    return response
+
+
+def printer_attributes(uri: str, timeout: float = 10) -> Response:
+    response = _call(
+        uri, GET_PRINTER_ATTRIBUTES, timeout,
+        operation_attributes=[
+            (VALUE_NAME, "requesting-user-name", "mail2nas"),
+            (VALUE_KEYWORD, "requested-attributes", list(WANTED_ATTRIBUTES)),
+        ],
+    )
+    if not response.ok:
+        raise IppError(f"Drucker lehnt die Abfrage ab (IPP-Status 0x{response.status:04x})")
+    return response
+
+
+def print_job(
+    uri: str,
+    document: bytes,
+    document_format: str,
+    job_name: str,
+    job_attributes: list[tuple[int, str, object]] = (),
+    timeout: float = 120,
+) -> int | None:
+    """Send one document. Returns the job id the printer assigned."""
+    response = _call(
+        uri, PRINT_JOB, timeout,
+        operation_attributes=[
+            (VALUE_NAME, "requesting-user-name", "mail2nas"),
+            (VALUE_NAME, "job-name", job_name[:255] or "mail2nas"),
+            (VALUE_MIME, "document-format", document_format),
+        ],
+        job_attributes=list(job_attributes),
+        document=document,
+    )
+    if not response.ok:
+        message = response.first("status-message") or ""
+        raise IppError(
+            f"Drucker hat den Auftrag abgelehnt (IPP-Status 0x{response.status:04x})"
+            + (f": {message}" if message else "")
+        )
+    return response.first("job-id")
+MAIL2NAS_EOF
+
+# --- mail2nas/render.py ---
+cat > mail2nas/render.py <<'MAIL2NAS_EOF'
+"""Turning an attachment into something a printer accepts.
+
+Two steps, used by direct IPP printing (`ipp.py`):
+
+1. **Anything -> PDF.** PDF stays as it is, PostScript goes through
+   Ghostscript, images through Pillow, plain text through a tiny PDF writer
+   below. PDF is the common ground every later step understands.
+2. **PDF -> raster**, only if the printer cannot take PDF itself: Ghostscript
+   renders PWG raster (IPP Everywhere, Mopria) or URF (AirPrint) at a
+   resolution the printer listed as supported.
+
+Ghostscript always runs with -dSAFER: the documents are mail attachments from
+strangers, and PostScript/PDF are programming languages.
+"""
+from __future__ import annotations
+
+import io
+import logging
+import os
+import subprocess
+import tempfile
+
+logger = logging.getLogger(__name__)
+
+TEXT_EXTENSIONS = {"txt", "text", "log", "csv"}
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"}
+
+# Page sizes in PostScript points, and the names Ghostscript uses for them.
+PAGE_SIZES = {"a4": (595, 842), "letter": (612, 792)}
+
+# Plain text layout: Courier 10 pt, 2 cm margins.
+_FONT_SIZE = 10
+_LINE_HEIGHT = 12
+_MARGIN = 57
+_COLUMNS = 95
+
+
+class RenderError(RuntimeError):
+    """The document could not be prepared for printing."""
+
+
+# --- to PDF -----------------------------------------------------------------------
+
+
+def to_pdf(data: bytes, extension: str, paper: str = "a4", gs_binary: str = "gs",
+           timeout: int = 120) -> bytes:
+    extension = (extension or "").lower()
+    if extension == "pdf" or data[:5] == b"%PDF-":
+        return data
+    if extension == "ps" or data[:2] == b"%!":
+        return _ghostscript(data, "ps", ["-sDEVICE=pdfwrite"], paper, gs_binary, timeout)
+    if extension in IMAGE_EXTENSIONS:
+        return image_to_pdf(data, paper)
+    if extension in TEXT_EXTENSIONS:
+        return text_to_pdf(data.decode("utf-8", "replace"), paper)
+    raise RenderError(f"Dateityp .{extension or '?'} kann nicht direkt gedruckt werden.")
+
+
+def image_to_pdf(data: bytes, paper: str = "a4") -> bytes:
+    """One image, scaled to fit the page."""
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:  # pragma: no cover - Pillow is in requirements.txt
+        raise RenderError("Bilder koennen nicht gedruckt werden: Pillow fehlt.") from None
+
+    width_pt, height_pt = PAGE_SIZES.get(paper, PAGE_SIZES["a4"])
+    try:
+        image = Image.open(io.BytesIO(data))
+        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(image)]
+    except Exception as exc:  # noqa: BLE001 - Pillow raises many types for broken files
+        raise RenderError(f"Bild nicht lesbar: {exc}") from exc
+    if not frames:
+        raise RenderError("Bild enthaelt keine Seite.")
+    # The resolution decides the size on paper: chosen so the largest image
+    # just fits the printable area. Small images are not blown up beyond 150 dpi.
+    usable_w = (width_pt - 2 * _MARGIN) / 72
+    usable_h = (height_pt - 2 * _MARGIN) / 72
+    resolution = max(150.0, max(max(f.width / usable_w, f.height / usable_h) for f in frames))
+    out = io.BytesIO()
+    frames[0].save(out, "PDF", resolution=resolution, save_all=True, append_images=frames[1:])
+    return out.getvalue()
+
+
+def _pdf_string(text: str) -> bytes:
+    # The base-14 Courier speaks Latin-1 (WinAnsi); anything else becomes "?".
+    raw = text.encode("cp1252", "replace")
+    return b"(" + raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)") + b")"
+
+
+def _wrap(text: str) -> list[str]:
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.expandtabs(4).replace("\f", "")
+        line = "".join(ch for ch in line if ch.isprintable())
+        while len(line) > _COLUMNS:
+            lines.append(line[:_COLUMNS])
+            line = line[_COLUMNS:]
+        lines.append(line)
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines or [""]
+
+
+def text_to_pdf(text: str, paper: str = "a4") -> bytes:
+    """Plain text as a PDF in Courier - enough for test pages and CSV dumps."""
+    width, height = PAGE_SIZES.get(paper, PAGE_SIZES["a4"])
+    per_page = max(1, (height - 2 * _MARGIN) // _LINE_HEIGHT)
+    lines = _wrap(text)
+    pages = [lines[i : i + per_page] for i in range(0, len(lines), per_page)]
+
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"",  # the page tree, filled in below once the page ids are known
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+    ]
+    page_ids = []
+    for page in pages:
+        stream = [b"BT", f"/F1 {_FONT_SIZE} Tf {_LINE_HEIGHT} TL".encode(),
+                  f"{_MARGIN} {height - _MARGIN - _FONT_SIZE} Td".encode()]
+        for line in page:
+            stream.append(_pdf_string(line) + b" Tj T*")
+        stream.append(b"ET")
+        content = b"\n".join(stream)
+        objects.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+        content_id = len(objects)
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
+            b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>"
+            % (width, height, content_id)
+        )
+        page_ids.append(len(objects))
+    kids = b" ".join(b"%d 0 R" % pid for pid in page_ids)
+    objects[1] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(page_ids))
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1, xref)
+    return bytes(out)
+
+
+# --- to raster ----------------------------------------------------------------------
+
+
+def to_pwg_raster(pdf: bytes, dpi: int = 300, color: bool = False, paper: str = "a4",
+                  gs_binary: str = "gs", timeout: int = 120) -> bytes:
+    # cupsColorSpace 18 = sGray, 19 = sRGB; 8 bits per colour are what IPP
+    # Everywhere requires every printer to accept (sgray_8 / srgb_8).
+    args = ["-sDEVICE=pwgraster", f"-r{dpi}", f"-dcupsColorSpace={19 if color else 18}",
+            "-dcupsBitsPerColor=8"]
+    return _ghostscript(pdf, "pdf", args, paper, gs_binary, timeout)
+
+
+def to_urf(pdf: bytes, dpi: int = 300, paper: str = "a4", gs_binary: str = "gs",
+           timeout: int = 120) -> bytes:
+    return _ghostscript(pdf, "pdf", ["-sDEVICE=urf", f"-r{dpi}"], paper, gs_binary, timeout)
+
+
+def _ghostscript(data: bytes, suffix: str, device_args: list[str], paper: str,
+                 gs_binary: str, timeout: int) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="mail2nas-render-") as workdir:
+        source = os.path.join(workdir, f"in.{suffix}")
+        target = os.path.join(workdir, "out")
+        with open(source, "wb") as fh:
+            fh.write(data)
+        command = [
+            gs_binary, "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-dNOINTERPOLATE",
+            f"-sPAPERSIZE={paper if paper in PAGE_SIZES else 'a4'}", "-dFIXEDMEDIA",
+            "-dPDFFitPage", *device_args, f"-sOutputFile={target}", source,
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+        except FileNotFoundError:
+            raise RenderError(
+                f"{gs_binary} nicht gefunden - im Container fehlt das Paket ghostscript."
+            ) from None
+        except subprocess.TimeoutExpired:
+            raise RenderError(f"Aufbereiten fuer den Drucker nach {timeout}s abgebrochen.") from None
+        if result.returncode != 0 or not os.path.exists(target):
+            message = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
+            raise RenderError(f"Ghostscript konnte das Dokument nicht aufbereiten: "
+                              f"{message[-300:] or result.returncode}")
+        with open(target, "rb") as fh:
+            return fh.read()
 MAIL2NAS_EOF
 
 # --- mail2nas/runtime.py ---
@@ -7543,8 +8264,8 @@ BASE_TEMPLATE = """
     <nav>
       <a href="{{ url_for('overview_page') }}">Uebersicht</a> &middot;
       <a href="{{ url_for('mapping_page') }}">Zuordnungen</a> &middot;
-      <a href="{{ url_for('config_page') }}">Konfiguration</a> &middot;
-      <a href="{{ url_for('settings_page') }}">Einstellungen</a> &middot;
+      <a href="{{ url_for('config_page') }}">Einrichtung</a> &middot;
+      <a href="{{ url_for('settings_page') }}">Optionen</a> &middot;
       <a href="{{ url_for('log_page') }}">Protokoll</a> &middot;
       <a href="{{ url_for('backup_page') }}">Sicherung</a> &middot;
       <a href="{{ url_for('password_page') }}">Passwort</a> &middot;
@@ -7664,7 +8385,7 @@ MAPPING_BODY = """
   <p class="hint">Mit <em>Drucken</em> wird jeder Anhang, den diese Zuordnung trifft,
   zusaetzlich ausgedruckt - z. B. nur Rechnungen. Gedruckt wird erst, nachdem der
   Anhang abgelegt wurde. Drucker werden unter
-  <a href="{{ url_for('config_page') }}">Konfiguration</a> angelegt.</p>
+  <a href="{{ url_for('config_page') }}">Einrichtung</a> angelegt.</p>
   {% endif %}
 </div>
 
@@ -7833,7 +8554,7 @@ CONFIG_BODY = """
   {% if printers %}
   <div class="table-wrap">
   <table>
-    <tr><th>Name</th><th>Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
+    <tr><th>Name</th><th>Adresse / Warteschlange</th><th>Optionen</th><th>Status</th><th></th></tr>
     {% for printer in printers %}
     <tr>
       <td class="keyword">{{ printer.name }}</td>
@@ -7852,10 +8573,11 @@ CONFIG_BODY = """
   <p class="hint">Einmal angelegt, dann ueberall per Auswahlfeld verwendbar: je
   Postfach (alles drucken) und je Zuordnung (z. B. nur Rechnungen).</p>
   {% elif printing_enabled %}
-  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Drucker ist eine
-  CUPS-Warteschlange; der Name ist derselbe wie in CUPS (<code>lpstat -p</code>).</p>
+  <p class="hint">Kein Drucker angelegt - es wird nichts gedruckt. Ein Netzwerkdrucker
+  laesst sich direkt ueber seine IP-Adresse einbinden („Im Netzwerk suchen"), ein
+  CUPS-Server wird dafuer nicht gebraucht.</p>
   {% else %}
-  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Einstellungen</a>
+  <p class="hint">Drucken ist unter <a href="{{ url_for('settings_page') }}">Optionen</a>
   abgeschaltet.</p>
   {% endif %}
   <p style="margin-bottom:0">
@@ -7877,7 +8599,7 @@ CONFIG_BODY = """
       <td class="keyword">{{ entry.name }}{% if loop.first %}
         <span class="hint">Standard</span>{% endif %}</td>
       <td>{{ entry.location() }}</td>
-      <td>{% if entry.backend == 'smb' %}SMB{% else %}gemountet{% endif %}</td>
+      <td>{% if entry.backend == 'smb' %}SMB{% elif entry.backend == 'internal' %}im Container{% else %}gemountet{% endif %}</td>
       <td>{% if entry.enabled %}aktiv{% else %}pausiert{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('edit_archive', archive_id=entry.id) }}">Bearbeiten</a>
@@ -7892,7 +8614,7 @@ CONFIG_BODY = """
   {% else %}
   <p class="hint"><strong>Noch kein Archiv eingerichtet</strong> - solange wird nichts
   abgeholt. Meist ist das eine SMB-Freigabe auf dem NAS; gemountet werden muss dafuer
-  nichts.</p>
+  nichts. Ohne NAS - etwa nur fuer Mail-to-Print - die Art „Im Container" waehlen.</p>
   {% endif %}
   <p style="margin-bottom:0"><a href="{{ url_for('new_archive') }}">
     <button type="button">Archiv hinzufuegen</button></a></p>
@@ -7982,9 +8704,10 @@ CONFIG_BODY = """
     <button type="button">Benachrichtigungen einrichten</button></a></p>
 </div>
 
-<p class="hint">Allgemeine Einstellungen - Ordner fuer Unsortiertes und Quarantaene,
-Grenzwerte, gesperrte Dateitypen, Abrufintervall, Testmodus - stehen unter
-<a href="{{ url_for('settings_page') }}">Einstellungen</a>.</p>
+<p class="hint">Hier wird eingerichtet, <em>was</em> angeschlossen ist. Wie mail2nas
+arbeitet - Ordner fuer Unsortiertes und Quarantaene, Grenzwerte, gesperrte Dateitypen,
+Abrufintervall, Drucken an/aus, Testmodus - steht unter
+<a href="{{ url_for('settings_page') }}">Optionen</a>.</p>
 """
 
 ACCOUNT_BODY = """
@@ -8068,7 +8791,7 @@ ACCOUNT_BODY = """
     die jemand schon geoeffnet hat - etwa in Outlook, bevor mail2nas an der Reihe war.
     Jede Mail wird trotzdem nur einmal verarbeitet. Beruecksichtigt werden Mails ab dem
     Datum, hoechstens so weit zurueck, wie das Protokoll aufbewahrt wird
-    ({{ retention_days }} Tage, unter Einstellungen).</p>
+    ({{ retention_days }} Tage, unter Optionen).</p>
 
     {% if printers %}
     <input type="hidden" name="print_fields" value="1">
@@ -8148,17 +8871,17 @@ PRINTER_BODY = """
                placeholder="z. B. Buero EG" required>
       </div>
       <div class="field">
-        <label for="destination">Warteschlange in CUPS</label>
+        <label for="destination">Druckeradresse oder CUPS-Warteschlange</label>
         <input id="destination" name="destination" type="text"
                value="{{ printer.destination if printer else '' }}"
-               placeholder="z. B. Kyocera_M2540" required>
+               placeholder="z. B. ipp://192.168.1.50/ipp/print" required>
       </div>
     </div>
     <div class="row" style="margin-top:.6rem">
       <div class="field">
         <label for="server">CUPS-Server (optional)</label>
         <input id="server" name="server" type="text" value="{{ printer.server if printer else '' }}"
-               placeholder="leer = lokaler cupsd, sonst z. B. cups.lan:631">
+               placeholder="nur fuer eine CUPS-Warteschlange, z. B. cups.lan:631">
       </div>
       <div class="field">
         <label for="copies">Kopien</label>
@@ -8182,8 +8905,14 @@ PRINTER_BODY = """
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Abbrechen</button></a>
     </div>
   </form>
-  <p class="hint">Die Warteschlange ist der Name, unter dem der Drucker in CUPS
-  bekannt ist (<code>lpstat -p</code>). Die Optionen sind genau die, die
+  <p class="hint"><strong>Direkt, ohne CUPS</strong> (empfohlen fuer einen einzelnen
+  Netzwerkdrucker): die Adresse <code>ipp://&lt;IP-des-Druckers&gt;/ipp/print</code>
+  eintragen und das Feld CUPS-Server leer lassen. Das klappt mit praktisch jedem
+  Drucker, der AirPrint, Mopria oder IPP Everywhere kann - am einfachsten ueber
+  „Im Netzwerk suchen" mit der IP-Adresse. Optionen dann: <code>media=A4</code>,
+  <code>sides=two-sided-long-edge</code>, <code>print-color-mode=monochrome</code>.</p>
+  <p class="hint"><strong>Ueber einen CUPS-Server</strong>: der Name der Warteschlange
+  (<code>lpstat -p</code>) plus der Server. Die Optionen sind dann genau die, die
   <code>lp -o</code> versteht - jeweils ohne <code>-o</code>, mehrere durch
   Leerzeichen getrennt.</p>
 </div>
@@ -8195,8 +8924,8 @@ PRINTER_BODY = """
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button class="secondary" type="submit">Testseite drucken</button>
     <p class="hint">Druckt eine Seite mit den Einstellungen dieses Druckers - so
-    laesst sich pruefen, ob die Warteschlange stimmt, bevor die erste Rechnung
-    ankommt.</p>
+    laesst sich pruefen, ob Adresse bzw. Warteschlange stimmen, bevor die erste
+    Rechnung ankommt.</p>
   </form>
 </div>
 
@@ -8322,15 +9051,17 @@ DISCOVERY_BODY = """
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="row">
       <div class="field">
-        <label for="server">CUPS-Server abfragen (optional)</label>
+        <label for="server">IP-Adresse des Druckers oder CUPS-Server</label>
         <input id="server" name="server" type="text" value="{{ server }}"
-               placeholder="z. B. cups.lan:631 - leer = lokaler cupsd">
+               placeholder="z. B. 192.168.1.50 oder cups.lan:631">
       </div>
       <button type="submit">Suchen</button>
       <a href="{{ url_for('config_page') }}"><button class="secondary" type="button">Zurueck</button></a>
     </div>
-    <p class="hint" style="margin-bottom:0">Gefragt werden die Warteschlangen des
-    CUPS-Servers und - per mDNS - Geraete, die sich im Netz selbst ankuendigen.</p>
+    <p class="hint" style="margin-bottom:0">Ist die Adresse ein Drucker, wird er direkt
+    gefragt (IPP - AirPrint, Mopria, IPP Everywhere); ist sie ein CUPS-Server, werden
+    seine Warteschlangen gelistet. Dazu kommen Geraete, die sich per mDNS selbst
+    ankuendigen.</p>
   </form>
 </div>
 
@@ -8340,22 +9071,18 @@ DISCOVERY_BODY = """
   {% if found %}
   <div class="table-wrap">
   <table>
-    <tr><th>Name</th><th>Warteschlange</th><th>Server</th><th>Quelle</th><th></th></tr>
+    <tr><th>Name</th><th>Adresse / Warteschlange</th><th>Server</th><th>Art</th><th></th></tr>
     {% for item in found %}
     <tr>
       <td class="keyword">{{ item.name }}</td>
       <td>{{ item.destination }}<br><span class="hint">{{ item.detail }}</span></td>
-      <td>{{ item.server or 'lokal' }}</td>
-      <td>{% if item.ready_to_use %}CUPS-Warteschlange{% else %}im Netz gefunden{% endif %}</td>
+      <td>{% if item.direct %}-{% else %}{{ item.server or 'lokal' }}{% endif %}</td>
+      <td>{% if item.direct %}direkt (IPP){% else %}CUPS-Warteschlange{% endif %}</td>
       <td style="white-space:nowrap">
         <a href="{{ url_for('new_printer', name=item.name, destination=item.destination,
                             server=item.server) }}">Uebernehmen</a>
       </td>
     </tr>
-    {% if not item.ready_to_use %}
-    <tr><td colspan="5" class="hint">Noch keine Warteschlange. Zuverlaessig wird daraus
-      eine mit:<br><code>{{ item.lpadmin_command() }}</code></td></tr>
-    {% endif %}
     {% endfor %}
   </table>
   </div>
@@ -8389,6 +9116,8 @@ ARCHIVE_BODY = """
             SMB-Freigabe (nichts gemountet)</option>
           <option value="local" {% if archive and archive.backend == 'local' %}selected{% endif %}>
             Gemountetes Verzeichnis</option>
+          <option value="internal" {% if archive and archive.backend == 'internal' %}selected{% endif %}>
+            Im Container - ohne NAS (z. B. nur Mail-to-Print)</option>
         </select>
       </div>
     </div>
@@ -8458,6 +9187,11 @@ ARCHIVE_BODY = """
   Quarantaene-Ordner.
   Ein gemountetes Verzeichnis muss vom Betriebssystem eingebunden sein - mail2nas
   mountet nichts.</p>
+  <p class="hint"><strong>Ohne NAS</strong> (nur drucken): Art „Im Container" waehlen.
+  Gedruckt wird dann wie eingerichtet; nur was nicht gedruckt werden konnte, was in
+  Quarantaene muss oder fuer das ein Postfach auf „ablegen" steht, landet im
+  Docker-Volume (<code>/data/ablage</code>) - herunterladen z. B. mit
+  <code>docker compose cp mail2nas:/data/ablage .</code></p>
 </div>
 
 {% if archive %}
@@ -8672,6 +9406,9 @@ OVERVIEW_BODY = """
 """
 
 SETTINGS_BODY = """
+<p class="hint">Wie mail2nas arbeitet - fuer alle Postfaecher, Archive und Drucker
+gemeinsam. Diese selbst werden unter <a href="{{ url_for('config_page') }}">Einrichtung</a>
+angelegt.</p>
 <form method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
@@ -8799,7 +9536,7 @@ SETTINGS_BODY = """
     Mail bei jedem Durchlauf erneut geprueft.</p>
   </div>
 
-  <button type="submit">Einstellungen speichern</button>
+  <button type="submit">Optionen speichern</button>
   <span class="hint">&nbsp;Wirkt sofort, ohne Neustart.</span>
 </form>
 """
@@ -8903,7 +9640,7 @@ LOG_BODY = """
 </div>
 {% endif %}
 <p class="hint">Aufbewahrt werden {{ retention_days }} Tage (einstellbar unter
-<a href="{{ url_for('settings_page') }}">Einstellungen</a>). Vollstaendige Fehlermeldungen
+<a href="{{ url_for('settings_page') }}">Optionen</a>). Vollstaendige Fehlermeldungen
 mit Stacktrace stehen zusaetzlich im Container-Log (<code>docker compose logs</code>).</p>
 """
 
@@ -8923,7 +9660,7 @@ BACKUP_BODY = """
 <div class="card">
   <h2 style="margin-top:0">Sicherung herunterladen</h2>
   <p style="margin-top:0">Die komplette Konfiguration in einer Datei: Postfaecher, Archive,
-  Zuordnungen, Drucker, Zustelladressen, Abholordner, Einstellungen, Benachrichtigungen,
+  Zuordnungen, Drucker, Zustelladressen, Abholordner, Optionen, Benachrichtigungen,
   Passwort der Oberflaeche und das Protokoll.</p>
   <p><a href="{{ url_for('download_backup') }}"><button type="button">Jetzt sichern und
     herunterladen</button></a></p>
@@ -9257,7 +9994,8 @@ def create_app(runtime) -> Flask:
     def _setup_hint() -> str:
         """One line on every page while something essential is missing."""
         if runtime.default_archive() is None:
-            return "Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt."
+            return ("Noch kein Archiv eingerichtet - es wird nichts abgeholt oder abgelegt. "
+                    "Ohne NAS (nur drucken): ein Archiv der Art „Im Container\" anlegen.")
         if runtime.status.archive.ok is False:
             return "Das Standard-Archiv ist nicht bereit: " + runtime.status.archive.detail
         if not runtime.accounts.enabled() and not (runtime.pickups and runtime.pickups.enabled()):
@@ -9541,7 +10279,7 @@ def create_app(runtime) -> Flask:
     def config_page():
         return render(
             CONFIG_BODY,
-            "Konfiguration",
+            "Einrichtung",
             accounts=runtime.accounts.all(),
             printers=_printers(),
             address_rules=_address_rules(),
@@ -9574,11 +10312,11 @@ def create_app(runtime) -> Flask:
                     flash("Gespeichert. Der Testmodus ist jetzt an - es wird nichts abgelegt.",
                           "error")
                 else:
-                    flash("Einstellungen gespeichert.", "ok")
+                    flash("Optionen gespeichert.", "ok")
                 return redirect(url_for("settings_page"))
         return render(
             SETTINGS_BODY,
-            "Einstellungen",
+            "Optionen",
             o=options,
             prefixes=FILENAME_PREFIXES,
             limits=LIMITS,
@@ -10228,7 +10966,7 @@ def create_app(runtime) -> Flask:
             logger.exception("Web UI: test print failed")
             flash(f"Testdruck fehlgeschlagen: {exc}", "error")
         else:
-            flash("Testseite an die Warteschlange uebergeben.", "ok")
+            flash("Testseite an den Drucker uebergeben.", "ok")
         return redirect(url_for("edit_printer", printer_id=printer_id))
 
     @app.route("/config/printers/discover", methods=["GET", "POST"])
@@ -14122,6 +14860,37 @@ def test_changes_to_addresses_need_a_csrf_token(client, env):
     assert runtime.addresses.all() == []
 
 
+# --- naming: Einrichtung vs. Optionen -----------------------------------------
+
+
+def test_the_menu_names_setup_and_options_differently(client, env):
+    _login(client)
+
+    html = client.get("/config").get_data(as_text=True)
+
+    assert ">Einrichtung</a>" in html and ">Optionen</a>" in html
+    assert ">Konfiguration</a>" not in html and ">Einstellungen</a>" not in html
+
+
+def test_an_archive_inside_the_container_needs_no_nas(client, env, tmp_path, monkeypatch):
+    from mail2nas import archives as archives_module
+
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(tmp_path / "ablage"))
+    _, _, _, _, runtime = env
+    _login(client)
+
+    client.post(
+        "/config/archives/new",
+        data={"backend": "internal", "enabled": "1",
+              "csrf_token": _csrf(client, "/config/archives/new")},
+    )
+
+    archive = [a for a in runtime.archives.all() if a.backend == "internal"][0]
+    assert archive.name == "Im Container"
+    archive.to_storage().check_writable()
+    assert (tmp_path / "ablage").is_dir()
+
+
 # --- finding printers on the network -----------------------------------------
 
 
@@ -14151,7 +14920,8 @@ def test_searching_lists_what_was_found(client, env, monkeypatch):
         lambda server, **kwargs: (
             [
                 Found("Buero_MFP", "Buero_MFP", "cups.lan", "cups", "ipp://10.0.0.5/ipp/print"),
-                Found("Kyocera M2540", "ipp/print", "10.0.0.6", "mdns", "ipp://10.0.0.6/ipp/print"),
+                Found("Brother MFC-L2710DW series", "ipp://10.0.0.6/ipp/print", "", "ipp",
+                      "Formate: image/pwg-raster"),
             ],
             [],
         ),
@@ -14164,9 +14934,11 @@ def test_searching_lists_what_was_found(client, env, monkeypatch):
     ).get_data(as_text=True)
 
     assert "Buero_MFP" in html
-    assert "Kyocera M2540" in html
-    # the device without a queue comes with the command that creates one
-    assert "lpadmin -p Kyocera_M2540" in html
+    assert "Brother MFC-L2710DW series" in html
+    # a device is taken over with its address, ready to print on directly
+    assert "direkt (IPP)" in html
+    assert "destination=ipp://10.0.0.6/ipp/print" in html.replace("%3A", ":").replace("%2F", "/")
+    assert "lpadmin" not in html
 
 
 def test_a_failing_search_reports_instead_of_crashing(client, env, monkeypatch):
@@ -15415,6 +16187,23 @@ def _local(tmp_path, **fields) -> int:
 # --- validation ---------------------------------------------------------------
 
 
+def test_an_internal_archive_needs_nothing_and_lives_in_the_volume(tmp_path, monkeypatch):
+    import mail2nas.archives as archives_module
+
+    root = tmp_path / "data" / "ablage"
+    monkeypatch.setattr(archives_module, "INTERNAL_ROOT", str(root))
+    store = _store(tmp_path)
+
+    archive = store.get(store.add(backend="internal", path="/somewhere/else"))
+
+    assert archive.name == "Im Container"
+    assert archive.path == ""  # the location is fixed, not configurable
+    assert str(root) in archive.location()
+    storage = archive.to_storage()
+    storage.check_writable()
+    assert storage.save_unique(("quarantaene",), "x.exe", b"MZ").startswith(str(root))
+
+
 def test_an_smb_archive_needs_server_share_and_credentials(tmp_path):
     store = _store(tmp_path)
 
@@ -16609,7 +17398,7 @@ def test_parse_lpstat_reads_queue_and_device():
         ("Lager", "Lager", "cups.lan"),
     ]
     assert found[0].detail == "ipp://192.168.1.50:631/ipp/print"
-    assert found[0].ready_to_use is True
+    assert found[0].direct is False
 
 
 def test_parse_lpstat_survives_a_localised_prefix():
@@ -16719,22 +17508,22 @@ def test_parse_responses_builds_a_printer():
     assert len(found) == 1
     printer = found[0]
     assert printer.name == "Kyocera ECOSYS M2540"
-    assert printer.destination == "ipp/print"
-    assert printer.server == "192.168.1.50"
-    assert printer.detail == "ipp://192.168.1.50:631/ipp/print"
-    assert printer.ready_to_use is False
+    # Usable as it is: the device address, printed on directly over IPP.
+    assert printer.destination == "ipp://192.168.1.50/ipp/print"
+    assert printer.server == ""
+    assert printer.direct is True
 
 
-def test_a_non_standard_port_stays_in_the_server():
+def test_a_non_standard_port_stays_in_the_address():
     found = parse_responses([_response(port=6310, rp="ipp/print")])
 
-    assert found[0].server == "192.168.1.50:6310"
+    assert found[0].destination == "ipp://192.168.1.50:6310/ipp/print"
 
 
 def test_without_a_queue_in_the_txt_record_the_default_is_used():
     found = parse_responses([_response(ty="Drucker")])
 
-    assert found[0].destination == "ipp/print"
+    assert found[0].destination.endswith("/ipp/print")
 
 
 def test_the_instance_name_is_used_when_the_txt_record_has_no_model():
@@ -16763,7 +17552,7 @@ def test_compressed_names_are_followed():
 
     found = parse_responses([header + first + second])
 
-    assert [f.server for f in found] == ["drucker.local"]
+    assert [f.destination for f in found] == ["ipp://drucker.local/ipp/print"]
 
 
 @pytest.mark.parametrize(
@@ -16804,7 +17593,7 @@ def test_discover_merges_both_sources(monkeypatch):
     monkeypatch.setattr(
         discovery,
         "mdns_printers",
-        lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")],
+        lambda **k: [Found("B", "ipp://10.0.0.2/ipp/print", "", "mdns")],
     )
 
     found, problems = discover("cups.lan")
@@ -16819,7 +17608,9 @@ def test_a_device_that_already_has_a_queue_is_not_listed_twice(monkeypatch):
         discovery, "cups_queues", lambda *a, **k: [Found("A", "A", "cups.lan", "cups", uri)]
     )
     monkeypatch.setattr(
-        discovery, "mdns_printers", lambda **k: [Found("A", "ipp/print", "10.0.0.1", "mdns", uri)]
+        discovery,
+        "mdns_printers",
+        lambda **k: [Found("A", "ipp://10.0.0.1/ipp/print", "", "mdns")],
     )
 
     found, _ = discover("cups.lan")
@@ -16832,8 +17623,9 @@ def test_a_broken_cups_server_still_leaves_the_mdns_results(monkeypatch):
         raise DiscoveryError("Server nicht erreichbar")
 
     monkeypatch.setattr(discovery, "cups_queues", boom)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: None)
     monkeypatch.setattr(
-        discovery, "mdns_printers", lambda **k: [Found("B", "ipp/print", "10.0.0.2", "mdns")]
+        discovery, "mdns_printers", lambda **k: [Found("B", "ipp://10.0.0.2/ipp/print", "", "mdns")]
     )
 
     found, problems = discover("cups.lan")
@@ -16852,13 +17644,430 @@ def test_finding_nothing_explains_why(monkeypatch):
     assert any("Multicast" in problem for problem in problems)
 
 
-def test_the_lpadmin_hint_is_a_usable_command():
-    entry = Found("Kyocera M2540", "ipp/print", "10.0.0.2", "mdns", "ipp://10.0.0.2:631/ipp/print")
+# --- a printer's own address typed in -------------------------------------------
 
-    command = entry.lpadmin_command()
 
-    assert command.startswith("lpadmin -p Kyocera_M2540 -v ipp://10.0.0.2:631/ipp/print")
-    assert " -m everywhere" in command
+def test_an_address_that_is_a_printer_and_not_a_cups_server_is_found(monkeypatch):
+    """What happened with a Brother MFC-L2710DW: its IP was typed in as the
+    CUPS server, lpstat answered "operation not supported" and nothing was
+    found. The device itself is asked over IPP instead."""
+
+    def not_cups(*args, **kwargs):
+        raise DiscoveryError("lpstat: server-error-operation-not-supported")
+
+    device = Found("Brother MFC-L2710DW series", "ipp://10.10.112.160/ipp/print", "", "ipp")
+    asked = []
+    monkeypatch.setattr(discovery, "cups_queues", not_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: asked.append(address) or device)
+    monkeypatch.setattr(discovery, "mdns_printers", lambda **k: [])
+
+    found, problems = discover("10.10.112.160")
+
+    assert asked == ["10.10.112.160"]
+    assert found == [device]
+    assert not any("operation-not-supported" in problem for problem in problems)
+
+
+def test_a_full_device_address_is_not_asked_as_cups_server(monkeypatch):
+    def no_cups(*args, **kwargs):
+        raise AssertionError("lpstat must not be called for an ipp:// address")
+
+    device = Found("Drucker", "ipp://10.0.0.5/ipp/print", "", "ipp")
+    monkeypatch.setattr(discovery, "cups_queues", no_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: device)
+
+    found, _ = discover("ipp://10.0.0.5/ipp/print", include_mdns=False)
+
+    assert found == [device]
+
+
+def test_neither_cups_nor_printer_says_both(monkeypatch):
+    def not_cups(*args, **kwargs):
+        raise DiscoveryError("Verbindung abgelehnt")
+
+    monkeypatch.setattr(discovery, "cups_queues", not_cups)
+    monkeypatch.setattr(discovery, "ipp_device", lambda address: None)
+
+    found, problems = discover("10.0.0.9", include_mdns=False)
+
+    assert found == []
+    assert any("kein IPP-Drucker" in problem for problem in problems)
+
+
+def test_ipp_device_tries_the_usual_paths(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def attributes(uri, timeout=10):
+        tried.append(uri)
+        if not uri.endswith("/ipp/port1"):
+            raise ipp.IppError("Drucker antwortet mit HTTP 404 Not Found")
+        return ipp.Response(0, {
+            "printer-make-and-model": ["Brother MFC-L2710DW series"],
+            "document-format-supported": ["application/octet-stream", "image/urf",
+                                          "image/pwg-raster"],
+        })
+
+    monkeypatch.setattr(ipp, "printer_attributes", attributes)
+
+    device = discovery.ipp_device("10.0.0.7")
+
+    assert tried[:2] == ["ipp://10.0.0.7/ipp/print", "ipp://10.0.0.7/ipp/port1"]
+    assert device.destination == "ipp://10.0.0.7/ipp/port1"
+    assert device.name == "Brother MFC-L2710DW series"
+    assert "image/pwg-raster" in device.detail
+
+
+def test_ipp_device_gives_up_when_nothing_listens(monkeypatch):
+    from mail2nas import ipp
+
+    tried = []
+
+    def refused(uri, timeout=10):
+        tried.append(uri)
+        raise ipp.IppError("Drucker 10.0.0.8:631 nicht erreichbar: Connection refused")
+
+    monkeypatch.setattr(ipp, "printer_attributes", refused)
+
+    assert discovery.ipp_device("10.0.0.8") is None
+    assert len(tried) == 1
+MAIL2NAS_EOF
+
+# --- tests/test_ipp.py ---
+cat > tests/test_ipp.py <<'MAIL2NAS_EOF'
+from __future__ import annotations
+
+import shutil
+import struct
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
+
+from mail2nas import ipp, printing, render
+from mail2nas.printers import Printer, PrinterError, validate
+from mail2nas.printing import PrintError, Spooler
+
+needs_gs = pytest.mark.skipif(shutil.which("gs") is None, reason="ghostscript not installed")
+
+
+def _printer(destination="ipp://10.0.0.5/ipp/print", options="", copies=1) -> Printer:
+    return Printer(id=1, name="Brother", destination=destination, server="",
+                   options=options, copies=copies, enabled=True)
+
+
+def _response_bytes(status: int, attributes: list[tuple[int, str, list]]) -> bytes:
+    """An IPP response as a printer would send it."""
+    out = struct.pack(">BBHI", 2, 0, status, 1) + bytes([ipp.TAG_OPERATION])
+    out += ipp._attribute(ipp.VALUE_CHARSET, "attributes-charset", "utf-8")
+    out += ipp._attribute(ipp.VALUE_LANGUAGE, "attributes-natural-language", "en")
+    out += bytes([0x04])  # printer attributes
+    for tag, name, values in attributes:
+        if tag == ipp.VALUE_RESOLUTION:
+            for index, (x, y) in enumerate(values):
+                label = name.encode() if index == 0 else b""
+                raw = struct.pack(">iiB", x, y, 3)
+                out += struct.pack(">BH", tag, len(label)) + label + struct.pack(">H", 9) + raw
+        else:
+            out += ipp._attribute(tag, name, values)
+    return out + bytes([ipp.TAG_END])
+
+
+# --- protocol ---------------------------------------------------------------------
+
+
+def test_a_request_starts_with_the_mandatory_attributes():
+    body = ipp.encode_request(ipp.GET_PRINTER_ATTRIBUTES, "ipp://h/ipp/print", request_id=7)
+
+    version, operation, request_id = struct.unpack(">HHI", body[:8])
+    assert (version, operation, request_id) == (0x0200, ipp.GET_PRINTER_ATTRIBUTES, 7)
+    assert body[8] == ipp.TAG_OPERATION
+    assert body.index(b"attributes-charset") < body.index(b"printer-uri")
+    assert body.endswith(bytes([ipp.TAG_END]))
+
+
+def test_a_response_is_decoded_with_multiple_values_and_resolutions():
+    data = _response_bytes(0, [
+        (ipp.VALUE_MIME, "document-format-supported", ["image/pwg-raster", "image/urf"]),
+        (ipp.VALUE_RESOLUTION, "pwg-raster-document-resolution-supported", [(300, 300), (600, 600)]),
+        (ipp.VALUE_BOOLEAN, "color-supported", [False]),
+        (ipp.VALUE_ENUM, "printer-state", [3]),
+    ])
+
+    response = ipp.decode_response(data)
+
+    assert response.ok
+    assert response.attributes["document-format-supported"] == ["image/pwg-raster", "image/urf"]
+    assert [r.dpi for r in response.attributes["pwg-raster-document-resolution-supported"]] == [
+        (300, 300), (600, 600)]
+    assert response.first("color-supported") is False
+    assert response.first("printer-state") == 3
+
+
+def test_collections_are_skipped_without_losing_what_follows():
+    data = struct.pack(">BBHI", 2, 0, 0, 1) + bytes([0x04])
+    data += struct.pack(">BH", ipp.VALUE_BEGIN_COLLECTION, 9) + b"media-col" + struct.pack(">H", 0)
+    data += struct.pack(">BH", 0x4A, 0) + struct.pack(">H", 10) + b"media-size"
+    data += struct.pack(">BH", ipp.VALUE_BEGIN_COLLECTION, 0) + struct.pack(">H", 0)
+    data += struct.pack(">BH", ipp.VALUE_END_COLLECTION, 0) + struct.pack(">H", 0)
+    data += struct.pack(">BH", ipp.VALUE_END_COLLECTION, 0) + struct.pack(">H", 0)
+    data += ipp._attribute(ipp.VALUE_KEYWORD, "sides-supported", ["one-sided"])
+    data += bytes([ipp.TAG_END])
+
+    response = ipp.decode_response(data)
+
+    assert response.attributes["sides-supported"] == ["one-sided"]
+    assert "media-size" not in response.attributes
+
+
+@pytest.mark.parametrize("data", [b"", b"\x02\x00", b"\x02\x00\x00\x00\x00\x00\x00\x01\x01\x44\xff"])
+def test_garbage_does_not_crash_the_decoder(data):
+    try:
+        ipp.decode_response(data)
+    except ipp.IppError:
+        pass
+
+
+@pytest.mark.parametrize("uri", ["http://x/ipp", "ipp://", "10.0.0.5"])
+def test_only_ipp_addresses_are_accepted(uri):
+    with pytest.raises(ipp.IppError):
+        ipp.split_uri(uri)
+
+
+def test_the_default_port_is_631():
+    assert ipp.split_uri("ipp://10.0.0.5/ipp/print") == ("ipp", "10.0.0.5", 631, "/ipp/print")
+    assert ipp.split_uri("ipps://drucker:443/x")[2] == 443
+
+
+def test_a_job_really_goes_over_http():
+    """End to end through the socket: a tiny HTTP server playing printer."""
+    received = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - name required by http.server
+            length = int(self.headers["Content-Length"])
+            received["type"] = self.headers["Content-Type"]
+            received["path"] = self.path
+            received["body"] = self.rfile.read(length)
+            reply = _response_bytes(0, [(ipp.VALUE_INTEGER, "job-id", [42])])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        uri = f"ipp://127.0.0.1:{server.server_port}/ipp/print"
+        job = ipp.print_job(uri, b"%PDF-1.4 fake", "application/pdf", "Rechnung",
+                            [(ipp.VALUE_INTEGER, "copies", 2)])
+    finally:
+        server.shutdown()
+
+    assert job == 42
+    assert received["type"] == "application/ipp"
+    assert received["path"] == "/ipp/print"
+    assert received["body"].endswith(b"%PDF-1.4 fake")
+    assert b"application/pdf" in received["body"] and b"copies" in received["body"]
+
+
+def test_a_refused_job_raises_with_the_status():
+    reply = _response_bytes(0x040A, [])  # client-error-document-format-not-supported
+    with pytest.raises(ipp.IppError, match="0x040a"):
+        original = ipp._post
+        try:
+            ipp._post = lambda uri, body, timeout: reply
+            ipp.print_job("ipp://h/ipp/print", b"x", "application/pdf", "t")
+        finally:
+            ipp._post = original
+
+
+# --- rendering --------------------------------------------------------------------
+
+
+def test_text_becomes_a_pdf_with_one_page_per_screenful():
+    pdf = render.text_to_pdf("\n".join(f"Zeile {n} äöü" for n in range(150)))
+
+    assert pdf.startswith(b"%PDF-1.4")
+    assert pdf.rstrip().endswith(b"%%EOF")
+    assert pdf.count(b"/Type /Page ") == 3  # 64 lines per A4 page
+    assert b"Zeile 149 \xe4\xf6\xfc" in pdf  # WinAnsi
+
+
+def test_brackets_and_backslashes_in_text_are_escaped():
+    pdf = render.text_to_pdf("a (b) \\ c")
+
+    assert b"(a \\(b\\) \\\\ c) Tj" in pdf
+
+
+def test_pdf_passes_through_unchanged():
+    assert render.to_pdf(b"%PDF-1.7 x", "pdf") == b"%PDF-1.7 x"
+
+
+def test_an_image_becomes_a_pdf():
+    from io import BytesIO
+
+    from PIL import Image
+
+    png = BytesIO()
+    Image.new("RGB", (400, 300), "white").save(png, "PNG")
+
+    assert render.to_pdf(png.getvalue(), "png").startswith(b"%PDF")
+
+
+def test_unknown_types_are_refused():
+    with pytest.raises(render.RenderError):
+        render.to_pdf(b"PK\x03\x04", "docx")
+
+
+@needs_gs
+def test_ghostscript_makes_pwg_raster_at_the_wanted_resolution():
+    raster = render.to_pwg_raster(render.text_to_pdf("Hallo"), dpi=300)
+
+    assert raster[:4] == b"RaS2"
+    header = raster[4:4 + 1796]
+    assert struct.unpack(">II", header[276:284]) == (300, 300)
+    assert struct.unpack(">I", header[400:404])[0] == 18  # sGray
+
+
+@needs_gs
+def test_ghostscript_makes_urf():
+    assert render.to_urf(render.text_to_pdf("Hallo")).startswith(b"UNIRAST")
+
+
+# --- printing directly ---------------------------------------------------------------
+
+
+def _fake_printer(monkeypatch, formats, **extra):
+    sent = {}
+    attributes = {"document-format-supported": formats, **extra}
+
+    def printer_attributes(uri, timeout=10):
+        return ipp.Response(0, attributes)
+
+    def print_job(uri, document, document_format, job_name, job_attributes=(), timeout=120):
+        sent.update(uri=uri, document=document, format=document_format, name=job_name,
+                    attributes={name: value for _, name, value in job_attributes})
+        return 7
+
+    monkeypatch.setattr(ipp, "printer_attributes", printer_attributes)
+    monkeypatch.setattr(ipp, "print_job", print_job)
+    return sent
+
+
+def test_a_pdf_printer_gets_the_pdf(monkeypatch):
+    sent = _fake_printer(monkeypatch, ["application/pdf", "image/pwg-raster"])
+
+    reply = printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
+
+    assert sent["format"] == "application/pdf"
+    assert sent["document"] == b"%PDF-1.4 x"
+    assert "7" in reply
+
+
+def test_a_raster_only_printer_gets_pwg_raster_at_a_supported_resolution(monkeypatch):
+    sent = _fake_printer(
+        monkeypatch, ["application/octet-stream", "image/pwg-raster", "image/urf"],
+        **{"pwg-raster-document-resolution-supported": [ipp.Resolution(600, 600, 3),
+                                                        ipp.Resolution(1200, 1200, 3)],
+           "pwg-raster-document-type-supported": ["black_1", "sgray_8"]},
+    )
+    calls = {}
+    monkeypatch.setattr(render, "to_pwg_raster",
+                        lambda pdf, dpi, color, paper, gs, timeout: calls.update(
+                            dpi=dpi, color=color, paper=paper) or b"RaS2")
+
+    printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
+
+    assert sent["format"] == "image/pwg-raster"
+    assert calls == {"dpi": 600, "color": False, "paper": "a4"}
+
+
+def test_urf_is_the_last_resort(monkeypatch):
+    sent = _fake_printer(monkeypatch, ["image/urf"], **{"urf-supported": ["W8", "RS300-600"]})
+    calls = {}
+    monkeypatch.setattr(render, "to_urf", lambda pdf, dpi, paper, gs, timeout: calls.update(
+        dpi=dpi) or b"UNIRAST")
+
+    printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
+
+    assert sent["format"] == "image/urf"
+    assert calls == {"dpi": 300}
+
+
+def test_a_printer_without_a_usable_format_says_so(monkeypatch):
+    _fake_printer(monkeypatch, ["application/vnd.hp-pcl"])
+
+    with pytest.raises(PrintError, match="vnd.hp-pcl"):
+        printing.print_direct(_printer(), b"%PDF-1.4 x", "pdf", "Rechnung")
+
+
+def test_copies_and_supported_options_go_along(monkeypatch):
+    sent = _fake_printer(
+        monkeypatch, ["application/pdf"],
+        **{"sides-supported": ["one-sided", "two-sided-long-edge"],
+           "media-supported": ["iso_a4_210x297mm", "na_letter_8.5x11in"]},
+    )
+
+    printing.print_direct(
+        _printer(options="media=A4 sides=two-sided-long-edge", copies=3), b"%PDF-1.4", "pdf", "t"
+    )
+
+    assert sent["attributes"] == {
+        "copies": 3, "sides": "two-sided-long-edge", "media": "iso_a4_210x297mm"}
+
+
+def test_an_unreachable_printer_is_a_print_error(monkeypatch):
+    def unreachable(uri, timeout=10):
+        raise ipp.IppError("Drucker 10.0.0.5:631 nicht erreichbar: timed out")
+
+    monkeypatch.setattr(ipp, "printer_attributes", unreachable)
+
+    with pytest.raises(PrintError, match="nicht erreichbar"):
+        printing.print_direct(_printer(), b"%PDF-1.4", "pdf", "t")
+
+
+def test_the_spooler_sends_ipp_addresses_directly_and_never_calls_lp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(printing, "print_direct",
+                        lambda printer, data, ext, title, timeout, gs: calls.append(ext) or "ok")
+    spooler = Spooler(lp_binary="/nonexistent/lp")
+
+    spooler.print_test_page(_printer())
+
+    assert calls == ["txt"]
+
+
+# --- the printer form ------------------------------------------------------------------
+
+
+def test_an_ipp_address_is_a_valid_destination():
+    values = validate({"name": "Brother", "destination": "ipp://10.10.112.160/ipp/print"})
+
+    assert values["destination"] == "ipp://10.10.112.160/ipp/print"
+
+
+def test_an_ipp_address_with_a_cups_server_is_refused():
+    with pytest.raises(PrinterError, match="CUPS-Server bitte leer"):
+        validate({"destination": "ipp://10.0.0.5/ipp/print", "server": "cups.lan"})
+
+
+@pytest.mark.parametrize("destination", ["ipp:///ipp/print", "ipp://host:abc/x"])
+def test_a_broken_ipp_address_is_refused(destination):
+    with pytest.raises(PrinterError):
+        validate({"destination": destination})
+
+
+def test_is_direct():
+    assert _printer().is_direct
+    assert _printer("IPPS://drucker/ipp/print").is_direct
+    assert not _printer("Kyocera_M2540").is_direct
 MAIL2NAS_EOF
 
 # --- tests/test_main.py ---

@@ -51,6 +51,11 @@ class Printer:
         return str(self.id)
 
     @property
+    def is_direct(self) -> bool:
+        """Addressed as ipp://... - printed on directly, no CUPS server involved."""
+        return self.destination.lower().startswith(("ipp://", "ipps://"))
+
+    @property
     def option_list(self) -> list[str]:
         """The options as separate `-o` arguments."""
         return shlex.split(self.options) if self.options.strip() else []
@@ -177,7 +182,9 @@ def validate(fields: dict) -> dict:
     options = " ".join(str(fields.get("options") or "").split())
 
     if not destination:
-        raise PrinterError("Bitte den Namen der Druckerwarteschlange angeben.")
+        raise PrinterError(
+            "Bitte die Druckeradresse (ipp://...) oder den Namen der CUPS-Warteschlange angeben."
+        )
     if len(destination) > MAX_DESTINATION_LENGTH:
         raise PrinterError(f"Die Warteschlange darf hoechstens {MAX_DESTINATION_LENGTH} Zeichen lang sein.")
     if any(char.isspace() for char in destination) or destination.startswith("-"):
@@ -185,6 +192,21 @@ def validate(fields: dict) -> dict:
             "Die Warteschlange darf keine Leerzeichen enthalten und nicht mit '-' beginnen "
             "(so heisst sie auch in CUPS)."
         )
+    if destination.lower().startswith(("ipp://", "ipps://")):
+        from urllib.parse import urlsplit
+
+        try:
+            host = urlsplit(destination).hostname
+            urlsplit(destination).port  # noqa: B018 - raises on a bad port
+        except ValueError:
+            host = None
+        if not host:
+            raise PrinterError("Die Druckeradresse ist nicht lesbar - Form: ipp://192.168.1.50/ipp/print")
+        if server:
+            raise PrinterError(
+                "Bei einer Druckeradresse (ipp://...) wird direkt gedruckt - "
+                "das Feld CUPS-Server bitte leer lassen."
+            )
     if len(name) > MAX_NAME_LENGTH:
         raise PrinterError(f"Der Name darf hoechstens {MAX_NAME_LENGTH} Zeichen lang sein.")
     if any(char.isspace() for char in server) or server.startswith("-"):

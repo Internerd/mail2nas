@@ -220,26 +220,27 @@ die Einrichtung. Die Reihenfolge:
 
 1. **Anmelden** mit dem Startpasswort und unter **Passwort** ein eigenes
    setzen. Das Startpasswort wird dabei auch vom Server geloescht.
-2. **Archiv einrichten** (Konfiguration -> Archiv hinzufuegen): Server,
-   Freigabe, Benutzer, Passwort des NAS. **Verbindung testen** schreibt eine
+2. **Archiv einrichten** (Einrichtung -> Archiv hinzufuegen): Server,
+   Freigabe, Benutzer, Passwort des NAS - oder, ohne NAS, die Art "Im
+   Container" (siehe [Ohne NAS](#ohne-nas---nur-mail-to-print)). **Verbindung testen** schreibt eine
    winzige Testdatei und loescht sie wieder - danach steht fest, dass
    Zugangsdaten und Schreibrechte stimmen.
-3. **Postfach anlegen** (Konfiguration -> Postfach hinzufuegen): IMAP-Server,
+3. **Postfach anlegen** (Einrichtung -> Postfach hinzufuegen): IMAP-Server,
    Benutzer, Passwort, Ordner. **Anmeldung und Ordner pruefen** meldet sich
    an und zeigt, wie viele ungelesene Mails warten - ohne eine anzufassen.
 4. **Zuordnungen anlegen**: Stichwort eintippen, Zielordner aus der Liste der
    Ordner auf dem NAS waehlen (oder einen neuen anlegen). Eine
    `mapping.yaml` aus einer anderen Installation laesst sich importieren.
 5. Optional: **Drucker**, **Zustelladressen**, **Abholordner**, und unter
-   **Einstellungen** Ordnernamen, Grenzwerte und den Testmodus.
-6. Empfohlen: **Benachrichtigungen** (Konfiguration) einrichten und unter
+   **Optionen** Ordnernamen, Grenzwerte und den Testmodus.
+6. Empfohlen: **Benachrichtigungen** (Einrichtung) einrichten und unter
    **Sicherung** die taegliche Sicherung aufs NAS einschalten.
 
 Solange kein Archiv eingerichtet und erfolgreich getestet ist, holt mail2nas
 **keine** Mail ab - die Oberflaeche sagt das auf jeder Seite. So kann nichts
 an einem Ort landen, an dem es niemand erwartet.
 
-**Zum Ausprobieren** gibt es unter Einstellungen den **Testmodus**: es wird
+**Zum Ausprobieren** gibt es unter Optionen den **Testmodus**: es wird
 nichts abgelegt, gedruckt oder als gelesen markiert, nur protokolliert, was
 passieren wuerde (Protokoll -> Verarbeitung, Aktion "Testmodus").
 
@@ -253,8 +254,8 @@ http://<container-ip>:8080/
 |---|---|
 | **Uebersicht** | Einrichtungsschritte, Zustand des Archivs, je Postfach: verbunden / Fehler / zuletzt ok, Anzahl verarbeiteter Mails, Probleme mit Abholordnern, Probleme der letzten 24 Stunden, Zustand der automatischen Sicherung |
 | **Zuordnungen** | Stichwort -> Ordner, Reihenfolge mit Pfeilen, je Zeile Postfach, Archiv und Drucken; Export und Import als `mapping.yaml` |
-| **Konfiguration** | Postfaecher, Archive, Drucker (inkl. Suche im Netzwerk), Zustelladressen, Abholordner, Benachrichtigungen - jeweils mit Test-Knopf |
-| **Einstellungen** | Ordner fuer Unsortiertes und Quarantaene, Dateinamen, gesperrte Dateitypen, Abrufintervall, Grenzwerte, Drucken, Aufbewahrung des Protokolls, Testmodus |
+| **Einrichtung** | Postfaecher, Archive, Drucker (inkl. Suche im Netzwerk), Zustelladressen, Abholordner, Benachrichtigungen - jeweils mit Test-Knopf |
+| **Optionen** | Ordner fuer Unsortiertes und Quarantaene, Dateinamen, gesperrte Dateitypen, Abrufintervall, Grenzwerte, Drucken, Aufbewahrung des Protokolls, Testmodus |
 | **Protokoll** | was mit jedem Anhang passiert ist, und das Dienstprotokoll - filterbar, als CSV |
 | **Sicherung** | Konfiguration herunterladen, taegliche Sicherung aufs NAS, Wiederherstellen |
 | **Passwort** | eigenes Passwort setzen |
@@ -338,7 +339,7 @@ moeglich. Je Postfach einstellbar:
 Wird ein Postfach geloescht, bleiben seine Zuordnungen stehen und greifen
 nicht mehr - die Oberflaeche zeigt sie als "(geloeschtes Postfach)".
 
-### Einstellungen
+### Optionen
 
 | Einstellung | Bedeutung | Standard |
 |---|---|---|
@@ -493,44 +494,59 @@ Ablage. Alles daran wird in der Weboberflaeche eingestellt.
 
 ### Drucker einmal anlegen, ueberall auswaehlen
 
-Unter **Konfiguration -> Drucker** wird jeder Drucker genau einmal
+Unter **Einrichtung -> Drucker** wird jeder Drucker genau einmal
 eingetragen:
 
 | Feld | Bedeutung |
 |---|---|
 | Anzeigename | wie er in den Auswahlfeldern erscheint, z. B. "Buero EG" |
-| Warteschlange in CUPS | der Queue-Name, wie ihn `lpstat -p` zeigt |
-| CUPS-Server | leer = lokaler `cupsd`, sonst z. B. `cups.lan:631` |
+| Druckeradresse oder Warteschlange | **direkt:** `ipp://<IP-des-Druckers>/ipp/print` - oder der Name einer CUPS-Warteschlange, wie ihn `lpstat -p` zeigt |
+| CUPS-Server | nur fuer eine Warteschlange, z. B. `cups.lan:631`; bei einer `ipp://`-Adresse leer |
 | Kopien | 1-20 |
-| Druckoptionen | wie bei `lp -o`, ohne `-o`, durch Leerzeichen getrennt: `media=A4 sides=two-sided-long-edge` |
+| Druckoptionen | durch Leerzeichen getrennt, z. B. `media=A4 sides=two-sided-long-edge`. Direkt per IPP verstanden: `media`, `sides`, `print-color-mode`; ueber CUPS alles, was `lp -o` kennt |
 | Aktiv | pausierte Drucker bleiben gespeichert, es geht nichts an sie raus |
 
 Danach taucht der Drucker ueberall als Auswahlfeld auf - beim Postfach, bei
 jeder Zuordnung, Zustelladresse und jedem Abholordner. **Testseite drucken**
-prueft die Warteschlange; Fehlermeldungen von CUPS erscheinen direkt auf der
+prueft den Weg; Fehlermeldungen von Drucker bzw. CUPS erscheinen direkt auf der
 Seite.
+
+### Direkt drucken, ohne CUPS
+
+Ein CUPS-Server ist nicht noetig. Praktisch jeder Netzwerkdrucker der letzten
+Jahre spricht **IPP** (die Grundlage von AirPrint, Mopria und IPP Everywhere -
+z. B. Brother MFC-L2710DW, HP, Canon, Epson, Kyocera) und wird direkt ueber
+seine Adresse angesprochen: `ipp://192.168.1.50/ipp/print`.
+
+mail2nas fragt den Drucker vor jedem Auftrag, welche Formate er annimmt, und
+bereitet das Dokument passend auf: PDF, wenn er es kann; sonst wird es mit
+Ghostscript in **PWG-Raster** (IPP Everywhere/Mopria) oder **URF** (AirPrint)
+in einer vom Drucker unterstuetzten Aufloesung umgewandelt. Text und Bilder
+werden vorher zu PDF. Der Drucker muss dafuer im Container-Netz per TCP 631
+erreichbar sein (bei VLANs: Firewall-Regel zwischen den Netzen).
+
+Druckt ein Geraet nur in einer eigenen Druckersprache ohne IPP-Rasterformat,
+bleibt der Weg ueber einen CUPS-Server mit passendem Treiber.
 
 ### Drucker im Netzwerk finden
 
-**Konfiguration -> Im Netzwerk suchen** findet
+**Einrichtung -> Im Netzwerk suchen** findet - "Uebernehmen" fuellt jeweils das
+Formular vor:
 
-- **Warteschlangen eines CUPS-Servers** (`lpstat -v`) - sofort verwendbar:
-  "Uebernehmen" fuellt das Formular vor.
-- **Geraete, die sich per mDNS/DNS-SD ankuendigen** (AirPrint, "driverless")
-  - mit dem passenden `lpadmin`-Befehl, um daraus eine Warteschlange zu machen:
-
-  ```bash
-  lpadmin -p Kyocera_M2540 -v ipp://192.168.1.50:631/ipp/print -E -m everywhere
-  ```
+- **den Drucker unter einer eingegebenen IP-Adresse** - er wird direkt per IPP
+  gefragt und meldet Modell und Formate; danach ist er sofort verwendbar,
+- **Warteschlangen eines CUPS-Servers** (`lpstat -v`), wenn die Adresse ein
+  CUPS-Server ist,
+- **Geraete, die sich per mDNS/DNS-SD ankuendigen** (AirPrint, "driverless").
 
 mDNS braucht Multicast; im Docker-Bridge-Netz kommt davon nichts an (die Seite
-sagt das). Dann den CUPS-Server nutzen oder den Container mit
-`network_mode: host` starten. Gesucht wird nur auf Knopfdruck.
+sagt das). Dann einfach die IP-Adresse des Druckers eingeben. Gesucht wird nur
+auf Knopfdruck.
 
 ### Drucken per Mail-Adresse (Zustelladressen)
 
 Der direkteste Weg zum Ausdruck: **eine Mail an eine dafuer eingerichtete
-Adresse schicken.** Unter **Konfiguration -> Zustelladressen**:
+Adresse schicken.** Unter **Einrichtung -> Zustelladressen**:
 
 | Feld | Bedeutung |
 |---|---|
@@ -591,19 +607,35 @@ stiller Verlust wird:
   trotzdem als verarbeitet - sonst laege bei jedem Versuch eine weitere Kopie
   im Archiv.
 - **Quarantaene wird nie gedruckt.**
-- Nur Formate, die CUPS selbst versteht (Einstellungen -> Druckbare
-  Dateitypen). Ein `.docx` ohne Konverter kaeme als Zeichensalat heraus.
+- Nur Formate, die sich zuverlaessig drucken lassen (Optionen -> Druckbare
+  Dateitypen): PDF, PostScript, Text, gaengige Bilder. Ein `.docx` kaeme als
+  Zeichensalat heraus.
 
-### Voraussetzung: CUPS
+### Ohne NAS - nur Mail-to-Print
 
-Gedruckt wird ueber `lp` (Paket `cups-client` im Image). Ein Druckerdienst
-laeuft im Container **nicht** - der Drucker muss an einem CUPS-Server haengen,
-der beim Drucker eingetragen wird, oder an einem `cupsd` auf dem Docker-Host.
+Ein NAS ist nicht Pflicht. Wer nur drucken will, legt unter **Einrichtung ->
+Archiv hinzufuegen** ein Archiv der Art **"Im Container - ohne NAS"** an und
+schaltet beim Postfach "Anhaenge im Archiv ablegen" aus. Das Archiv ist ein
+Ordner im Docker-Volume (`/data/ablage`); dort landet nur, was nicht verloren
+gehen darf: Anhaenge, die nicht gedruckt werden konnten, und die Quarantaene.
+Herausholen z. B. mit:
+
+```bash
+cd /opt/mail2nas && docker compose cp mail2nas:/data/ablage ./ablage
+```
+
+### Direkt oder ueber CUPS
+
+Ein Drucker mit `ipp://`-Adresse wird direkt angesprochen (siehe oben, dafuer
+sind Ghostscript und Pillow im Image). Eine CUPS-Warteschlange wird ueber `lp`
+(Paket `cups-client`) gedruckt; ein Druckerdienst laeuft im Container
+**nicht** - die Warteschlange muss an einem CUPS-Server haengen, der beim
+Drucker eingetragen wird.
 
 ## Abholordner (Scan-to-Folder)
 
 Viele Kopierer mailen ihre Scans nicht, sondern legen sie per SMB in einen
-Ordner. Unter **Konfiguration -> Abholordner** wird so ein Ordner eingetragen,
+Ordner. Unter **Einrichtung -> Abholordner** wird so ein Ordner eingetragen,
 und mail2nas raeumt ihn ab - mit denselben Zuordnungen, derselben Quarantaene,
 derselben Benennung wie bei Mailanhaengen.
 
@@ -642,7 +674,7 @@ Unter **Protokoll** steht, was mail2nas getan hat - ohne Shell und ohne
   Fehler, Aenderungen in der Oberflaeche, Anmeldungen), filterbar nach Stufe.
 
 Beides wird in der Datenbank gehalten und ueberlebt Neustarts und Updates.
-**Aufbewahrt wird ein halbes Jahr** (183 Tage, unter Einstellungen zwischen 30
+**Aufbewahrt wird ein halbes Jahr** (183 Tage, unter Optionen zwischen 30
 Tagen und 10 Jahren einstellbar); aeltere Eintraege loescht mail2nas einmal
 am Tag. Mit derselben Frist wird die Liste der verarbeiteten Message-IDs
 aufgeraeumt, damit die Datenbank nicht endlos waechst. Die abgelegten Dateien
@@ -662,7 +694,7 @@ nicht bei jedem Versuch.
 
 ## Benachrichtigungen
 
-Unter **Konfiguration -> Benachrichtigungen** wird ein Postausgangsserver
+Unter **Einrichtung -> Benachrichtigungen** wird ein Postausgangsserver
 (SMTP) eingetragen und **an wen** die Mails gehen (eine oder mehrere
 Adressen). Dann meldet sich mail2nas per Mail:
 
@@ -932,7 +964,7 @@ cd /opt/mail2nas && docker compose logs -f
 - **Mail landet im Fallback-Ordner**: Reihenfolge der Zuordnungen pruefen
   (eine weiter oben greift zuerst), ob die Zuordnung auf ein anderes Postfach
   beschraenkt ist, und ob das Stichwort wirklich im Dateinamen oder Betreff
-  steht - sonst unter Einstellungen den Mailtext mit durchsuchen lassen.
+  steht - sonst unter Optionen den Mailtext mit durchsuchen lassen.
 - **Nach dem Update keine Zuordnungen**: unter Zuordnungen steht, ob und woher
   sie uebernommen wurden. War die alte `mapping.yaml` fehlerhaft, liegt sie
   unveraendert auf dem NAS - korrigieren und importieren.
@@ -956,14 +988,14 @@ cd /opt/mail2nas && docker compose logs -f
   - `no usable printer is configured` -> Drucken ist gewuenscht, aber kein
     aktiver Drucker gewaehlt.
   - `is not in PRINTABLE_EXTENSIONS` -> Format bewusst nicht gedruckt
-    (Einstellungen -> Druckbare Dateitypen).
-  - gar nichts -> "Drucken erlaubt" unter Einstellungen aus?
+    (Optionen -> Druckbare Dateitypen).
+  - gar nichts -> "Drucken erlaubt" unter Optionen aus?
 - **An eine Adresse gemailt, nichts gedruckt**: steht im Log
   `is addressed to ...`? Wenn nicht, wurde die Adresse nicht erkannt - die
   Kopfzeilen der Mail ansehen ("Original anzeigen") und die Adresse genau so
   eintragen, oder mit `@firma.de` / `drucker-*@firma.de` arbeiten. Ist ein
   Absender eingetragen, muss auch der passen.
-- **Abholordner bleibt voll**: Datei noch zu jung (Einstellungen -> fertig
+- **Abholordner bleibt voll**: Datei noch zu jung (Optionen -> fertig
   nach)? Endet sie auf `.tmp`/`.part` oder beginnt mit einem Punkt? Darf
   mail2nas dort loeschen? Ohne Loeschrecht wird bewusst nichts abgeholt.
 
