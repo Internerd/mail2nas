@@ -209,7 +209,13 @@ class _Worker:
         if count:
             logger.info("Account %s: processed %d message(s)", label, count)
             status.processed(self.key, count)
-        status.set(self.key, "verbunden", "IDLE" if self.account.mode == "idle" else "Polling")
+        detail = "IDLE" if self.account.mode == "idle" else "Polling"
+        if archiver.last_search is not None:
+            when, found = archiver.last_search
+            what = "ungelesene" if not self.account.include_seen else "passende"
+            detail += (f" - zuletzt geprueft {time.strftime('%H:%M:%S', time.localtime(when))}, "
+                       f"{found} {what} Mail(s) gefunden")
+        status.set(self.key, "verbunden", detail)
 
     def _run_poll(self, archiver: Archiver, client, label: str) -> None:
         while not self._stop.is_set():

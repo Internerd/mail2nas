@@ -3,6 +3,7 @@ from __future__ import annotations
 import email
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from email.header import decode_header, make_header
@@ -168,6 +169,9 @@ class Archiver:
         # Failures already written to the journal in this session - a mail
         # that keeps failing is recorded once, not on every retry.
         self._reported: set[tuple[int, str]] = set()
+        # (when, how many) of the last search - shown on the overview page,
+        # so "what does mail2nas actually see" has an answer without a shell.
+        self.last_search: tuple[float, int] | None = None
 
     @property
     def options(self) -> Options:
@@ -229,7 +233,14 @@ class Archiver:
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
         self.mapping.reload()
-        uids = [uid for uid in client.search(self.search_criteria()) if uid not in self._done_uids]
+        # A server only shows mail that arrived during the session after a
+        # command has finished - a SEARCH is answered from the view before
+        # it. Without this NOOP a new mail is found one interval late, which
+        # with the default of five minutes looks like "nothing happens".
+        client.noop()
+        found = client.search(self.search_criteria())
+        uids = [uid for uid in found if uid not in self._done_uids]
+        self.last_search = (time.time(), len(found))
         if not uids:
             return 0
 

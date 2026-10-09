@@ -7176,6 +7176,7 @@ from __future__ import annotations
 import email
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from email.header import decode_header, make_header
@@ -7341,6 +7342,9 @@ class Archiver:
         # Failures already written to the journal in this session - a mail
         # that keeps failing is recorded once, not on every retry.
         self._reported: set[tuple[int, str]] = set()
+        # (when, how many) of the last search - shown on the overview page,
+        # so "what does mail2nas actually see" has an answer without a shell.
+        self.last_search: tuple[float, int] | None = None
 
     @property
     def options(self) -> Options:
@@ -7402,7 +7406,14 @@ class Archiver:
     def run_once(self, client: IMAPClient) -> int:
         """Process all currently unseen messages. Returns the number processed."""
         self.mapping.reload()
-        uids = [uid for uid in client.search(self.search_criteria()) if uid not in self._done_uids]
+        # A server only shows mail that arrived during the session after a
+        # command has finished - a SEARCH is answered from the view before
+        # it. Without this NOOP a new mail is found one interval late, which
+        # with the default of five minutes looks like "nothing happens".
+        client.noop()
+        found = client.search(self.search_criteria())
+        uids = [uid for uid in found if uid not in self._done_uids]
+        self.last_search = (time.time(), len(found))
         if not uids:
             return 0
 
@@ -11763,7 +11774,13 @@ class _Worker:
         if count:
             logger.info("Account %s: processed %d message(s)", label, count)
             status.processed(self.key, count)
-        status.set(self.key, "verbunden", "IDLE" if self.account.mode == "idle" else "Polling")
+        detail = "IDLE" if self.account.mode == "idle" else "Polling"
+        if archiver.last_search is not None:
+            when, found = archiver.last_search
+            what = "ungelesene" if not self.account.include_seen else "passende"
+            detail += (f" - zuletzt geprueft {time.strftime('%H:%M:%S', time.localtime(when))}, "
+                       f"{found} {what} Mail(s) gefunden")
+        status.set(self.key, "verbunden", detail)
 
     def _run_poll(self, archiver: Archiver, client, label: str) -> None:
         while not self._stop.is_set():
@@ -12639,6 +12656,9 @@ class FakeIMAPClient:
                 entry[b"RFC822"] = self._raw
             result[uid] = entry
         return result
+
+    def noop(self):
+        return None
 
     def add_flags(self, uids, flags):
         self.flags_added.append((list(uids), list(flags)))
@@ -13675,6 +13695,26 @@ def test_settings_changed_in_the_ui_apply_to_the_next_message(tmp_path):
     )
 
     assert any((tmp_path / "sonstiges").glob("*"))
+
+
+def test_the_server_is_asked_for_news_before_every_search(tmp_path):
+    """A mail delivered during the session is only visible after a command
+    has finished - without the NOOP it is found one interval late."""
+    calls = []
+
+    class Client(FakeIMAPClient):
+        def noop(self):
+            calls.append("noop")
+
+        def search(self, criteria):
+            calls.append("search")
+            return []
+
+    archiver = _make_archiver(tmp_path)
+    archiver.run_once(Client(uid=1, raw=b""))
+
+    assert calls == ["noop", "search"]
+    assert archiver.last_search[1] == 0
 MAIL2NAS_EOF
 
 # --- tests/test_config.py ---
@@ -18513,6 +18553,8 @@ def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkey
     worker = main_module._Worker(runtime, runtime.accounts.get(account_id))
 
     class _Archiver:
+        last_search = None
+
         def run_once(self, client):
             return 0
 
@@ -18527,6 +18569,27 @@ def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkey
 
     assert not thread.is_alive()
     assert time.monotonic() - started < 1  # not the 300 s poll interval
+
+
+def test_the_overview_says_when_and_what_was_last_searched(runtime):
+    """Without a shell the only way to see what mail2nas sees: the overview."""
+    import time
+
+    from mail2nas.main import _Worker
+
+    account = runtime.accounts.get(_add(runtime))
+    worker = _Worker(runtime, account)
+
+    class _Archiver:
+        last_search = (time.time(), 2)
+
+        def run_once(self, client):
+            return 0
+
+    worker._cycle(_Archiver(), object(), "test")
+
+    detail = runtime.status.workers()[worker.key].detail
+    assert "zuletzt geprueft" in detail and "2 ungelesene" in detail
 MAIL2NAS_EOF
 
 # --- tests/test_migrate.py ---

@@ -248,6 +248,8 @@ def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkey
     worker = main_module._Worker(runtime, runtime.accounts.get(account_id))
 
     class _Archiver:
+        last_search = None
+
         def run_once(self, client):
             return 0
 
@@ -262,3 +264,24 @@ def test_a_worker_in_idle_stops_without_waiting_for_the_interval(runtime, monkey
 
     assert not thread.is_alive()
     assert time.monotonic() - started < 1  # not the 300 s poll interval
+
+
+def test_the_overview_says_when_and_what_was_last_searched(runtime):
+    """Without a shell the only way to see what mail2nas sees: the overview."""
+    import time
+
+    from mail2nas.main import _Worker
+
+    account = runtime.accounts.get(_add(runtime))
+    worker = _Worker(runtime, account)
+
+    class _Archiver:
+        last_search = (time.time(), 2)
+
+        def run_once(self, client):
+            return 0
+
+    worker._cycle(_Archiver(), object(), "test")
+
+    detail = runtime.status.workers()[worker.key].detail
+    assert "zuletzt geprueft" in detail and "2 ungelesene" in detail

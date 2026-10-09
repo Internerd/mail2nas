@@ -144,6 +144,9 @@ class FakeIMAPClient:
             result[uid] = entry
         return result
 
+    def noop(self):
+        return None
+
     def add_flags(self, uids, flags):
         self.flags_added.append((list(uids), list(flags)))
 
@@ -1179,3 +1182,23 @@ def test_settings_changed_in_the_ui_apply_to_the_next_message(tmp_path):
     )
 
     assert any((tmp_path / "sonstiges").glob("*"))
+
+
+def test_the_server_is_asked_for_news_before_every_search(tmp_path):
+    """A mail delivered during the session is only visible after a command
+    has finished - without the NOOP it is found one interval late."""
+    calls = []
+
+    class Client(FakeIMAPClient):
+        def noop(self):
+            calls.append("noop")
+
+        def search(self, criteria):
+            calls.append("search")
+            return []
+
+    archiver = _make_archiver(tmp_path)
+    archiver.run_once(Client(uid=1, raw=b""))
+
+    assert calls == ["noop", "search"]
+    assert archiver.last_search[1] == 0
