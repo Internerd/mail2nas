@@ -4046,12 +4046,13 @@ class LocalStorage(Storage):
     def check_writable(self) -> None:
         if not self._root.is_dir():
             raise SystemExit(
-                f"STORAGE_ROOT {self._root} does not exist or is not a directory - "
-                "is the share mounted? (With STORAGE_BACKEND=smb no mount is needed.)"
+                f"{self._root} does not exist or is not a directory - is the share "
+                "mounted and passed into the container? (An archive of the kind SMB "
+                "needs no mount at all.)"
             )
         if not os.access(self._root, os.W_OK | os.X_OK):
             raise SystemExit(
-                f"STORAGE_ROOT {self._root} is not writable by uid {os.getuid()} - "
+                f"{self._root} is not writable by uid {os.getuid()} - "
                 "check the mount options (uid/gid/file_mode) and the share permissions."
             )
 
@@ -4298,12 +4299,12 @@ class SmbStorage(Storage):
         try:
             self._with_reconnect("write test", lambda: self._write_probe(probe))
         except Exception as exc:  # noqa: BLE001 - turn any failure into an actionable message
-            where = " (below SMB_ROOT)" if self._root_parts else ""
+            where = " (in the configured subfolder)" if self._root_parts else ""
             raise SystemExit(
                 f"Cannot archive to {self.description} over SMB: {exc}\n"
-                "Check SMB_HOST/SMB_SHARE/SMB_USER/SMB_PASSWORD (and SMB_DOMAIN if your "
-                f"server needs one), and that this user may write to the share{where}. "
-                "If the server refuses encryption, set SMB_ENCRYPT=false."
+                "Check server, share, user and password of the archive (and the domain if "
+                f"your server needs one), and that this user may write to the share{where}. "
+                "If the server refuses encryption, untick 'Verbindung verschluesseln'."
             ) from exc
 
     def _write_probe(self, name: str) -> None:
@@ -6660,6 +6661,16 @@ class Archiver:
                     ),
                 )
                 client.add_flags([uid], [b"\\Seen"])
+                # Remembered like any processed mail. Otherwise a mailbox that
+                # also looks at read mail finds it again on every cycle (it
+                # stays in the folder unless an oversized folder is set) and
+                # writes a fresh "too large" entry each time.
+                self._done_uids.add(uid)
+                header = _header_part(head)
+                if header is not None:
+                    self.store.mark_processed(
+                        _message_id(BytesHeaderParser().parsebytes(header), uid, self.account.key)
+                    )
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
             return True
@@ -7214,28 +7225,22 @@ class PickupRunner:
             )
             return False
 
-        # Printing first, and from the source: the document has to be read
-        # anyway, and a printer that is out of paper must not stop the filing
-        # (nor leave the scan in the folder to be printed again next cycle).
+        # Read before the move (afterwards the original is gone), but print
+        # only once the document is filed: if filing fails, the scan stays in
+        # the folder and is tried again next cycle - printing first would put
+        # it on paper again on every one of those retries. Same order as for
+        # mail: the archive first, paper is the copy.
         printer = self._printer_for(pickup, quarantined)
-        if printer is not None:
-            printed = self.printing.send(
-                printer, source.read_bytes(entry.relative), entry.name,
-                job_title(pickup.name, entry.name),
-            )
-            self._record(
-                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
-                target=printer.label(),
-                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
-                                          "druckbar - Details im Protokoll",
-            )
+        data = None
+        if printer is not None or source is not target:
+            data = source.read_bytes(entry.relative)
 
         if source is target:
             out_path = target.move_unique(entry.parts, parts, out_name)
         else:
             # Two different servers: no streamed move, so copy the bytes over
             # and only then remove the original.
-            out_path = target.save_unique(parts, out_name, source.read_bytes(entry.relative))
+            out_path = target.save_unique(parts, out_name, data)
             source.remove_file(entry.relative)
 
         self._record(
@@ -7253,6 +7258,19 @@ class PickupRunner:
             " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
             out_path,
         )
+
+        if printer is not None:
+            # A printer that is offline or out of paper only costs the paper
+            # copy - the document is filed and will not be picked up again.
+            printed = self.printing.send(
+                printer, data, entry.name, job_title(pickup.name, entry.name)
+            )
+            self._record(
+                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
+                target=printer.label(),
+                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
+                                          "druckbar - Details im Protokoll",
+            )
         return True
 
     def _record(self, pickup: Pickup, action: str, entry, **fields) -> None:
@@ -11938,6 +11956,55 @@ def test_process_message_skips_oversized_message_without_reading_body(tmp_path):
     assert not (tmp_path / "rechnungen").exists()
 
 
+class HeaderIMAPClient(FakeIMAPClient):
+    """Also answers the Message-ID header part, as a real server does."""
+
+    def __init__(self, uid: int, raw: bytes, message_id: str):
+        super().__init__(uid, raw)
+        self._header = f"Message-ID: {message_id}\r\n\r\n".encode()
+        self.searches = 0
+
+    def fetch(self, uids, parts):
+        result = super().fetch(uids, parts)
+        if any(str(p).startswith("BODY.PEEK[HEADER") for p in parts):
+            result[self._uid][b"BODY[HEADER.FIELDS (MESSAGE-ID)]"] = self._header
+        return result
+
+    def search(self, criteria):
+        self.searches += 1
+        return [self._uid]
+
+
+def test_oversized_message_is_not_reported_again_when_read_mail_is_included(tmp_path):
+    from mail2nas import journal as j
+
+    class Recorder:
+        def __init__(self):
+            self.entries = []
+
+        def record(self, source, action, **fields):
+            self.entries.append(action)
+
+        def done(self, *args):
+            return False
+
+    archiver = _make_archiver(
+        tmp_path, account=_account(include_seen=True), max_message_size_mb=1
+    )
+    archiver.journal = Recorder()
+    huge_raw = _build_message("riesig", [("rechnung.pdf", b"x" * (2 * 1024 * 1024))])
+    client = HeaderIMAPClient(uid=7, raw=huge_raw, message_id="<huge@example.com>")
+
+    archiver.run_once(client)
+    archiver.run_once(client)
+    # A new session (reconnect) forgets the UIDs, but not the processed list.
+    archiver._done_uids.clear()
+    archiver.run_once(client)
+
+    assert archiver.journal.entries == [j.TOO_LARGE]
+    assert archiver.store.is_processed(f"{TEST_ACCOUNT.key}:<huge@example.com>")
+
+
 def test_process_message_skips_only_oversized_attachment(tmp_path):
     archiver = _make_archiver(
         tmp_path, mapping_content="RE: rechnungen\n", max_attachment_size_mb=1, max_message_size_mb=50
@@ -16001,6 +16068,32 @@ def test_a_pickup_can_print_what_it_files(tmp_path):
 
     assert spooler.printed_on == ["drucker_a"]
     assert len(list((tmp_path / "eingang").glob("*"))) == 1
+
+
+def test_a_scan_that_cannot_be_filed_is_not_printed_again_on_every_retry(tmp_path, monkeypatch):
+    runner, pickups, _, _ = _env(tmp_path)
+    printing, spooler, printer_id = _printing(tmp_path)
+    runner.printing = printing
+    pickups.add(
+        name="Kopierer", folder="scans", target_folder="eingang",
+        print_attachments=True, printer=printer_id,
+    )
+    source = _drop(tmp_path / "scans", "scan.pdf")
+    storage = runner.storages.get("")
+
+    def broken(*args, **kwargs):
+        raise OSError("NAS weg")
+
+    monkeypatch.setattr(storage, "move_unique", broken)
+    runner.run_once()
+    runner.run_once()
+
+    assert source.exists()  # left in place for the next attempt
+    assert spooler.printed_on == []
+
+    monkeypatch.undo()
+    assert runner.run_once() == 1
+    assert spooler.printed_on == ["drucker_a"]
 
 
 def test_a_quarantined_scan_is_never_printed(tmp_path):

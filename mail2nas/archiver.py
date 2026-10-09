@@ -299,6 +299,16 @@ class Archiver:
                     ),
                 )
                 client.add_flags([uid], [b"\\Seen"])
+                # Remembered like any processed mail. Otherwise a mailbox that
+                # also looks at read mail finds it again on every cycle (it
+                # stays in the folder unless an oversized folder is set) and
+                # writes a fresh "too large" entry each time.
+                self._done_uids.add(uid)
+                header = _header_part(head)
+                if header is not None:
+                    self.store.mark_processed(
+                        _message_id(BytesHeaderParser().parsebytes(header), uid, self.account.key)
+                    )
                 if self.account.oversized_folder:
                     client.move([uid], self.account.oversized_folder)
             return True

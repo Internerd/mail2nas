@@ -291,6 +291,55 @@ def test_process_message_skips_oversized_message_without_reading_body(tmp_path):
     assert not (tmp_path / "rechnungen").exists()
 
 
+class HeaderIMAPClient(FakeIMAPClient):
+    """Also answers the Message-ID header part, as a real server does."""
+
+    def __init__(self, uid: int, raw: bytes, message_id: str):
+        super().__init__(uid, raw)
+        self._header = f"Message-ID: {message_id}\r\n\r\n".encode()
+        self.searches = 0
+
+    def fetch(self, uids, parts):
+        result = super().fetch(uids, parts)
+        if any(str(p).startswith("BODY.PEEK[HEADER") for p in parts):
+            result[self._uid][b"BODY[HEADER.FIELDS (MESSAGE-ID)]"] = self._header
+        return result
+
+    def search(self, criteria):
+        self.searches += 1
+        return [self._uid]
+
+
+def test_oversized_message_is_not_reported_again_when_read_mail_is_included(tmp_path):
+    from mail2nas import journal as j
+
+    class Recorder:
+        def __init__(self):
+            self.entries = []
+
+        def record(self, source, action, **fields):
+            self.entries.append(action)
+
+        def done(self, *args):
+            return False
+
+    archiver = _make_archiver(
+        tmp_path, account=_account(include_seen=True), max_message_size_mb=1
+    )
+    archiver.journal = Recorder()
+    huge_raw = _build_message("riesig", [("rechnung.pdf", b"x" * (2 * 1024 * 1024))])
+    client = HeaderIMAPClient(uid=7, raw=huge_raw, message_id="<huge@example.com>")
+
+    archiver.run_once(client)
+    archiver.run_once(client)
+    # A new session (reconnect) forgets the UIDs, but not the processed list.
+    archiver._done_uids.clear()
+    archiver.run_once(client)
+
+    assert archiver.journal.entries == [j.TOO_LARGE]
+    assert archiver.store.is_processed(f"{TEST_ACCOUNT.key}:<huge@example.com>")
+
+
 def test_process_message_skips_only_oversized_attachment(tmp_path):
     archiver = _make_archiver(
         tmp_path, mapping_content="RE: rechnungen\n", max_attachment_size_mb=1, max_message_size_mb=50

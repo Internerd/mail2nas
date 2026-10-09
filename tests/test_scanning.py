@@ -300,6 +300,32 @@ def test_a_pickup_can_print_what_it_files(tmp_path):
     assert len(list((tmp_path / "eingang").glob("*"))) == 1
 
 
+def test_a_scan_that_cannot_be_filed_is_not_printed_again_on_every_retry(tmp_path, monkeypatch):
+    runner, pickups, _, _ = _env(tmp_path)
+    printing, spooler, printer_id = _printing(tmp_path)
+    runner.printing = printing
+    pickups.add(
+        name="Kopierer", folder="scans", target_folder="eingang",
+        print_attachments=True, printer=printer_id,
+    )
+    source = _drop(tmp_path / "scans", "scan.pdf")
+    storage = runner.storages.get("")
+
+    def broken(*args, **kwargs):
+        raise OSError("NAS weg")
+
+    monkeypatch.setattr(storage, "move_unique", broken)
+    runner.run_once()
+    runner.run_once()
+
+    assert source.exists()  # left in place for the next attempt
+    assert spooler.printed_on == []
+
+    monkeypatch.undo()
+    assert runner.run_once() == 1
+    assert spooler.printed_on == ["drucker_a"]
+
+
 def test_a_quarantined_scan_is_never_printed(tmp_path):
     runner, pickups, _, _ = _env(tmp_path)
     printing, spooler, printer_id = _printing(tmp_path)

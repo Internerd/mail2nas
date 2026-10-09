@@ -169,12 +169,13 @@ class LocalStorage(Storage):
     def check_writable(self) -> None:
         if not self._root.is_dir():
             raise SystemExit(
-                f"STORAGE_ROOT {self._root} does not exist or is not a directory - "
-                "is the share mounted? (With STORAGE_BACKEND=smb no mount is needed.)"
+                f"{self._root} does not exist or is not a directory - is the share "
+                "mounted and passed into the container? (An archive of the kind SMB "
+                "needs no mount at all.)"
             )
         if not os.access(self._root, os.W_OK | os.X_OK):
             raise SystemExit(
-                f"STORAGE_ROOT {self._root} is not writable by uid {os.getuid()} - "
+                f"{self._root} is not writable by uid {os.getuid()} - "
                 "check the mount options (uid/gid/file_mode) and the share permissions."
             )
 
@@ -421,12 +422,12 @@ class SmbStorage(Storage):
         try:
             self._with_reconnect("write test", lambda: self._write_probe(probe))
         except Exception as exc:  # noqa: BLE001 - turn any failure into an actionable message
-            where = " (below SMB_ROOT)" if self._root_parts else ""
+            where = " (in the configured subfolder)" if self._root_parts else ""
             raise SystemExit(
                 f"Cannot archive to {self.description} over SMB: {exc}\n"
-                "Check SMB_HOST/SMB_SHARE/SMB_USER/SMB_PASSWORD (and SMB_DOMAIN if your "
-                f"server needs one), and that this user may write to the share{where}. "
-                "If the server refuses encryption, set SMB_ENCRYPT=false."
+                "Check server, share, user and password of the archive (and the domain if "
+                f"your server needs one), and that this user may write to the share{where}. "
+                "If the server refuses encryption, untick 'Verbindung verschluesseln'."
             ) from exc
 
     def _write_probe(self, name: str) -> None:

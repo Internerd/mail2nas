@@ -180,28 +180,22 @@ class PickupRunner:
             )
             return False
 
-        # Printing first, and from the source: the document has to be read
-        # anyway, and a printer that is out of paper must not stop the filing
-        # (nor leave the scan in the folder to be printed again next cycle).
+        # Read before the move (afterwards the original is gone), but print
+        # only once the document is filed: if filing fails, the scan stays in
+        # the folder and is tried again next cycle - printing first would put
+        # it on paper again on every one of those retries. Same order as for
+        # mail: the archive first, paper is the copy.
         printer = self._printer_for(pickup, quarantined)
-        if printer is not None:
-            printed = self.printing.send(
-                printer, source.read_bytes(entry.relative), entry.name,
-                job_title(pickup.name, entry.name),
-            )
-            self._record(
-                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
-                target=printer.label(),
-                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
-                                          "druckbar - Details im Protokoll",
-            )
+        data = None
+        if printer is not None or source is not target:
+            data = source.read_bytes(entry.relative)
 
         if source is target:
             out_path = target.move_unique(entry.parts, parts, out_name)
         else:
             # Two different servers: no streamed move, so copy the bytes over
             # and only then remove the original.
-            out_path = target.save_unique(parts, out_name, source.read_bytes(entry.relative))
+            out_path = target.save_unique(parts, out_name, data)
             source.remove_file(entry.relative)
 
         self._record(
@@ -219,6 +213,19 @@ class PickupRunner:
             " [QUARANTAENE: gesperrte Dateiendung]" if quarantined else "",
             out_path,
         )
+
+        if printer is not None:
+            # A printer that is offline or out of paper only costs the paper
+            # copy - the document is filed and will not be picked up again.
+            printed = self.printing.send(
+                printer, data, entry.name, job_title(pickup.name, entry.name)
+            )
+            self._record(
+                pickup, j.PRINTED if printed else j.NOT_PRINTED, entry,
+                target=printer.label(),
+                detail="" if printed else "Druckauftrag nicht angenommen oder Dateityp nicht "
+                                          "druckbar - Details im Protokoll",
+            )
         return True
 
     def _record(self, pickup: Pickup, action: str, entry, **fields) -> None:
